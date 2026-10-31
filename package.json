@@ -1,0 +1,24 @@
+{
+  "name": "seam",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "packageManager": "pnpm@12.14.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @seam/platform dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "test:e2e": "pnpm --filter @seam/platform test:e2e",
+    "test:integration": "pnpm --filter @seam/platform test:integration",
+    "db:generate": "pnpm --filter @seam/platform db:generate",
+    "db:migrate": "pnpm --filter @seam/platform db:migrate"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
