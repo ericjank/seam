@@ -71,7 +71,43 @@ packages/protocol       共享 Zod 协议
 packages/agent-adapters 本地 AI CLI 适配器
 ```
 
-## 启动
+## Docker 快速部署
+
+Docker Compose 会同时启动 Next.js 应用和 MySQL 8，应用启动时自动执行数据库迁移，数据保存在 `mysql-data` 数据卷中。
+
+1. 创建部署环境配置：
+
+```bash
+cp .env.example .env
+openssl rand -base64 32
+```
+
+2. 编辑 `.env`，设置 `MYSQL_ROOT_PASSWORD`、`DB_PASSWORD` 和上一步生成的 `SEAM_MASTER_KEY`。该文件已被 Git 忽略，不要提交真实密码。
+
+3. 构建并启动：
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+4. 查看应用日志，确认迁移和启动成功：
+
+```bash
+docker compose logs -f app
+```
+
+默认访问 `http://localhost:3000`。如需修改端口，在 `.env` 中设置 `APP_PORT=8080`；正式部署时将 `SEAM_APP_URL` 设置为外部访问地址，例如 `https://seam.example.com`，并在应用前配置 HTTPS 反向代理。
+
+停止服务：
+
+```bash
+docker compose down
+```
+
+`docker compose down` 不会删除数据库。只有确定需要永久删除全部数据时，才使用 `docker compose down -v`。
+
+## 手动启动（不使用 Docker）
 
 要求 Node.js 22+、pnpm 12+ 和可访问的 MySQL 8。
 
