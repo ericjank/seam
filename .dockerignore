@@ -2,6 +2,7 @@
 .gitignore
 .playwright-cli
 output/playwright
+output/acceptance-*
 node_modules
 **/node_modules
 **/.next

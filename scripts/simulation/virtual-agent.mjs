@@ -48,7 +48,7 @@ export function quote(input) {
   if (!Number.isInteger(input.quantity) || input.quantity < 1 || input.quantity > 100) throw new Error("invalid quantity");
   const subtotal = prices[input.sku] * input.quantity;
   const output = {sku: input.sku, quantity: input.quantity, subtotal, currency:"CNY"};
-  ${supportsDiscount ? `const percent = input.discountPercent ?? 0;
+  ${supportsDiscount ? `const percent = input.discountPercent === undefined ? 0 : input.discountPercent;
   if (!Number.isInteger(percent) || percent < 0 || percent > 100) throw new Error("invalid discountPercent");
   output.discount = Math.floor(subtotal * percent / 100);
   output.total = subtotal - output.discount;` : ""}
@@ -68,10 +68,12 @@ test("invalid inputs fail", () => {
   assert.throws(() => quote({sku:"unknown",quantity:1}));
 });
 ${supportsDiscount ? `test("discount boundaries and validation", () => {
+  assert.equal(quote({sku:"SKU-001",quantity:2}).total,24000);
+  assert.equal(quote({sku:"SKU-001",quantity:2,discountPercent:undefined}).discount,0);
   assert.equal(quote({sku:"SKU-001",quantity:2,discountPercent:10}).total,21600);
   assert.equal(quote({sku:"SKU-001",quantity:2,discountPercent:0}).discount,0);
   assert.equal(quote({sku:"SKU-001",quantity:2,discountPercent:100}).total,0);
-  for (const discountPercent of [-1,101,1.5,"10"]) assert.throws(() => quote({sku:"SKU-001",quantity:1,discountPercent}));
+  for (const discountPercent of [-1,101,1.5,"10",null,false,true,""]) assert.throws(() => quote({sku:"SKU-001",quantity:1,discountPercent}));
 });` : ""}
 `;
   await writeFile("service.mjs", source);

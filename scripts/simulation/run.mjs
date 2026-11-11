@@ -141,7 +141,11 @@ async function jointHttpCheck(revision) {
       const rejected = await fetch(`${address}/quote`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
       assert.equal(rejected.status, 400);
     }
+    const additionalInvalidDiscounts = [null, false, true, "10", 1.5, 101];
     if (revision >= 2) {
+      const zeroDiscount = await consumer.getQuote(address, { sku: "SKU-001", quantity: 2, discountPercent: 0 });
+      assert.equal(zeroDiscount.discount, 0);
+      assert.equal(zeroDiscount.total, 24000);
       const discounted = await consumer.getQuote(address, { sku: "SKU-001", quantity: 2, discountPercent: 10 });
       assert.equal(discounted.discount, 2400);
       assert.equal(discounted.total, 21600);
@@ -149,8 +153,17 @@ async function jointHttpCheck(revision) {
       await assert.rejects(() => consumer.getQuote(address, { sku: "SKU-001", quantity: 1, discountPercent: -1 }));
       const rejectedDiscount = await fetch(`${address}/quote`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sku: "SKU-001", quantity: 1, discountPercent: -1 }) });
       assert.equal(rejectedDiscount.status, 400);
+      for (const discountPercent of additionalInvalidDiscounts) {
+        const input = { sku: "SKU-001", quantity: 1, discountPercent };
+        await assert.rejects(() => consumer.getQuote(address, input));
+        const invalid = await fetch(`${address}/quote`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+        assert.equal(invalid.status, 400, `discountPercent=${JSON.stringify(discountPercent)} must fail at the provider`);
+      }
     }
-    assert.ok(received >= (revision >= 2 ? 7 : 4), "joint checks must reach the provider through real HTTP");
+    // Consumer-side validation may avoid some calls. Each added invalid case
+    // still has a direct provider HTTP check. Historical 6/10 counts belong
+    // to their original reports; new executions record their actual counts.
+    assert.ok(received >= (revision >= 2 ? 8 + additionalInvalidDiscounts.length : 4), "joint checks must reach the provider through real HTTP");
     return { revision, status: "passed", transport: "real localhost HTTP", receivedRequests: received };
   } finally {
     server.closeAllConnections();
