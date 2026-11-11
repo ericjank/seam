@@ -5,6 +5,7 @@ import { newId } from "@/lib/ids";
 import { authorizeActor, type Actor } from "./actor";
 import { addSystemMessage } from "./collaborations";
 import { audit } from "@/lib/audit";
+import { HttpError } from "@/lib/http";
 
 export async function createProposal(actor: Actor, collaborationId: string, input: {
   title: string;
@@ -31,9 +32,10 @@ export async function createProposal(actor: Actor, collaborationId: string, inpu
   return { id, artifactVersionId };
 }
 
-export async function decideProposal(actor: Actor, proposalId: string, decision: "approved" | "rejected", comment = "") {
+export async function decideProposal(actor: Actor, proposalId: string, decision: "approved" | "rejected", comment = "", expectedCollaborationId?: string) {
   const [proposal] = await db.select().from(proposals).where(eq(proposals.id, proposalId)).limit(1);
   if (!proposal || proposal.status !== "open") throw new Error("提案不存在或已关闭");
+  if (expectedCollaborationId && proposal.collaborationId !== expectedCollaborationId) throw new HttpError(422, "提案不属于当前协作");
   const participantId = await authorizeActor(actor, proposal.collaborationId);
   if (!participantId) throw new Error("请选择代表哪个项目参与方进行确认");
   const [participant] = await db.select().from(participants).where(eq(participants.id, participantId)).limit(1);

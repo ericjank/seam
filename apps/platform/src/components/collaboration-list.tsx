@@ -34,11 +34,11 @@ export function CollaborationList({ collaborations, projects }: Props) {
           router.push(`/collaborations/${result.id}`);
         } catch (err) { setError(errorMessage(err)); }
       }}>
-        <div className="field"><label>协作标题</label><input name="title" required placeholder="订单页与订单服务接口对接" /></div>
+        <div className="field"><label>协作标题（可选）</label><input name="title" placeholder="留空时从目标生成" /></div>
         <div className="field"><label>协作类型</label><select name="type">{Object.entries(typeNames).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div>
-        <div className="field wide"><label>目标与验收背景</label><textarea name="objective" required placeholder="说明要完成的业务目标、边界和期望结果" /></div>
+        <div className="field wide"><label>想让各项目 AI 一起完成什么？</label><textarea name="objective" required placeholder="直接描述业务目标，AI 从各自项目提取接口、分工和测试信息，无需逐项填写" /></div>
         <div className="field"><label>发起项目</label><select name="projectId" value={projectId} onChange={(e) => setProjectId(e.target.value)} required>{uniqueProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
-        <div className="field"><label>发起 Agent</label><select name="agentId"><option value="">稍后指定</option>{agents.map((row) => <option key={row.agent?.id} value={row.agent?.id}>{row.agent?.name}</option>)}</select></div>
+        <div className="field"><label>发起 Agent</label><select key={projectId} name="agentId"><option value="">自动选择项目唯一 Agent</option>{agents.map((row) => <option key={row.agent?.id} value={row.agent?.id}>{row.agent?.name}</option>)}</select></div>
         <div className="wide"><button className="btn" disabled={!uniqueProjects.length}>创建并邀请参与方</button></div>
       </form>
     </section>}

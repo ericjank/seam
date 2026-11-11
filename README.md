@@ -177,6 +177,17 @@ export SEAM_TEST_COMMAND='pnpm test:contract'
 
 ## Verification
 
+Chat messages now dispatch work by default. Agents receive persistent user instructions,
+current proposals, credential request metadata and acceptance results. Real shared changes
+automatically hand off to the relevant projects, with a fresh bounded budget per request.
+Runs pause on missing human input, failure or no new handoff. The UI also shows actual
+Connector execution modes and durable job errors.
+
+Run `node --env-file=/path/to/private/seam.env apps/connector/dist/cli.js --doctor`
+before connecting. Codex defaults to `read-only`; a local maintainer may explicitly choose
+`SEAM_CODEX_SANDBOX=workspace-write`. Platform messages cannot change this policy.
+See [AI collaboration improvements](docs/AI协作改进.md) for configuration, diagnosis and validation.
+
 ```bash
 pnpm lint
 pnpm typecheck

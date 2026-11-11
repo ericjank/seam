@@ -175,6 +175,14 @@ export SEAM_TEST_COMMAND='pnpm test:contract'
 5. 各项目在本地实施和测试，只提交测试摘要与证据。
 6. 所有任务完成后协作验收完成；契约变更会重新打开相关流程。
 
+### 直接让 AI 推进
+
+在协作对话中发送目标，默认立即交给各项目 AI；有新产物或实际任务变化时相关方自动接续，无需逐项填写任务、资料和通知 ID。各端复用已有用户指令、提案、凭据申请状态及验收记录。需要人工信息、执行失败、无新交接或本次达到最多 12 批时暂停；回复或“继续推进”可开启新的推进。
+
+接入前可运行 `node --env-file=/path/to/private/seam.env apps/connector/dist/cli.js --doctor`。Codex 默认只读，本机维护者明确允许实施后可设置 `SEAM_CODEX_SANDBOX=workspace-write`；平台不能远程改变该权限。界面展示实际执行模式和失败记录。
+
+机制、问题分析、配置及验证方式见 [AI 协作改进](docs/AI协作改进.md)。
+
 ## 验证
 
 ```bash

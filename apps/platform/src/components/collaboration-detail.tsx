@@ -15,6 +15,8 @@ const tabs = [
 ] as const;
 
 export function CollaborationDetail({ data }: { data: CollaborationData }) {
+  const [dispatchNotice, setDispatchNotice] = useState("");
+  const [inviteProjectId, setInviteProjectId] = useState("");
   const [tab, setTab] = useState<(typeof tabs)[number][0]>("chat");
   const { run, error, busy } = useAction();
   const router = useRouter();
@@ -30,14 +32,21 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
     };
     return () => { events.close(); clearTimeout(timer); };
   }, [id, router]);
+  const projectChoices = Array.from(new Map(data.availableProjects.filter((row) =>
+    !data.participants.some((p) => p.project.id === row.project.id)).map((row) => [row.project.id, row.project])).values());
+  const inviteAgents = data.availableProjects.filter((row) => row.project.id === inviteProjectId && row.agent);
   return <div className="stack">
-    <div className="page-header"><div><div className="row"><span className="badge badge-blue">{data.collaboration.type}</span><span className="badge">{data.collaboration.status}</span></div><h1 style={{ marginTop: 12 }}>{data.collaboration.title}</h1><p className="muted">{data.collaboration.objective}</p></div><button className="btn" disabled={busy} onClick={() => void run(`/api/collaborations/${id}/dispatch`, {}).catch(() => undefined)}>运行一轮 Agent 协商</button></div>
+    <div className="page-header"><div><div className="row"><span className="badge badge-blue">{data.collaboration.type}</span><span className="badge">{data.collaboration.status}</span></div><h1 style={{ marginTop: 12 }}>{data.collaboration.title}</h1><p className="muted">{data.collaboration.objective}</p></div><button className="btn" disabled={busy} onClick={() => void run(`/api/collaborations/${id}/dispatch`, { autoAdvance: true }).catch(() => undefined)}>继续推进</button></div>
     {error && <div className="notice error">{error}</div>}
-    <section className="card"><div className="card-header"><h2>参与项目</h2><span className="small muted">协商轮次 {data.collaboration.negotiationRound}/{data.collaboration.maxNegotiationRounds}</span></div>
+    <section className="card"><div className="card-header"><h2>参与项目</h2><span className="small muted">累计派发 {data.collaboration.negotiationRound} 批 · 每次最多 {data.collaboration.maxNegotiationRounds} 批</span></div>
       <div className="grid grid-3">{data.participants.map((row) => <div className="list-item" key={row.participant.id}>
         <div className="row-between"><strong>{row.project.name}</strong><span className={`badge ${row.participant.status === "active" ? "badge-green" : "badge-amber"}`}>{row.participant.status}</span></div>
         <p className="small muted">{row.participant.role} · {row.agent ? `${row.agent.name}（${row.agent.status}）` : "未绑定 Agent"}</p>
-        <div className="small muted">参与方 ID：{row.participant.id}</div>
+        {(() => {
+          const capability = data.connectorCapabilities.find((item) => item.agentId === row.participant.agentId);
+          return <div className="small muted">{capability ? `实际执行：${capability.adapter} · ${capability.executionMode === "workspace-write" ? "项目内可写" : capability.executionMode === "read-only" ? "只读，实施前需本机配置写入" : "权限由本地工具管理"} · ${capability.testConfigured ? "已配置本地测试" : "未配置本地测试命令"}` : "尚未上报执行能力，请在本机运行 Connector --doctor 并更新 Connector"}</div>;
+        })()}
+        <details className="small muted"><summary>参与方标识</summary>{row.participant.id}</details>
         {row.participant.status === "invited" && <button className="btn btn-secondary btn-small" style={{ marginTop: 10 }} onClick={() => void run(`/api/participants/${row.participant.id}/accept`, {}).catch(() => undefined)}>代表该项目接受邀请</button>}
       </div>)}</div>
       <details style={{ marginTop: 16 }}><summary>邀请另一个独立项目</summary>
@@ -46,8 +55,8 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
           const form = event.currentTarget;
           try { await run(`/api/collaborations/${id}/participants`, Object.fromEntries(new FormData(form))); form.reset(); } catch {}
         }}>
-          <div className="field"><label>目标项目 ID</label><input name="projectId" required placeholder="由项目所有者在项目页提供" /></div>
-          <div className="field"><label>Agent ID（可选）</label><input name="agentId" /></div>
+          <div className="field"><label>目标项目</label><select value={inviteProjectId} onChange={(event) => setInviteProjectId(event.target.value)}><option value="">外部项目：填写项目 ID</option>{projectChoices.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>{inviteProjectId ? <input type="hidden" name="projectId" value={inviteProjectId} /> : <input name="projectId" required placeholder="外部项目所有者提供的项目 ID" />}</div>
+          <div className="field"><label>项目 Agent</label>{inviteProjectId ? <select key={inviteProjectId} name="agentId" defaultValue={inviteAgents.length === 1 ? inviteAgents[0]?.agent?.id : ""}><option value="">自动选择唯一 Agent</option>{inviteAgents.map((row) => <option key={row.agent!.id} value={row.agent!.id}>{row.agent!.name}</option>)}</select> : <input name="agentId" placeholder="可选：自动选择该项目唯一 Agent" />}</div>
           <div className="field"><label>职责</label><select name="role"><option value="provider">提供方</option><option value="consumer">消费方</option><option value="reviewer">评审方</option><option value="participant">普通参与方</option></select></div>
           <div className="field" style={{ justifyContent: "end" }}><button className="btn">发送邀请</button></div>
         </form>
@@ -55,13 +64,21 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
     </section>
     <div className="tabs">{tabs.map(([value, label]) => <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{label}</button>)}</div>
     {tab === "chat" && <section className="card"><h2>协作对话</h2>
+      <p className="small muted">说一次目标，各端 AI 读取本地项目、复用已有资料并填写任务和产物。有新交接时自动推进，遇到缺失信息或执行失败会暂停。</p>
+      {dispatchNotice && <div className="notice">{dispatchNotice}</div>}
+      {data.jobs.length > 0 && <details style={{ marginBottom: 16 }}><summary>最近执行记录（{data.jobs.filter((job) => job.status === "failed").length} 项失败）</summary><div className="list">{data.jobs.map((job) => <div className="list-item" key={job.id}><strong>{data.participants.find((p) => p.participant.agentId === job.agentId)?.project.name ?? "项目 Agent"}</strong> · {job.status}<div className="small muted">{job.id} · 第 {job.attempts} 次领取</div>{job.error && <p className="message-text">{job.error}</p>}</div>)}</div></details>}
       <div>{data.messages.map((message) => <div className="message" key={message.id}><div className="avatar">{message.authorName.slice(0, 1).toUpperCase()}</div><div className="message-body"><div className="row"><strong>{message.authorName}</strong><span className="badge">{message.kind}</span><span className="small muted">{new Date(message.createdAt).toLocaleString("zh-CN")}</span></div><p className="message-text">{message.body}</p></div></div>)}</div>
       <form className="row" style={{ marginTop: 18 }} onSubmit={async (event) => {
         event.preventDefault();
         const form = event.currentTarget;
         const body = new FormData(form).get("body");
-        try { await run(`/api/collaborations/${id}/messages`, { body }); form.reset(); } catch {}
-      }}><textarea name="body" required placeholder="补充协作背景或向所有 Agent 提问；不需要再复制给其他项目" style={{ minHeight: 70 }} /><button className="btn">发送</button></form>
+        const dispatch = new FormData(form).get("dispatch") === "on";
+        try {
+          const result = await run(`/api/collaborations/${id}/messages`, { body, dispatch });
+          setDispatchNotice(result.dispatchError ? `消息已保存；${result.dispatchError}` : dispatch ? "消息已交给项目 AI，可在执行记录中查看进度。" : "留言已保存。");
+          form.reset();
+        } catch {}
+      }}><div style={{ flex: 1 }}><textarea name="body" required placeholder="告诉各端 AI 要完成什么，已有背景无需重复填写" style={{ minHeight: 70 }} /><label className="small row"><input type="checkbox" name="dispatch" defaultChecked style={{ width: "auto" }} />发送后自动交给 AI 推进</label></div><button className="btn" disabled={busy}>发送</button></form>
     </section>}
     {tab === "proposals" && <NegotiationTab data={data} />}
     {tab === "artifacts" && <ArtifactsTab data={data} />}

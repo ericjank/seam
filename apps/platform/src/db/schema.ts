@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -13,8 +14,8 @@ import {
 
 const id = () => varchar("id", { length: 36 });
 const timestamps = {
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
+  updatedAt: timestamp("updated_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 };
 
 export const organizations = mysqlTable("organizations", {
@@ -37,7 +38,7 @@ export const sessions = mysqlTable("sessions", {
   tokenHash: varchar("token_hash", { length: 64 }).primaryKey(),
   userId: varchar("user_id", { length: 36 }).notNull().references(() => users.id, { onDelete: "cascade" }),
   expiresAt: timestamp("expires_at", { fsp: 3 }).notNull(),
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 });
 
 export const projects = mysqlTable("projects", {
@@ -80,7 +81,7 @@ export const participants = mysqlTable("participants", {
   role: mysqlEnum("role", ["coordinator", "provider", "consumer", "reviewer", "participant"]).notNull().default("participant"),
   approvalRequired: boolean("approval_required").notNull().default(true),
   status: mysqlEnum("status", ["invited", "active", "declined"]).notNull().default("invited"),
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 }, (table) => [
   uniqueIndex("participants_collab_project_unique").on(table.collaborationId, table.projectId),
   index("participants_collab_idx").on(table.collaborationId),
@@ -88,6 +89,7 @@ export const participants = mysqlTable("participants", {
 
 export const messages = mysqlTable("messages", {
   id: id().primaryKey(),
+  sequence: int("sequence").autoincrement().notNull().unique(),
   collaborationId: varchar("collaboration_id", { length: 36 }).notNull().references(() => collaborations.id, { onDelete: "cascade" }),
   participantId: varchar("participant_id", { length: 36 }).references(() => participants.id),
   authorType: mysqlEnum("author_type", ["user", "agent", "system"]).notNull(),
@@ -95,7 +97,7 @@ export const messages = mysqlTable("messages", {
   kind: mysqlEnum("kind", ["chat", "question", "clarification", "objection", "status", "system"]).notNull().default("chat"),
   body: text("body").notNull(),
   metadata: json("metadata").notNull().default({}),
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 }, (table) => [index("messages_collab_created_idx").on(table.collaborationId, table.createdAt)]);
 
 export const artifacts = mysqlTable("artifacts", {
@@ -114,7 +116,7 @@ export const artifactVersions = mysqlTable("artifact_versions", {
   content: text("content").notNull(),
   contentHash: varchar("content_hash", { length: 64 }).notNull(),
   createdByParticipantId: varchar("created_by_participant_id", { length: 36 }).references(() => participants.id),
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 }, (table) => [uniqueIndex("artifact_versions_version_unique").on(table.artifactId, table.version)]);
 
 export const proposals = mysqlTable("proposals", {
@@ -136,7 +138,7 @@ export const approvals = mysqlTable("approvals", {
   artifactVersionId: varchar("artifact_version_id", { length: 36 }).references(() => artifactVersions.id),
   decision: mysqlEnum("decision", ["approved", "rejected"]).notNull(),
   comment: text("comment").notNull(),
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 }, (table) => [uniqueIndex("approvals_proposal_participant_unique").on(table.proposalId, table.participantId)]);
 
 export const workItems = mysqlTable("work_items", {
@@ -180,6 +182,7 @@ export const credentials = mysqlTable("credentials", {
 
 export const acceptanceRuns = mysqlTable("acceptance_runs", {
   id: id().primaryKey(),
+  sequence: int("sequence").autoincrement().notNull().unique(),
   collaborationId: varchar("collaboration_id", { length: 36 }).notNull().references(() => collaborations.id, { onDelete: "cascade" }),
   workItemId: varchar("work_item_id", { length: 36 }).references(() => workItems.id),
   participantId: varchar("participant_id", { length: 36 }).notNull().references(() => participants.id),
@@ -187,11 +190,12 @@ export const acceptanceRuns = mysqlTable("acceptance_runs", {
   status: mysqlEnum("status", ["passed", "failed"]).notNull(),
   summary: text("summary").notNull(),
   evidence: json("evidence").notNull().default({}),
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 });
 
 export const connectorJobs = mysqlTable("connector_jobs", {
   id: id().primaryKey(),
+  sequence: int("sequence").autoincrement().notNull().unique(),
   agentId: varchar("agent_id", { length: 36 }).notNull().references(() => agents.id, { onDelete: "cascade" }),
   collaborationId: varchar("collaboration_id", { length: 36 }).references(() => collaborations.id, { onDelete: "cascade" }),
   kind: mysqlEnum("kind", ["collaboration.turn", "a2a.message", "local.test"]).notNull(),
@@ -200,17 +204,18 @@ export const connectorJobs = mysqlTable("connector_jobs", {
   result: json("result"),
   error: text("error"),
   attempts: int("attempts").notNull().default(0),
-  availableAt: timestamp("available_at", { fsp: 3 }).notNull().defaultNow(),
+  availableAt: timestamp("available_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
   leaseUntil: timestamp("lease_until", { fsp: 3 }),
   ...timestamps,
 }, (table) => [index("connector_jobs_agent_status_idx").on(table.agentId, table.status, table.availableAt)]);
 
 export const auditEvents = mysqlTable("audit_events", {
   id: id().primaryKey(),
+  sequence: int("sequence").autoincrement().notNull().unique(),
   collaborationId: varchar("collaboration_id", { length: 36 }).references(() => collaborations.id, { onDelete: "cascade" }),
   actorType: mysqlEnum("actor_type", ["user", "agent", "connector", "system"]).notNull(),
   actorId: varchar("actor_id", { length: 100 }),
   action: varchar("action", { length: 100 }).notNull(),
   metadata: json("metadata").notNull().default({}),
-  createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 }, (table) => [index("audit_collab_created_idx").on(table.collaborationId, table.createdAt)]);

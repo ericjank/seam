@@ -8,6 +8,7 @@ import {
   artifacts,
   auditEvents,
   collaborations,
+  connectorJobs,
   credentials,
   dependencies,
   messages,
@@ -20,6 +21,14 @@ import {
 import { newId } from "@/lib/ids";
 import { requireCollaborationAccess, requireParticipantAccess, requireProjectAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
+import { listProjects } from "./projects";
+import { HttpError } from "@/lib/http";
+
+async function resolveProjectAgent(projectId: string, agentId?: string) {
+  const candidates = await db.select({ id: agents.id }).from(agents).where(eq(agents.projectId, projectId));
+  if (agentId && !candidates.some((agent) => agent.id === agentId)) throw new HttpError(422, "Agent 不属于所选项目");
+  return agentId || (candidates.length === 1 ? candidates[0]!.id : null);
+}
 
 export async function listCollaborations(userId: string) {
   return db.select({ collaboration: collaborations, project: projects })
@@ -38,6 +47,7 @@ export async function createCollaboration(userId: string, input: {
   agentId?: string;
 }) {
   await requireProjectAccess(userId, input.projectId, true);
+  const agentId = await resolveProjectAgent(input.projectId, input.agentId);
   const collaborationId = newId();
   const participantId = newId();
   await db.transaction(async (tx) => {
@@ -53,7 +63,7 @@ export async function createCollaboration(userId: string, input: {
       id: participantId,
       collaborationId,
       projectId: input.projectId,
-      agentId: input.agentId || null,
+      agentId,
       role: "coordinator",
       status: "active",
     });
@@ -77,11 +87,12 @@ export async function inviteParticipant(userId: string, input: {
   role: "provider" | "consumer" | "reviewer" | "participant";
 }) {
   await requireCollaborationAccess(userId, input.collaborationId, true);
+  const agentId = await resolveProjectAgent(input.projectId, input.agentId);
   const participant = {
     id: newId(),
     collaborationId: input.collaborationId,
     projectId: input.projectId,
-    agentId: input.agentId || null,
+    agentId,
     role: input.role,
     status: "invited" as const,
   };
@@ -104,12 +115,12 @@ export async function addSystemMessage(collaborationId: string, body: string) {
   await db.update(collaborations).set({ updatedAt: new Date() }).where(eq(collaborations.id, collaborationId));
 }
 
-export async function addUserMessage(userId: string, collaborationId: string, body: string) {
+export async function addUserMessage(userId: string, collaborationId: string, body: string, dispatch = true) {
   const { collaboration } = await requireCollaborationAccess(userId, collaborationId, true);
   const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   const id = newId();
   await db.insert(messages).values({
-    id, collaborationId, authorType: "user", authorName: user?.name ?? "用户", kind: "chat", body,
+    id, collaborationId, authorType: "user", authorName: user?.name ?? "用户", kind: "chat", body, metadata: { dispatch },
   });
   await db.update(collaborations).set({ updatedAt: new Date() }).where(eq(collaborations.id, collaboration.id));
   return id;
@@ -124,7 +135,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     .where(eq(participants.collaborationId, collaborationId))
     .orderBy(asc(participants.createdAt));
   const messageRows = await db.select().from(messages)
-    .where(eq(messages.collaborationId, collaborationId)).orderBy(asc(messages.createdAt));
+    .where(eq(messages.collaborationId, collaborationId)).orderBy(asc(messages.sequence));
   const artifactRows = await db.select().from(artifacts)
     .where(eq(artifacts.collaborationId, collaborationId)).orderBy(asc(artifacts.createdAt));
   const versionRows = artifactRows.length ? await db.select().from(artifactVersions)
@@ -145,9 +156,21 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     status: credentials.status, expiresAt: credentials.expiresAt, createdAt: credentials.createdAt,
   }).from(credentials).where(eq(credentials.collaborationId, collaborationId));
   const acceptanceRows = await db.select().from(acceptanceRuns)
-    .where(eq(acceptanceRuns.collaborationId, collaborationId)).orderBy(desc(acceptanceRuns.createdAt));
+    .where(eq(acceptanceRuns.collaborationId, collaborationId)).orderBy(desc(acceptanceRuns.sequence));
   const auditRows = await db.select().from(auditEvents)
-    .where(eq(auditEvents.collaborationId, collaborationId)).orderBy(desc(auditEvents.createdAt)).limit(100);
+    .where(eq(auditEvents.collaborationId, collaborationId)).orderBy(desc(auditEvents.sequence)).limit(100);
+  const availableProjects = (await listProjects(userId)).map((row) => ({
+    project: { id: row.project.id, name: row.project.name },
+    agent: row.agent ? { id: row.agent.id, name: row.agent.name } : null,
+  }));
+  const jobRows = await db.select({
+    id: connectorJobs.id, agentId: connectorJobs.agentId, kind: connectorJobs.kind,
+    status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt,
+  }).from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(20);
+  const agentIds = participantRows.flatMap((row) => row.agent ? [row.agent.id] : []);
+  const capabilityRows = agentIds.length ? await db.select().from(auditEvents).where(and(
+    eq(auditEvents.action, "connector.capabilities"), inArray(auditEvents.actorId, agentIds),
+  )).orderBy(desc(auditEvents.sequence)) : [];
 
   return {
     collaboration,
@@ -168,5 +191,13 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     credentials: credentialRows,
     acceptanceRuns: acceptanceRows,
     auditEvents: auditRows,
+    availableProjects,
+    jobs: jobRows,
+    connectorCapabilities: agentIds.flatMap((agentId) => {
+      const report = capabilityRows.find((row) => row.actorId === agentId);
+      if (!report) return [];
+      const metadata = report.metadata as { adapter: string; executionMode: string; testConfigured: boolean };
+      return [{ agentId, ...metadata, reportedAt: report.createdAt.toISOString() }];
+    }),
   };
 }

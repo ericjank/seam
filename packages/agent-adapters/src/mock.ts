@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentRunInput } from "./types";
+import type { AgentAdapter, AgentRunInput } from "./types.js";
 
 export class MockAgentAdapter implements AgentAdapter {
   readonly type = "mock" as const;
@@ -22,7 +22,7 @@ export class MockAgentAdapter implements AgentAdapter {
         needsHumanInput: false,
       };
     }
-    if (context.workItems.length === 0 && context.artifacts.length > 0) {
+    if (context.participant.role !== "provider" && !context.workItems.some((item) => item.assigneeParticipantId === context.participant.id) && context.artifacts.length > 0) {
       return {
         message: "契约草案已收到。我创建本项目的对接任务，完成后再提交真实测试证据。",
         kind: "status" as const,

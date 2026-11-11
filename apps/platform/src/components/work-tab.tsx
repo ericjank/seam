@@ -41,7 +41,7 @@ export function WorkTab({ data }: { data: CollaborationData }) {
         const raw = new FormData(event.currentTarget);
         try { await run(`/api/collaborations/${id}/work-items`, { ...Object.fromEntries(raw), operation: "update", workItemId: item.id }); } catch {}
       }}>
-        <select name="status" defaultValue={item.status} style={{ width: "auto" }}><option value="pending">待开始</option><option value="in_progress">实施中</option><option value="blocked">阻塞</option><option value="validating">验收中</option><option value="rejected">已拒绝</option></select>
+        <select name="status" defaultValue={item.status} style={{ width: "auto" }}>{item.status === "completed" && <option value="completed">已通过验收</option>}<option value="pending">待开始</option><option value="in_progress">实施中</option><option value="blocked">阻塞</option><option value="validating">验收中</option><option value="rejected">已拒绝</option></select>
         <input name="summary" placeholder="进度摘要（可选）" />
         <button className="btn btn-secondary btn-small">更新</button>
       </form>

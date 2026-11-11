@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireUser } from "@/lib/auth";
-import { handleApiError } from "@/lib/http";
+import { handleApiError, HttpError } from "@/lib/http";
 import { optionalUuid } from "@/lib/validation";
 import { requireParticipantAccess } from "@/lib/access";
 import { createProposal, decideProposal } from "@/services/proposals";
@@ -23,11 +23,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       actor = { kind: "participant", id: input.participantId };
     }
     if (input.operation === "decide") {
-      if (!input.proposalId || !input.decision) throw new Error("缺少提案或决定");
-      await decideProposal(actor, input.proposalId, input.decision, input.comment);
+      if (!input.proposalId || !input.decision) throw new HttpError(422, "缺少提案或决定");
+      await decideProposal(actor, input.proposalId, input.decision, input.comment, collaborationId);
       return NextResponse.json({ ok: true });
     }
-    if (!input.title || !input.body) throw new Error("缺少提案标题或内容");
+    if (!input.title || !input.body) throw new HttpError(422, "缺少提案标题或内容");
     return NextResponse.json(await createProposal(actor, collaborationId, { ...input, title: input.title, body: input.body }), { status: 201 });
   } catch (error) { return handleApiError(error); }
 }

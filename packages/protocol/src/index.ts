@@ -177,6 +177,7 @@ export const agentTurnResultSchema = z.object({
 export type AgentTurnResult = z.infer<typeof agentTurnResultSchema>;
 
 export const collaborationContextSchema = z.object({
+  jobId: idSchema.optional(),
   collaborationId: idSchema,
   title: z.string(),
   type: collaborationTypeSchema,
@@ -187,6 +188,25 @@ export const collaborationContextSchema = z.object({
   messages: z.array(collaborationMessageSchema),
   artifacts: z.array(artifactSchema),
   workItems: z.array(workItemSchema),
+  // Older user instructions remain visible even after the recent-message window moves on.
+  instructions: z.array(collaborationMessageSchema).default([]),
+  proposals: z.array(z.object({
+    id: idSchema, title: z.string(), body: z.string(),
+    status: z.enum(["open", "accepted", "rejected", "superseded"]),
+    artifactVersionId: idSchema.nullable(), approvalMode: z.enum(["all", "required"]),
+    approvals: z.array(z.object({ participantId: idSchema, decision: z.enum(["approved", "rejected"]), comment: z.string() })),
+  })).default([]),
+  credentialRequests: z.array(z.object({
+    id: idSchema, ownerParticipantId: idSchema, recipientParticipantId: idSchema,
+    name: z.string(), type: credentialTypeSchema, environment: z.string(), purpose: z.string(),
+    status: z.enum(["requested", "offered", "approved", "granted", "revoked", "rejected", "expired"]),
+    expiresAt: z.string().nullable(),
+  })).default([]),
+  acceptanceRuns: z.array(z.object({
+    id: idSchema, workItemId: idSchema.nullable(), participantId: idSchema,
+    artifactVersionId: idSchema.nullable(), status: z.enum(["passed", "failed"]),
+    summary: z.string(), evidence: z.record(z.string(), z.unknown()), createdAt: z.string(),
+  })).default([]),
 });
 export type CollaborationContext = z.infer<typeof collaborationContextSchema>;
 
@@ -202,6 +222,7 @@ export type ConnectorJob = z.infer<typeof connectorJobSchema>;
 
 export const connectorResultSchema = z.object({
   jobId: idSchema,
+  attempts: z.number().int().positive().optional(),
   status: z.enum(["completed", "failed"]),
   result: z.record(z.string(), z.unknown()).optional(),
   error: z.string().max(10_000).optional(),

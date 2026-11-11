@@ -1,22 +1,33 @@
 import { connectorJobSchema, type ConnectorJob } from "@seam/protocol";
-import type { ConnectorConfig } from "./config";
+import type { ConnectorConfig } from "./config.js";
+
+export interface ConnectorCapabilities {
+  adapter: ConnectorConfig["adapter"];
+  executionMode: "read-only" | "workspace-write" | "external";
+  testConfigured: boolean;
+}
 
 export class PlatformClient {
+  private attempts = new Map<string, number>();
   constructor(private config: ConnectorConfig) {}
 
-  async heartbeat() {
-    return this.request("/api/connectors/heartbeat", { agentId: this.config.agentId });
+  async heartbeat(capabilities?: ConnectorCapabilities) {
+    return this.request("/api/connectors/heartbeat", { agentId: this.config.agentId, capabilities });
   }
 
   async poll(): Promise<ConnectorJob | null> {
     const response = await this.request("/api/connectors/poll", { agentId: this.config.agentId, waitMs: 20000 });
-    return response.job ? connectorJobSchema.parse(response.job) : null;
+    const job = response.job ? connectorJobSchema.parse(response.job) : null;
+    if (job) this.attempts.set(job.id, job.attempts);
+    return job;
   }
 
   async complete(jobId: string, result: Record<string, unknown> | undefined, error?: string) {
-    return this.request("/api/connectors/complete", {
-      agentId: this.config.agentId, jobId, status: error ? "failed" : "completed", result, error,
+    const response = await this.request("/api/connectors/complete", {
+      agentId: this.config.agentId, jobId, attempts: this.attempts.get(jobId), status: error ? "failed" : "completed", result, error,
     });
+    this.attempts.delete(jobId);
+    return response;
   }
 
   async claimCredential(credentialId: string) {

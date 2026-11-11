@@ -1,80 +1,111 @@
-import { and, eq } from "drizzle-orm";
-import { db } from "@/db";
-import { agents, collaborations, connectorJobs, messages, participants } from "@/db/schema";
+import { and, eq, inArray } from "drizzle-orm";
+import { db, withTransaction } from "@/db";
+import { collaborations, connectorJobs, messages, participants } from "@/db/schema";
 import { agentTurnResultSchema, type CollaborationContext, type Participant } from "@seam/protocol";
 import { newId } from "@/lib/ids";
+import { HttpError } from "@/lib/http";
+import { nextWorkflowTargets, type Workflow } from "@/lib/workflow";
 import { requireCollaborationAccess } from "@/lib/access";
-import { getCollaborationDetail, addSystemMessage } from "./collaborations";
+import { getCollaborationDetail } from "./collaborations";
 import { upsertArtifact } from "./artifacts";
 import { createProposal, decideProposal } from "./proposals";
 import { createWorkItem, updateWorkItem } from "./work-items";
 import { requestCredential } from "./credentials";
 import { submitAcceptance } from "./acceptance";
 
-export async function dispatchAgentTurns(userId: string, collaborationId: string, participantIds?: string[]) {
+export async function dispatchAgentTurns(userId: string, collaborationId: string, participantIds?: string[], options: { autoAdvance?: boolean } = {}) {
   await requireCollaborationAccess(userId, collaborationId, true);
-  const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, collaborationId)).limit(1);
-  if (!collaboration || collaboration.negotiationRound >= collaboration.maxNegotiationRounds) throw new Error("已达到最大协商轮次，需要人工检查");
-  await db.update(collaborations).set({ negotiationRound: collaboration.negotiationRound + 1, updatedAt: new Date() }).where(eq(collaborations.id, collaborationId));
-  return enqueueTurns(userId, collaborationId, participantIds);
+  return withTransaction(async () => {
+    const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, collaborationId)).limit(1).for("update");
+    if (!collaboration) throw new HttpError(404, "协作不存在");
+    // Repeated clicks and messages join the current run. Polling refreshes its context.
+    const active = await db.select().from(connectorJobs).where(and(
+      eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"),
+      inArray(connectorJobs.status, ["pending", "running"]),
+    ));
+    if (active.length) return active.map((job) => job.id);
+    const detail = await getCollaborationDetail(userId, collaborationId);
+    const workflow: Workflow = {
+      id: newId(), round: 1, maxRounds: Math.max(1, Math.min(collaboration.maxNegotiationRounds, 12)),
+      autoAdvance: options.autoAdvance ?? false, inputMessageId: detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id,
+    };
+    return enqueueTurns(detail, workflow, participantIds);
+  });
 }
 
-async function enqueueTurns(userId: string, collaborationId: string, participantIds?: string[]) {
-  const detail = await getCollaborationDetail(userId, collaborationId);
-  const targets = detail.participants.filter((row) =>
-    row.participant.status === "active" && row.participant.agentId && (!participantIds || participantIds.includes(row.participant.id)));
+async function enqueueTurns(detail: Awaited<ReturnType<typeof getCollaborationDetail>>, workflow: Workflow, participantIds?: string[]) {
+  const targets = detail.participants.filter((row) => row.participant.status === "active" && row.participant.agentId &&
+    (!participantIds || participantIds.includes(row.participant.id)));
+  if (!targets.length) throw new HttpError(409, "没有可派发的项目 Agent，请先绑定 Agent 并接受项目邀请");
   const jobs = [];
   for (const row of targets) {
-    const context = buildContext(detail, row.participant.id);
     const id = newId();
+    const context = buildContext(detail, row.participant.id, id);
     await db.insert(connectorJobs).values({
-      id, agentId: row.participant.agentId as string, collaborationId, kind: "collaboration.turn", payload: { context },
+      id, agentId: row.participant.agentId as string, collaborationId: detail.collaboration.id,
+      kind: "collaboration.turn", payload: { context, workflow },
     });
     jobs.push(id);
   }
-  if (jobs.length) await addSystemMessage(collaborationId, `已向 ${jobs.length} 个项目 Agent 派发第 ${detail.collaboration.negotiationRound + 1} 轮协作。`);
+  await db.update(collaborations).set({ negotiationRound: detail.collaboration.negotiationRound + 1, updatedAt: new Date() })
+    .where(eq(collaborations.id, detail.collaboration.id));
+  await db.insert(messages).values({
+    id: newId(), collaborationId: detail.collaboration.id, authorType: "system", authorName: "Seam", kind: "system",
+    body: `已向 ${jobs.length} 个项目 Agent 派发本次第 ${workflow.round}/${workflow.maxRounds} 批协作。`,
+  });
   return jobs;
 }
 
-function buildContext(detail: Awaited<ReturnType<typeof getCollaborationDetail>>, participantId: string): CollaborationContext {
+export function buildContext(detail: Awaited<ReturnType<typeof getCollaborationDetail>>, participantId: string, jobId?: string): CollaborationContext {
   const participantRows: Participant[] = detail.participants.map((row) => ({
-    id: row.participant.id,
-    projectId: row.participant.projectId,
-    projectName: row.project.name,
-    agentId: row.participant.agentId,
-    agentName: row.agent?.name ?? null,
-    role: row.participant.role,
-    approvalRequired: row.participant.approvalRequired,
-    status: row.participant.status,
+    id: row.participant.id, projectId: row.participant.projectId, projectName: row.project.name,
+    agentId: row.participant.agentId, agentName: row.agent?.name ?? null,
+    role: row.participant.role, approvalRequired: row.participant.approvalRequired, status: row.participant.status,
   }));
   const participant = participantRows.find((row) => row.id === participantId);
-  if (!participant) throw new Error("参与方不存在");
+  if (!participant) throw new HttpError(404, "参与方不存在");
+  const mapMessage = (message: (typeof detail.messages)[number]) => ({
+    id: message.id, participantId: message.participantId, authorType: message.authorType, authorName: message.authorName,
+    kind: message.kind, body: message.body, metadata: message.metadata as Record<string, unknown>, createdAt: message.createdAt.toISOString(),
+  });
+  const referencedVersions = new Set(detail.proposals.map((p) => p.artifactVersionId));
   return {
-    collaborationId: detail.collaboration.id,
-    title: detail.collaboration.title,
-    type: detail.collaboration.type,
-    status: detail.collaboration.status,
-    objective: detail.collaboration.objective,
-    participant,
-    participants: participantRows,
-    messages: detail.messages.slice(-30).map((message) => ({
-      id: message.id, participantId: message.participantId, authorType: message.authorType,
-      authorName: message.authorName, kind: message.kind, body: message.body,
-      metadata: message.metadata as Record<string, unknown>, createdAt: message.createdAt.toISOString(),
-    })),
+    jobId, collaborationId: detail.collaboration.id, title: detail.collaboration.title,
+    type: detail.collaboration.type, status: detail.collaboration.status, objective: detail.collaboration.objective,
+    participant, participants: participantRows,
+    messages: detail.messages.slice(-30).map(mapMessage),
+    instructions: detail.messages.filter((message) => message.authorType === "user").map(mapMessage),
     artifacts: detail.artifacts.map((artifact) => ({
       id: artifact.id, title: artifact.title, type: artifact.type, currentVersion: artifact.currentVersion,
-      versions: artifact.versions.map((version) => ({
+      versions: artifact.versions.filter((v) => v.version >= artifact.currentVersion - 1 || referencedVersions.has(v.id)).map((version) => ({
         id: version.id, artifactId: version.artifactId, version: version.version, content: version.content,
-        contentHash: version.contentHash, createdByParticipantId: version.createdByParticipantId,
-        createdAt: version.createdAt.toISOString(),
+        contentHash: version.contentHash, createdByParticipantId: version.createdByParticipantId, createdAt: version.createdAt.toISOString(),
       })),
     })),
     workItems: detail.workItems.map((item) => ({
       id: item.id, title: item.title, description: item.description, assigneeParticipantId: item.assigneeParticipantId,
       status: item.status, priority: item.priority, acceptanceCriteria: item.acceptanceCriteria, dependsOn: item.dependsOn,
     })),
+    proposals: detail.proposals.map((p) => ({
+      id: p.id, title: p.title, body: p.body, status: p.status, artifactVersionId: p.artifactVersionId, approvalMode: p.approvalMode,
+      approvals: p.approvals.map((a) => ({ participantId: a.participantId, decision: a.decision, comment: a.comment })),
+    })),
+    credentialRequests: detail.credentials.map((c) => ({ ...c, expiresAt: c.expiresAt?.toISOString() ?? null })),
+    acceptanceRuns: detail.acceptanceRuns.map((a) => ({
+      id: a.id, workItemId: a.workItemId, participantId: a.participantId, artifactVersionId: a.artifactVersionId,
+      status: a.status, summary: a.summary, evidence: a.evidence as Record<string, unknown>, createdAt: a.createdAt.toISOString(),
+    })),
   };
+}
+
+// Refresh at claim time, rather than making a queued agent act on an obsolete snapshot.
+export async function refreshAgentJobContext(job: { id: string; kind: string; agentId: string; collaborationId: string | null; payload: unknown }) {
+  if (job.kind !== "collaboration.turn" || !job.collaborationId) return job.payload;
+  const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId)).limit(1);
+  const [participant] = await db.select().from(participants).where(and(eq(participants.agentId, job.agentId), eq(participants.collaborationId, job.collaborationId))).limit(1);
+  if (!collaboration || participant?.status !== "active") throw new HttpError(409, "协作或有效参与方已不存在");
+  const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
+  return { ...(job.payload as Record<string, unknown>), context: buildContext(detail, participant.id, job.id) };
 }
 
 export async function completeAgentTurn(jobId: string, result: unknown) {
@@ -82,36 +113,109 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   if (!job?.collaborationId || job.kind !== "collaboration.turn") return;
   const [participant] = await db.select().from(participants)
     .where(and(eq(participants.agentId, job.agentId), eq(participants.collaborationId, job.collaborationId))).limit(1);
-  if (!participant) throw new Error("找不到返回结果对应的参与方");
-  const turn = agentTurnResultSchema.parse((result as { agentTurn: unknown }).agentTurn);
+  if (!participant) throw new HttpError(409, "找不到返回结果对应的参与方");
+  const turn = agentTurnResultSchema.parse((result as { agentTurn: unknown })?.agentTurn);
+  const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId)).limit(1);
+  if (!collaboration) throw new HttpError(404, "协作不存在");
+  const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
+  // Validate the entire batch before applying any action. An Agent can participate in
+  // multiple collaborations, but IDs from one run must never affect another.
+  for (const action of turn.actions) {
+    if ("artifactId" in action && action.artifactId && !detail.artifacts.some((a) => a.id === action.artifactId)) throw new HttpError(422, "产物不属于当前协作");
+    if ("workItemId" in action && action.workItemId && !detail.workItems.some((w) => w.id === action.workItemId)) throw new HttpError(422, "任务不属于当前协作");
+    if (action.type === "proposal.decide" && !detail.proposals.some((p) => p.id === action.proposalId)) throw new HttpError(422, "提案不属于当前协作");
+    if (action.type === "credential.request" && !detail.participants.some((p) => p.participant.id === action.ownerParticipantId && p.participant.status === "active")) throw new HttpError(422, "凭据提供方不是当前协作的有效参与方");
+  }
   const actor = { kind: "participant" as const, id: participant.id };
+  let changed = false;
+  for (const action of turn.actions) {
+    if (action.type === "artifact.upsert") {
+      const outcome = await upsertArtifact(actor, job.collaborationId, { artifactId: action.artifactId, title: action.title, type: action.artifactType, content: action.content });
+      changed ||= !outcome.unchanged;
+    } else if (action.type === "proposal.create") {
+      const artifact = detail.artifacts.find((a) => a.id === action.artifactId);
+      const versionId = artifact?.versions.find((v) => v.version === artifact.currentVersion)?.id ?? null;
+      if (!changed && detail.proposals.some((p) => ["open", "accepted"].includes(p.status) && p.title === action.title && p.body === action.body && p.artifactVersionId === versionId && p.approvalMode === action.approvalMode)) continue;
+      await createProposal(actor, job.collaborationId, action); changed = true;
+    } else if (action.type === "proposal.decide") {
+      const proposal = detail.proposals.find((p) => p.id === action.proposalId);
+      if (!changed && proposal?.approvals.some((a) => a.participantId === participant.id && a.decision === action.decision && a.comment === action.comment)) continue;
+      await decideProposal(actor, action.proposalId, action.decision, action.comment); changed = true;
+    } else if (action.type === "work.create") {
+      if (detail.workItems.some((w) => w.title === action.title && w.description === action.description &&
+        w.assigneeParticipantId === (action.assigneeParticipantId ?? null) && w.priority === action.priority &&
+        w.acceptanceCriteria === action.acceptanceCriteria && [...w.dependsOn].sort().join() === [...action.dependsOn].sort().join())) continue;
+      await createWorkItem(actor, job.collaborationId, action); changed = true;
+    } else if (action.type === "work.update") {
+      const outcome = await updateWorkItem(actor, action.workItemId, action, job.collaborationId);
+      // Status commentary alone must not trigger an endless exchange.
+      changed ||= outcome.changed;
+    } else if (action.type === "credential.request") {
+      if (detail.credentials.some((c) => c.ownerParticipantId === action.ownerParticipantId && c.recipientParticipantId === participant.id &&
+        c.name === action.name && c.type === action.credentialType && c.environment === action.environment && c.purpose === action.purpose &&
+        (!action.expiresAt || c.expiresAt?.toISOString() === action.expiresAt) &&
+        ["requested", "offered", "approved", "granted"].includes(c.status) && (!c.expiresAt || c.expiresAt > new Date()))) continue;
+      await requestCredential(actor, job.collaborationId, { ...action, type: action.credentialType, expiresAt: action.expiresAt ? new Date(action.expiresAt) : undefined }); changed = true;
+    } else if (action.type === "acceptance.submit") {
+      await submitAcceptance(actor, job.collaborationId, action); changed = true;
+    }
+  }
   await db.insert(messages).values({
     id: newId(), collaborationId: job.collaborationId, participantId: participant.id,
     authorType: "agent", authorName: participant.id, kind: turn.kind, body: turn.message,
-    metadata: { needsHumanInput: turn.needsHumanInput, actionCount: turn.actions.length },
+    metadata: { jobId, needsHumanInput: turn.needsHumanInput, actionCount: turn.actions.length, workflowChanged: changed },
   });
-  for (const action of turn.actions) {
-    if (action.type === "artifact.upsert") {
-      await upsertArtifact(actor, job.collaborationId, { artifactId: action.artifactId, title: action.title, type: action.artifactType, content: action.content });
-    } else if (action.type === "proposal.create") {
-      await createProposal(actor, job.collaborationId, action);
-    } else if (action.type === "proposal.decide") {
-      await decideProposal(actor, action.proposalId, action.decision, action.comment);
-    } else if (action.type === "work.create") {
-      await createWorkItem(actor, job.collaborationId, action);
-    } else if (action.type === "work.update") {
-      await updateWorkItem(actor, action.workItemId, action);
-    } else if (action.type === "credential.request") {
-      await requestCredential(actor, job.collaborationId, {
-        ...action, type: action.credentialType, expiresAt: action.expiresAt ? new Date(action.expiresAt) : undefined,
+  await db.update(collaborations).set({ updatedAt: new Date() }).where(eq(collaborations.id, job.collaborationId));
+}
+
+export async function advanceAgentWorkflow(jobId: string) {
+  const [job] = await db.select().from(connectorJobs).where(eq(connectorJobs.id, jobId)).limit(1);
+  const workflow = (job?.payload as { workflow?: Workflow } | undefined)?.workflow;
+  if (!job?.collaborationId || !workflow) return;
+  return withTransaction(async () => {
+    const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId!)).limit(1).for("update");
+    if (!collaboration) return;
+    const allJobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, collaboration.id), eq(connectorJobs.kind, "collaboration.turn")));
+    const runJobs = allJobs.filter((j) => (j.payload as { workflow?: Workflow }).workflow?.id === workflow.id);
+    if (runJobs.some((j) => (j.payload as { workflow: Workflow }).workflow.round > workflow.round)) return;
+    const batch = runJobs.filter((j) => (j.payload as { workflow: Workflow }).workflow.round === workflow.round);
+    if (batch.some((j) => j.status === "running" || j.status === "pending")) return;
+    // A newer explicit run supersedes a late callback from an older one.
+    if (allJobs.some((j) => j.status === "pending" || j.status === "running")) return;
+    const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
+    if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
+    const lastInputId = detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id;
+    const outcome = nextWorkflowTargets({
+      workflow, failed: batch.some((j) => j.status !== "completed"), completed: collaboration.status === "completed",
+      activeParticipantIds: detail.participants.filter((p) => p.participant.status === "active" && p.participant.agentId).map((p) => p.participant.id),
+      newInstruction: lastInputId !== workflow.inputMessageId,
+      turns: batch.flatMap((j) => {
+        const parsed = agentTurnResultSchema.safeParse((j.result as { agentTurn?: unknown } | null)?.agentTurn);
+        const participant = detail.participants.find((p) => p.participant.agentId === j.agentId);
+        const message = detail.messages.find((m) => (m.metadata as Record<string, unknown>).jobId === j.id);
+        return parsed.success && participant ? [{ participantId: participant.participant.id, turn: parsed.data, changed: (message?.metadata as Record<string, unknown> | undefined)?.workflowChanged === true }] : [];
+      }),
+    });
+    if (outcome.targets.length) {
+      const newInstruction = lastInputId !== workflow.inputMessageId;
+      if (newInstruction) {
+        await db.insert(messages).values({
+          id: newId(), collaborationId: collaboration.id, authorType: "system", authorName: "Seam", kind: "system",
+          body: "已收到执行期间补充的新指令，开始新的有界推进。", metadata: { workflowStopped: workflow.id },
+        });
+      }
+      await enqueueTurns(detail, {
+        ...workflow, id: newInstruction ? newId() : workflow.id, round: newInstruction ? 1 : workflow.round + 1,
+        autoAdvance: newInstruction ? true : workflow.autoAdvance, inputMessageId: lastInputId,
+      }, outcome.targets);
+    } else {
+      // Idempotent stop marker, also visible to people through the normal event stream.
+      if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
+      await db.insert(messages).values({
+        id: newId(), collaborationId: collaboration.id, authorType: "system", authorName: "Seam", kind: "system",
+        body: outcome.reason!, metadata: { workflowStopped: workflow.id },
       });
-    } else if (action.type === "acceptance.submit") {
-      await submitAcceptance(actor, job.collaborationId, action);
+      await db.update(collaborations).set({ updatedAt: new Date() }).where(eq(collaborations.id, collaboration.id));
     }
-  }
-  const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId)).limit(1);
-  if (turn.notifyParticipantIds.length && collaboration && collaboration.negotiationRound < collaboration.maxNegotiationRounds) {
-    await db.update(collaborations).set({ negotiationRound: collaboration.negotiationRound + 1, updatedAt: new Date() }).where(eq(collaborations.id, collaboration.id));
-    await enqueueTurns(collaboration.createdById, collaboration.id, turn.notifyParticipantIds);
-  }
+  });
 }

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireUser } from "@/lib/auth";
-import { handleApiError } from "@/lib/http";
+import { handleApiError, HttpError } from "@/lib/http";
 import { optionalUuid } from "@/lib/validation";
 import { createWorkItem, updateWorkItem } from "@/services/work-items";
 
@@ -19,11 +19,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }).parse(await request.json());
     const actor = { kind: "user" as const, id: user.id };
     if (input.operation === "update") {
-      if (!input.workItemId) throw new Error("缺少任务 ID");
-      await updateWorkItem(actor, input.workItemId, input);
+      if (!input.workItemId) throw new HttpError(422, "缺少任务 ID");
+      await updateWorkItem(actor, input.workItemId, input, collaborationId);
       return NextResponse.json({ ok: true });
     }
-    if (!input.title) throw new Error("缺少任务标题");
+    if (!input.title) throw new HttpError(422, "缺少任务标题");
     return NextResponse.json(await createWorkItem(actor, collaborationId, { ...input, title: input.title }), { status: 201 });
   } catch (error) { return handleApiError(error); }
 }

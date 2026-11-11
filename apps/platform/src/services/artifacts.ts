@@ -20,6 +20,21 @@ export async function upsertArtifact(actor: Actor, collaborationId: string, inpu
   let artifactId = input.artifactId;
   let version = 1;
   let warnings: string[] = [];
+  let invalidatesAgreement = ["openapi", "asyncapi", "json-schema"].includes(input.type);
+
+  // Agents may repeat a create action after seeing another party's reply. Reusing
+  // an identical published artifact avoids manufacturing a new contract version.
+  if (!artifactId) {
+    const candidates = await db.select().from(artifacts).where(and(
+      eq(artifacts.collaborationId, collaborationId), eq(artifacts.title, input.title), eq(artifacts.type, input.type),
+    ));
+    for (const candidate of candidates) {
+      const [latest] = await db.select().from(artifactVersions).where(and(
+        eq(artifactVersions.artifactId, candidate.id), eq(artifactVersions.version, candidate.currentVersion),
+      )).limit(1);
+      if (latest?.contentHash === hash) return { artifactId: candidate.id, version: latest.version, unchanged: true, warnings: [] };
+    }
+  }
 
   if (artifactId) {
     const [existing] = await db.select().from(artifacts)
@@ -32,9 +47,15 @@ export async function upsertArtifact(actor: Actor, collaborationId: string, inpu
     if (latest && ["openapi", "asyncapi", "json-schema"].includes(existing.type)) {
       warnings = analyzeContractDiff(latest.content, input.content);
     }
-    await db.update(proposals).set({ status: "superseded", updatedAt: new Date() })
-      .where(and(eq(proposals.collaborationId, collaborationId), inArray(proposals.status, ["open", "accepted"])));
-    await db.update(workItems).set({ status: "in_progress", updatedAt: new Date() })
+    const previousVersions = await db.select({ id: artifactVersions.id }).from(artifactVersions).where(eq(artifactVersions.artifactId, artifactId));
+    const linkedProposals = previousVersions.length ? await db.select({ id: proposals.id }).from(proposals).where(and(
+      eq(proposals.collaborationId, collaborationId), inArray(proposals.artifactVersionId, previousVersions.map((v) => v.id)),
+      inArray(proposals.status, ["open", "accepted"]),
+    )) : [];
+    invalidatesAgreement ||= linkedProposals.length > 0;
+    if (linkedProposals.length) await db.update(proposals).set({ status: "superseded", updatedAt: new Date() })
+      .where(inArray(proposals.id, linkedProposals.map((p) => p.id)));
+    if (invalidatesAgreement) await db.update(workItems).set({ status: "in_progress", updatedAt: new Date() })
       .where(and(eq(workItems.collaborationId, collaborationId), inArray(workItems.status, ["validating", "completed"])));
     await db.update(artifacts).set({ currentVersion: version, updatedAt: new Date() }).where(eq(artifacts.id, artifactId));
   } else {
@@ -46,8 +67,8 @@ export async function upsertArtifact(actor: Actor, collaborationId: string, inpu
   await db.insert(artifactVersions).values({
     id: versionId, artifactId, version, content: input.content, contentHash: hash, createdByParticipantId: participantId,
   });
-  await db.update(collaborations).set({ status: "negotiating", updatedAt: new Date() }).where(eq(collaborations.id, collaborationId));
-  await addSystemMessage(collaborationId, `产物《${input.title}》已发布 v${version}，相关审批与验收需要重新确认。${warnings.length ? `\n${warnings.join("\n")}` : ""}`);
+  await db.update(collaborations).set({ ...(invalidatesAgreement ? { status: "negotiating" as const } : {}), updatedAt: new Date() }).where(eq(collaborations.id, collaborationId));
+  await addSystemMessage(collaborationId, `产物《${input.title}》已发布 v${version}。${invalidatesAgreement ? "相关契约审批与验收需要确认。" : ""}${warnings.length ? `\n${warnings.join("\n")}` : ""}`);
   await audit({ collaborationId, actorType: actor.kind === "user" ? "user" : "agent", actorId: actor.id, action: "artifact.version_created", metadata: { artifactId, version, warnings } });
   return { artifactId, versionId, version, unchanged: false, warnings };
 }
