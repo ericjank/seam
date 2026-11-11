@@ -51,7 +51,7 @@ export function ProjectManager({ rows }: { rows: ProjectRow[] }) {
         }}>
           <div className="field"><label>所属项目</label><select name="projectId" required>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
           <div className="field"><label>Agent 名称</label><input name="name" required placeholder="backend-ai" /></div>
-          <div className="field"><label>适配器</label><select name="adapter"><option value="claude-code">Claude Code</option><option value="codex">Codex CLI</option><option value="generic-cli">通用 CLI</option><option value="mock">Mock（联调测试）</option></select></div>
+          <div className="field"><label>适配器</label><select name="adapter"><option value="codex-app-server">Codex 持久对话（推荐）</option><option value="claude-code">Claude Code</option><option value="codex">Codex CLI</option><option value="generic-cli">通用 CLI</option><option value="mock">Mock（联调测试）</option></select></div>
           <button className="btn" disabled={!projects.length}>生成 Connector 凭据</button>
         </form>
       </section>

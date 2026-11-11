@@ -1,5 +1,7 @@
 "use client";
 
+import { formatDateTime } from "@/lib/date-time";
+
 import { useAction } from "./use-action";
 import type { CollaborationData } from "./detail-types";
 
@@ -31,7 +33,7 @@ export function GrantsTab({ data }: { data: CollaborationData }) {
       <div className="card-header"><div><h2>{credential.name}</h2><span className="small muted">{credential.type} · {credential.environment} · {credential.id}</span></div><span className={`badge ${["approved", "granted"].includes(credential.status) ? "badge-green" : credential.status === "revoked" ? "badge-red" : "badge-amber"}`}>{credential.status}</span></div>
       <p className="muted">{credential.purpose}</p>
       <p className="small muted">提供方：{data.participants.find((row) => row.participant.id === credential.ownerParticipantId)?.project.name} · 接收方：{data.participants.find((row) => row.participant.id === credential.recipientParticipantId)?.project.name}</p>
-      {credential.expiresAt && <p className="small muted">到期：{new Date(credential.expiresAt).toLocaleString("zh-CN")}</p>}
+      {credential.expiresAt && <p className="small muted">到期：{formatDateTime(credential.expiresAt)}</p>}
       <div className="row">
         {["requested", "offered"].includes(credential.status) && <form className="row" onSubmit={async (event) => {
           event.preventDefault();

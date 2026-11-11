@@ -8,6 +8,7 @@ import {
   artifacts,
   auditEvents,
   collaborations,
+  lifecycleRevisions,
   connectorJobs,
   credentials,
   dependencies,
@@ -23,6 +24,7 @@ import { requireCollaborationAccess, requireParticipantAccess, requireProjectAcc
 import { audit } from "@/lib/audit";
 import { listProjects } from "./projects";
 import { HttpError } from "@/lib/http";
+import { getLifecycleContext } from "./lifecycle";
 
 async function resolveProjectAgent(projectId: string, agentId?: string) {
   const candidates = await db.select({ id: agents.id }).from(agents).where(eq(agents.projectId, projectId));
@@ -117,6 +119,7 @@ export async function addSystemMessage(collaborationId: string, body: string) {
 
 export async function addUserMessage(userId: string, collaborationId: string, body: string, dispatch = true) {
   const { collaboration } = await requireCollaborationAccess(userId, collaborationId, true);
+  if (await getLifecycleContext(collaborationId)) throw new HttpError(409, "自动对接任务请通过补充要求创建新一轮文档，当前批准内容不能通过聊天改写");
   const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   const id = newId();
   await db.insert(messages).values({
@@ -127,7 +130,7 @@ export async function addUserMessage(userId: string, collaborationId: string, bo
 }
 
 export async function getCollaborationDetail(userId: string, collaborationId: string) {
-  const { collaboration } = await requireCollaborationAccess(userId, collaborationId);
+  const { collaboration, role } = await requireCollaborationAccess(userId, collaborationId);
   const participantRows = await db.select({ participant: participants, project: projects, agent: agents })
     .from(participants)
     .innerJoin(projects, eq(participants.projectId, projects.id))
@@ -165,7 +168,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
   }));
   const jobRows = await db.select({
     id: connectorJobs.id, agentId: connectorJobs.agentId, kind: connectorJobs.kind,
-    status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt,
+    status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt, result: connectorJobs.result,
   }).from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(20);
   const agentIds = participantRows.flatMap((row) => row.agent ? [row.agent.id] : []);
   const capabilityRows = agentIds.length ? await db.select().from(auditEvents).where(and(
@@ -174,6 +177,9 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
 
   return {
     collaboration,
+    canAdminister: role === "owner",
+    lifecycle: await getLifecycleContext(collaborationId),
+    lifecycleHistory: await db.select({ revision: lifecycleRevisions.revision, requirements: lifecycleRevisions.requirements, document: lifecycleRevisions.document, documentHash: lifecycleRevisions.documentHash, report: lifecycleRevisions.report }).from(lifecycleRevisions).where(eq(lifecycleRevisions.collaborationId, collaborationId)).orderBy(desc(lifecycleRevisions.revision)),
     participants: participantRows,
     messages: messageRows,
     artifacts: artifactRows.map((artifact) => ({
@@ -192,7 +198,11 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     acceptanceRuns: acceptanceRows,
     auditEvents: auditRows,
     availableProjects,
-    jobs: jobRows,
+    jobs: jobRows.map(({ result, ...job }) => {
+      const conversation = (result as { conversation?: { threadId?: unknown; transport?: unknown } } | null)?.conversation;
+      return { ...job, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)
+        ? { threadId: conversation.threadId, transport: "codex-app-server" as const } : null };
+    }),
     connectorCapabilities: agentIds.flatMap((agentId) => {
       const report = capabilityRows.find((row) => row.actorId === agentId);
       if (!report) return [];

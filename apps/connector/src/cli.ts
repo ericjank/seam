@@ -10,9 +10,12 @@ try {
     console.log(`Seam Connector
   node --env-file=/path/to/private/connector.env apps/connector/dist/cli.js
   --doctor                 本地诊断，无需中心凭据，不调用 AI
-  --adapter codex          使用本机已安装并登录的 Codex
+  --adapter codex-app-server  推荐：按协作保持本机 Codex 持久会话
+  --adapter codex          兼容：每轮独立调用 codex exec
+  --app-server-state-dir <path>  本机私有会话映射目录（默认 ~/.seam/threads）
   --project-root <path>    本项目目录
   --codex-sandbox <mode>   read-only（默认）或 workspace-write（本机明确授权后选择）
+  --codex-network-access <true|false>  本地网络能力（默认false，仅批准的executing生效）
   --once                   处理至多一个中心任务后退出
   --platform <url> --agent-id <id> --token <token>  建议改用私有 env 文件配置`);
   } else {

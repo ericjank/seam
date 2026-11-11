@@ -28,9 +28,11 @@ vi.mock("@/db", () => ({
 vi.mock("@/services/actor", () => ({ authorizeActor: vi.fn(async (): Promise<string | null> => "participant") }));
 vi.mock("@/services/collaborations", () => ({ addSystemMessage: vi.fn() }));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn() }));
+vi.mock("@/services/lifecycle", () => ({ getLifecycleContext: vi.fn(async () => null) }));
 
 import { submitAcceptance } from "../src/services/acceptance";
 import { authorizeActor } from "../src/services/actor";
+import { getLifecycleContext } from "../src/services/lifecycle";
 
 const actor = { kind: "participant" as const, id: "participant" };
 const work = { id: "work", collaborationId: "collaboration", status: "validating", title: "开发", assigneeParticipantId: "participant" };
@@ -40,9 +42,16 @@ beforeEach(() => {
   state.queries = []; state.updates = []; state.inserts = [];
   vi.clearAllMocks();
   vi.mocked(authorizeActor).mockResolvedValue("participant");
+  vi.mocked(getLifecycleContext).mockResolvedValue(null);
 });
 
 describe("真实验收与工作任务约束", () => {
+  it("自动对接的任务验收不能替代管理员终止", async () => {
+    vi.mocked(getLifecycleContext).mockResolvedValue({ phase: "executing" } as any);
+    state.queries.push([work], []);
+    await submitAcceptance(actor, "collaboration", passed);
+    expect(state.updates.map((update) => update.status)).toEqual(["completed", "validating"]);
+  });
   it("不能把另一个协作的任务标为验收通过", async () => {
     state.queries.push([]);
     await expect(submitAcceptance(actor, "collaboration", passed)).rejects.toMatchObject({ status: 404 });

@@ -14,6 +14,8 @@ describe("本机接入诊断", () => {
     expect(report.platformCredentialsConfigured).toBe(false);
     expect(JSON.stringify(report)).not.toContain('"token"');
     expect(readConfig(["--doctor", "--codex-sandbox", "workspace-write"], {}).codexSandbox).toBe("workspace-write");
+    const network = readConfig(["--doctor"], { SEAM_CODEX_NETWORK_ACCESS: "true" });
+    expect((await diagnoseConnector(network)).executionNetworkConfigured).toBe(true);
   });
 
   it("配置错误在启动前给出明确错误", () => {
@@ -21,6 +23,7 @@ describe("本机接入诊断", () => {
     expect(() => readConfig(["--doctor", "--adapter", "unknown"], {})).toThrow();
     expect(() => readConfig(["--doctor", "--adapter"], {})).toThrow("缺少值");
     expect(() => readConfig(["--doctor"], { SEAM_POLL_INTERVAL_MS: "NaN" })).toThrow();
+    expect(() => readConfig(["--doctor"], { SEAM_CODEX_NETWORK_ACCESS: "yes" })).toThrow();
     expect(() => readConfig([], {})).toThrow("SEAM_AGENT_ID");
   });
 

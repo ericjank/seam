@@ -13,7 +13,7 @@ Seam is an Agent collaboration platform for independent projects. Source code an
 
 - Multi-party, cross-organization collaboration for APIs, events, data contracts, release coordination, and custom work.
 - Local Connector + A2A: Agent Card and JSON-RPC `message/send`, `tasks/get`, and `tasks/cancel`.
-- Adapters for Claude Code, Codex CLI, generic CLIs, and a deterministic Mock Agent.
+- Adapters for persistent native Codex conversations, Claude Code, compatible Codex CLI, generic CLIs, and a deterministic Mock Agent.
 - Multi-Agent conversations, structured proposals, required-party or unanimous approval, task dependencies, and negotiation limits.
 - Versioned OpenAPI, AsyncAPI, JSON Schema, and Markdown artifacts, with breaking-change warnings.
 - Automatic invalidation of previous approvals and acceptance when a contract changes.
@@ -27,13 +27,10 @@ Seam is an Agent collaboration platform for independent projects. Source code an
 
 Team A uses Claude Code for an order frontend, while Team B uses Codex for the order service. They need a new Create Order API without repeatedly copying API documents and review comments between people.
 
-1. Each team starts a Connector in its own project directory, keeping its source code local.
-2. Team A creates a Create Order API collaboration and invites the order service project. Team B accepts the invitation.
-3. Click **Run an Agent negotiation round**. The backend Agent publishes an OpenAPI draft, and the frontend Agent requests changes to fields, error codes, pagination, and other details.
-4. Both Agents turn the final contract into a proposal, approve the same version, and create their implementation tasks.
-5. When the frontend needs to call the test environment, it requests a test API token through the credential workflow. The backend owner submits it encrypted and approves access, allowing the frontend Connector to collect it once.
-6. After implementation, each side runs contract tests locally and uploads only test results and evidence. The collaboration is accepted when all tasks pass.
-7. When fields are removed or response structures change, publish a new contract version. Previous approvals and acceptance are invalidated automatically, requiring another review.
+1. Both teams connect their local Agents. An administrator selects the two projects and submits the Create Order API goal.
+2. The Agents negotiate interfaces, implementation steps and tests, then confirm the same complete document.
+3. The administrator approves it. Both Agents implement and test, and Seam assembles their evidence into a report.
+4. Additional requirements start another plan and approval cycle. Once satisfied, the administrator explicitly terminates the task.
 
 ### Integrating with an external company while keeping source code private
 
@@ -151,7 +148,7 @@ node apps/connector/dist/cli.js \
   --adapter mock
 ```
 
-Supported `--adapter` values are `claude-code`, `codex`, `generic-cli`, and `mock`. Real AI CLIs must be installed and authenticated locally first.
+Supported `--adapter` values are `codex-app-server` (recommended), `claude-code`, `codex` (legacy single-turn CLI), `generic-cli`, and `mock`. Codex must already be installed and authenticated locally. App Server threads persist across Connector restarts and can be opened from the platform.
 
 Configure a generic CLI with the following environment variables. The complete negotiation prompt is appended as the last command argument:
 
@@ -168,25 +165,18 @@ export SEAM_TEST_COMMAND='pnpm test:contract'
 
 ## Collaboration workflow
 
-1. Create a collaboration and invite other projects. Members of the target projects accept the invitations.
-2. Click **Run an Agent negotiation round**. Each Connector claims its task and returns structured messages and actions.
-3. Turn the contract or documentation into a proposal. Implementation starts after the required participants approve the same version.
-4. Request, submit, approve, and collect integration credentials through the dedicated credential workflow when needed.
-5. Each project implements and tests locally, uploading only test summaries and evidence.
-6. Acceptance completes when all tasks are done. Contract changes reopen the relevant workflow.
+1. Connect both project Agents locally, select the two projects, enter the goal and submit once.
+2. Both Agents inspect their projects read-only, submit implementation plans, and confirm the same assembled document hash. Changes invalidate prior confirmations.
+3. An administrator reviews the complete document and explicitly approves that revision for execution.
+4. Both Agents implement and test locally, then submit actual evidence. Seam assembles the implementation report.
+5. Add requirements to start a fresh revision, negotiate again, and approve the new plan. Previous approval cannot authorize a new revision.
+6. After reviewing the final report, the administrator explicitly terminates the collaboration. Reports never automatically close it.
+
+Use `--adapter codex-app-server` with a local `SEAM_CODEX_SANDBOX=workspace-write` capability. For test endpoints or dependencies, a local maintainer can also set `SEAM_CODEX_NETWORK_ACCESS=true`; network access remains disabled during planning. Planning and unapproved turns remain read-only; writing requires the current executing phase and matching approved document hash. The adapter persists native threads, resumes after restarts, serializes turns and rejects interactive approvals on the unattended channel. Legacy invitations and collaboration APIs remain available.
+
+See [local Docker simulation with real Codex](docs/端到端模拟验证.md) for the full two-revision scenario, and [earlier workflow analysis](docs/AI协作改进.md) for the original dialogue-chain findings.
 
 ## Verification
-
-Chat messages now dispatch work by default. Agents receive persistent user instructions,
-current proposals, credential request metadata and acceptance results. Real shared changes
-automatically hand off to the relevant projects, with a fresh bounded budget per request.
-Runs pause on missing human input, failure or no new handoff. The UI also shows actual
-Connector execution modes and durable job errors.
-
-Run `node --env-file=/path/to/private/seam.env apps/connector/dist/cli.js --doctor`
-before connecting. Codex defaults to `read-only`; a local maintainer may explicitly choose
-`SEAM_CODEX_SANDBOX=workspace-write`. Platform messages cannot change this policy.
-See [AI collaboration improvements](docs/AI协作改进.md) for configuration, diagnosis and validation.
 
 ```bash
 pnpm lint

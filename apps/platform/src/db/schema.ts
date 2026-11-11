@@ -4,6 +4,7 @@ import {
   index,
   int,
   json,
+  longtext,
   mysqlEnum,
   mysqlTable,
   text,
@@ -54,7 +55,7 @@ export const agents = mysqlTable("agents", {
   id: id().primaryKey(),
   projectId: varchar("project_id", { length: 36 }).notNull().references(() => projects.id, { onDelete: "cascade" }),
   name: varchar("name", { length: 100 }).notNull(),
-  adapter: mysqlEnum("adapter", ["claude-code", "codex", "generic-cli", "mock"]).notNull(),
+  adapter: mysqlEnum("adapter", ["claude-code", "codex", "codex-app-server", "generic-cli", "mock"]).notNull(),
   status: mysqlEnum("status", ["offline", "online", "busy", "error"]).notNull().default("offline"),
   tokenHash: varchar("token_hash", { length: 64 }).notNull(),
   lastSeenAt: timestamp("last_seen_at", { fsp: 3 }),
@@ -219,3 +220,43 @@ export const auditEvents = mysqlTable("audit_events", {
   metadata: json("metadata").notNull().default({}),
   createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 }, (table) => [index("audit_collab_created_idx").on(table.collaborationId, table.createdAt)]);
+
+// Optional managed lifecycle. Legacy collaborations keep their existing workflow.
+export const collaborationLifecycles = mysqlTable("collaboration_lifecycles", {
+  collaborationId: varchar("collaboration_id", { length: 36 }).primaryKey().references(() => collaborations.id, { onDelete: "cascade" }),
+  revision: int("revision").notNull().default(1),
+  phase: mysqlEnum("phase", ["planning", "plan_confirmation", "awaiting_approval", "executing", "awaiting_review", "terminated"]).notNull().default("planning"),
+  requiredParticipantIds: json("required_participant_ids").$type<string[]>().notNull(),
+  documentHash: varchar("document_hash", { length: 64 }),
+  approvedHash: varchar("approved_hash", { length: 64 }),
+  approvedById: varchar("approved_by_id", { length: 36 }).references(() => users.id),
+  approvedAt: timestamp("approved_at", { fsp: 3 }),
+  terminatedById: varchar("terminated_by_id", { length: 36 }).references(() => users.id),
+  terminatedAt: timestamp("terminated_at", { fsp: 3 }),
+  ...timestamps,
+});
+
+export const lifecycleRevisions = mysqlTable("lifecycle_revisions", {
+  id: id().primaryKey(),
+  collaborationId: varchar("collaboration_id", { length: 36 }).notNull().references(() => collaborations.id, { onDelete: "cascade" }),
+  revision: int("revision").notNull(),
+  requirements: longtext("requirements").notNull(),
+  document: longtext("document"),
+  documentHash: varchar("document_hash", { length: 64 }),
+  report: longtext("report"),
+  createdById: varchar("created_by_id", { length: 36 }).notNull().references(() => users.id),
+  ...timestamps,
+}, (table) => [uniqueIndex("lifecycle_revisions_collab_revision_unique").on(table.collaborationId, table.revision)]);
+
+export const lifecycleContributions = mysqlTable("lifecycle_contributions", {
+  id: id().primaryKey(),
+  collaborationId: varchar("collaboration_id", { length: 36 }).notNull().references(() => collaborations.id, { onDelete: "cascade" }),
+  revision: int("revision").notNull(),
+  participantId: varchar("participant_id", { length: 36 }).notNull().references(() => participants.id),
+  content: longtext("content"),
+  confirmedHash: varchar("confirmed_hash", { length: 64 }),
+  reportStatus: mysqlEnum("report_status", ["passed", "failed"]),
+  reportSummary: longtext("report_summary"),
+  reportEvidence: json("report_evidence").$type<Record<string, unknown>>(),
+  ...timestamps,
+}, (table) => [uniqueIndex("lifecycle_contributions_collab_revision_participant_unique").on(table.collaborationId, table.revision, table.participantId)]);

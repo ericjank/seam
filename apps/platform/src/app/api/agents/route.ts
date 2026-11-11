@@ -9,7 +9,7 @@ export async function POST(request: Request) {
     const { user } = await requireUser();
     const input = z.object({
       projectId: z.string().uuid(), name: z.string().min(1).max(100),
-      adapter: z.enum(["claude-code", "codex", "generic-cli", "mock"]),
+      adapter: z.enum(["claude-code", "codex", "codex-app-server", "generic-cli", "mock"]),
     }).parse(await request.json());
     return NextResponse.json({ agent: await createAgent(user.id, input) }, { status: 201 });
   } catch (error) { return handleApiError(error); }

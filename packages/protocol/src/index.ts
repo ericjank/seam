@@ -156,6 +156,24 @@ export const acceptanceSubmitActionSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
 });
 
+export const lifecyclePhaseSchema = z.enum(["planning", "plan_confirmation", "awaiting_approval", "executing", "awaiting_review", "terminated"]);
+export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("plan.submit"), revision: z.number().int().positive(), content: z.string().min(100).max(100_000) }),
+  z.object({ type: z.literal("plan.confirm"), revision: z.number().int().positive(), documentHash: z.string().length(64) }),
+  z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}) }),
+]);
+export type LifecycleAgentAction = z.infer<typeof lifecycleAgentActionSchema>;
+export const lifecycleContextSchema = z.object({
+  revision: z.number().int().positive(), phase: lifecyclePhaseSchema, requirements: z.string(),
+  document: z.string().nullable(), documentHash: z.string().nullable(), approvedHash: z.string().nullable(),
+  requiredParticipantIds: z.array(idSchema),
+  contributions: z.array(z.object({ participantId: idSchema, content: z.string() })),
+  confirmations: z.array(idSchema),
+  reports: z.array(z.object({ participantId: idSchema, status: z.enum(["passed", "failed"]), summary: z.string(), evidence: z.record(z.string(), z.unknown()) })),
+  report: z.string().nullable(),
+});
+export type LifecycleContext = z.infer<typeof lifecycleContextSchema>;
+
 export const agentActionSchema = z.discriminatedUnion("type", [
   artifactUpsertActionSchema,
   proposalCreateActionSchema,
@@ -164,6 +182,7 @@ export const agentActionSchema = z.discriminatedUnion("type", [
   workUpdateActionSchema,
   credentialRequestActionSchema,
   acceptanceSubmitActionSchema,
+  ...lifecycleAgentActionSchema.options,
 ]);
 export type AgentAction = z.infer<typeof agentActionSchema>;
 
@@ -177,6 +196,7 @@ export const agentTurnResultSchema = z.object({
 export type AgentTurnResult = z.infer<typeof agentTurnResultSchema>;
 
 export const collaborationContextSchema = z.object({
+  lifecycle: lifecycleContextSchema.nullish(),
   jobId: idSchema.optional(),
   collaborationId: idSchema,
   title: z.string(),

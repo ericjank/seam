@@ -16,7 +16,11 @@
     "test:e2e": "pnpm --filter @seam/platform test:e2e",
     "test:integration": "pnpm --filter @seam/platform test:integration",
     "db:generate": "pnpm --filter @seam/platform db:generate",
-    "db:migrate": "pnpm --filter @seam/platform db:migrate"
+    "db:migrate": "pnpm --filter @seam/platform db:migrate",
+    "simulation:up": "docker compose -f docker-compose.simulation.yml up -d --build --wait",
+    "test:simulation": "pnpm --filter @seam/connector... build && node scripts/simulation/run.mjs",
+    "test:lifecycle": "pnpm --filter @seam/platform exec tsx tests/lifecycle-integration.ts",
+    "test:simulation:regression": "docker compose -f docker-compose.simulation.yml exec -T app node scripts/simulation/regression.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

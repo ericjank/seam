@@ -1,5 +1,7 @@
 "use client";
 
+import { formatDateTime } from "@/lib/date-time";
+
 import { useAction } from "./use-action";
 import type { CollaborationData } from "./detail-types";
 
@@ -42,7 +44,7 @@ export function AcceptanceTab({ data }: { data: CollaborationData }) {
     {data.acceptanceRuns.map((runItem) => <section className="card" key={runItem.id}>
       <div className="card-header"><h2>{data.participants.find((row) => row.participant.id === runItem.participantId)?.project.name}</h2><span className={`badge ${runItem.status === "passed" ? "badge-green" : "badge-red"}`}>{runItem.status}</span></div>
       <p>{runItem.summary}</p><div className="code">{JSON.stringify(runItem.evidence, null, 2)}</div>
-      <p className="small muted">{new Date(runItem.createdAt).toLocaleString("zh-CN")} · 产物版本 {runItem.artifactVersionId ?? "未关联"}</p>
+      <p className="small muted">{formatDateTime(runItem.createdAt)} · 产物版本 {runItem.artifactVersionId ?? "未关联"}</p>
     </section>)}
     {!data.acceptanceRuns.length && <div className="empty">尚无验收证据。Agent 单方面的“已完成”声明不会替代真实测试。</div>}
   </div>;

@@ -1,5 +1,7 @@
 .git
 .gitignore
+.playwright-cli
+output/playwright
 node_modules
 **/node_modules
 **/.next

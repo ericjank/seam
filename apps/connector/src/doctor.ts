@@ -9,7 +9,7 @@ export async function diagnoseConnector(config: ConnectorConfig) {
     if ((await stat(config.projectRoot)).isDirectory()) project = { ok: true, detail: "项目目录可访问" };
   } catch { /* Deliberately avoid leaking raw filesystem errors or credentials. */ }
   const cli = project.ok
-    ? await createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox }).healthCheck(config.projectRoot)
+    ? await createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox, appServerStateDir: config.appServerStateDir, codexNetworkAccess: config.codexNetworkAccess }).healthCheck(config.projectRoot)
     : { ok: false, detail: "先配置有效项目目录" };
   const configured = Boolean(config.agentId && config.token);
   return {
@@ -18,7 +18,8 @@ export async function diagnoseConnector(config: ConnectorConfig) {
     adapter: config.adapter,
     project,
     cli,
-    executionPolicy: describeExecutionPolicy(config.adapter, { codexSandbox: config.codexSandbox }),
+    executionPolicy: describeExecutionPolicy(config.adapter, { codexSandbox: config.codexSandbox, codexNetworkAccess: config.codexNetworkAccess }),
+    executionNetworkConfigured: config.codexNetworkAccess === true,
     localTestConfigured: Boolean(process.env.SEAM_TEST_COMMAND),
     platformCredentialsConfigured: configured,
     note: "仅检查本地配置和 CLI 版本，未验证登录、实际写入、中心连通性或业务联调；不需要提交源码和凭据。",

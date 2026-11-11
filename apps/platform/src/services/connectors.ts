@@ -1,4 +1,4 @@
-import { and, asc, eq, lte } from "drizzle-orm";
+import { and, asc, desc, eq, lte } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
 import { agents, collaborations, connectorJobs, auditEvents } from "@/db/schema";
 import { hashToken, newId } from "@/lib/ids";
@@ -34,14 +34,20 @@ export async function authenticateConnector(request: Request, agentId: string) {
 }
 
 export async function heartbeat(agentId: string, capabilities?: {
-  adapter: "codex" | "claude-code" | "generic-cli" | "mock";
+  adapter: "codex" | "codex-app-server" | "claude-code" | "generic-cli" | "mock";
   executionMode: "read-only" | "workspace-write" | "external";
   testConfigured: boolean;
 }) {
   await db.update(agents).set({ status: "online", lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(agents.id, agentId));
-  if (capabilities) await db.insert(auditEvents).values({
-    id: newId(), actorType: "connector", actorId: agentId, action: "connector.capabilities", metadata: capabilities,
-  });
+  if (capabilities) {
+    const [latest] = await db.select({ metadata: auditEvents.metadata }).from(auditEvents).where(and(
+      eq(auditEvents.actorId, agentId), eq(auditEvents.action, "connector.capabilities"),
+    )).orderBy(desc(auditEvents.sequence)).limit(1);
+    const previous = latest?.metadata as typeof capabilities | undefined;
+    if (!previous || previous.adapter !== capabilities.adapter || previous.executionMode !== capabilities.executionMode || previous.testConfigured !== capabilities.testConfigured) {
+      await db.insert(auditEvents).values({ id: newId(), actorType: "connector", actorId: agentId, action: "connector.capabilities", metadata: capabilities });
+    }
+  }
 }
 
 export async function pollConnectorJob(agentId: string, waitMs: number) {

@@ -7,8 +7,8 @@ import { credentials, messages, organizations, users } from "../src/db/schema";
 import { newId } from "../src/lib/ids";
 
 const base = process.env.SEAM_APP_URL ?? "http://localhost:3000";
-const email = "owner@seam.test";
-const password = "SeamTest!12345";
+const email = process.env.SEAM_TEST_OWNER_EMAIL ?? "owner@seam.test";
+const password = process.env.SEAM_TEST_OWNER_PASSWORD ?? "SeamTest!12345";
 let cookie = "";
 
 async function raw(path: string, body?: unknown, token?: string, method = "POST") {

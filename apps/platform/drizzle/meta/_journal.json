@@ -15,6 +15,13 @@
       "when": 1794402453615,
       "tag": "0001_boring_sauron",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1794412577495,
+      "tag": "0002_tense_excalibur",
+      "breakpoints": true
     }
   ]
 }

@@ -20,6 +20,7 @@ export function AppShell({ children, userName, organizationName }: {
         <Link href="/organization">组织</Link>
       </nav>
       <div className="topbar-meta">
+        <span title="平台时间统一为 Asia/Shanghai">北京时间</span>
         <span>{organizationName} · {userName}</span>
         <button className="btn btn-secondary btn-small" onClick={async () => {
           await fetch("/api/auth/logout", { method: "POST" });

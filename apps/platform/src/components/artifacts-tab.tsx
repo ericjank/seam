@@ -1,5 +1,7 @@
 "use client";
 
+import { formatDateTime } from "@/lib/date-time";
+
 import { useAction } from "./use-action";
 import type { CollaborationData } from "./detail-types";
 
@@ -25,7 +27,7 @@ export function ArtifactsTab({ data }: { data: CollaborationData }) {
     {data.artifacts.map((artifact) => <section className="card" key={artifact.id}>
       <div className="card-header"><div><h2>{artifact.title}</h2><span className="small muted">{artifact.type} · {artifact.id}</span></div><span className="badge badge-blue">v{artifact.currentVersion}</span></div>
       <div className="stack">{artifact.versions.slice().reverse().map((version) => <details key={version.id} open={version.version === artifact.currentVersion}>
-        <summary>v{version.version} · {new Date(version.createdAt).toLocaleString("zh-CN")} · hash {version.contentHash.slice(0, 12)}</summary>
+        <summary>v{version.version} · {formatDateTime(version.createdAt)} · hash {version.contentHash.slice(0, 12)}</summary>
         <div className="code" style={{ marginTop: 12, maxHeight: 420 }}>{version.content}</div>
       </details>)}</div>
     </section>)}

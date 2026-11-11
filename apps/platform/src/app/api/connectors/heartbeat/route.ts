@@ -8,7 +8,7 @@ export async function POST(request: Request) {
     const { agentId, capabilities } = z.object({
       agentId: z.string().uuid(),
       capabilities: z.object({
-        adapter: z.enum(["codex", "claude-code", "generic-cli", "mock"]),
+        adapter: z.enum(["codex", "codex-app-server", "claude-code", "generic-cli", "mock"]),
         executionMode: z.enum(["read-only", "workspace-write", "external"]), testConfigured: z.boolean(),
       }).optional(),
     }).parse(await request.json());

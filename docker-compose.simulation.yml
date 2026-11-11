@@ -1,0 +1,54 @@
+name: seam-simulation
+
+# A separate local installation. It never mounts an existing business checkout,
+# the normal Seam database, or the host's Codex credentials into a container.
+services:
+  mysql:
+    image: mysql:8.0
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: simulation-root-only
+      MYSQL_DATABASE: seam_simulation_test
+      MYSQL_USER: seam_simulation
+      MYSQL_PASSWORD: simulation-app-only
+    volumes:
+      - simulation-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  app:
+    image: seam-simulation:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${SIMULATION_NODE_IMAGE:-node:22.23.4-bookworm-slim}
+    init: true
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: seam_simulation_test
+      DB_USERNAME: seam_simulation
+      DB_PASSWORD: simulation-app-only
+      DB_CHARSET: utf8mb4
+      SEAM_MASTER_KEY: ${SIMULATION_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+      SEAM_APP_URL: http://127.0.0.1:${SIMULATION_APP_PORT:-13079}
+    ports:
+      - "127.0.0.1:${SIMULATION_APP_PORT:-13079}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  simulation-mysql-data:

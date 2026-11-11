@@ -12,6 +12,7 @@ import { createProposal, decideProposal } from "./proposals";
 import { createWorkItem, updateWorkItem } from "./work-items";
 import { requestCredential } from "./credentials";
 import { submitAcceptance } from "./acceptance";
+import { applyLifecycleAction, assertLifecycleJobCurrent, getLifecycleContext, type LifecycleSnapshot } from "./lifecycle";
 
 export async function dispatchAgentTurns(userId: string, collaborationId: string, participantIds?: string[], options: { autoAdvance?: boolean } = {}) {
   await requireCollaborationAccess(userId, collaborationId, true);
@@ -25,6 +26,11 @@ export async function dispatchAgentTurns(userId: string, collaborationId: string
     ));
     if (active.length) return active.map((job) => job.id);
     const detail = await getCollaborationDetail(userId, collaborationId);
+    if (detail.lifecycle) {
+      if (!["planning", "plan_confirmation", "executing"].includes(detail.lifecycle.phase)) throw new HttpError(409, "当前阶段等待管理员确认，不能继续派发实施");
+      const eligible = lifecycleTargets(detail.lifecycle);
+      participantIds = participantIds ? participantIds.filter((id) => eligible.includes(id)) : eligible;
+    }
     const workflow: Workflow = {
       id: newId(), round: 1, maxRounds: Math.max(1, Math.min(collaboration.maxNegotiationRounds, 12)),
       autoAdvance: options.autoAdvance ?? false, inputMessageId: detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id,
@@ -43,7 +49,10 @@ async function enqueueTurns(detail: Awaited<ReturnType<typeof getCollaborationDe
     const context = buildContext(detail, row.participant.id, id);
     await db.insert(connectorJobs).values({
       id, agentId: row.participant.agentId as string, collaborationId: detail.collaboration.id,
-      kind: "collaboration.turn", payload: { context, workflow },
+      kind: "collaboration.turn", payload: { context, workflow, lifecycleSnapshot: detail.lifecycle ? {
+        revision: detail.lifecycle.revision, phase: detail.lifecycle.phase,
+        documentHash: detail.lifecycle.documentHash, approvedHash: detail.lifecycle.approvedHash,
+      } : null },
     });
     jobs.push(id);
   }
@@ -70,6 +79,7 @@ export function buildContext(detail: Awaited<ReturnType<typeof getCollaborationD
   });
   const referencedVersions = new Set(detail.proposals.map((p) => p.artifactVersionId));
   return {
+    lifecycle: detail.lifecycle,
     jobId, collaborationId: detail.collaboration.id, title: detail.collaboration.title,
     type: detail.collaboration.type, status: detail.collaboration.status, objective: detail.collaboration.objective,
     participant, participants: participantRows,
@@ -101,6 +111,7 @@ export function buildContext(detail: Awaited<ReturnType<typeof getCollaborationD
 // Refresh at claim time, rather than making a queued agent act on an obsolete snapshot.
 export async function refreshAgentJobContext(job: { id: string; kind: string; agentId: string; collaborationId: string | null; payload: unknown }) {
   if (job.kind !== "collaboration.turn" || !job.collaborationId) return job.payload;
+  await assertLifecycleJobCurrent(job.collaborationId, (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot);
   const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId)).limit(1);
   const [participant] = await db.select().from(participants).where(and(eq(participants.agentId, job.agentId), eq(participants.collaborationId, job.collaborationId))).limit(1);
   if (!collaboration || participant?.status !== "active") throw new HttpError(409, "协作或有效参与方已不存在");
@@ -118,6 +129,12 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId)).limit(1);
   if (!collaboration) throw new HttpError(404, "协作不存在");
   const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
+  const lifecycle = await assertLifecycleJobCurrent(collaboration.id, (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot);
+  if (lifecycle) {
+    const allowed = lifecycle.phase === "planning" ? ["plan.submit"] : lifecycle.phase === "plan_confirmation" ? ["plan.confirm", "plan.submit"] : lifecycle.phase === "executing" ? ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit"] : [];
+    if (turn.actions.some((action) => !allowed.includes(action.type))) throw new HttpError(409, "动作不符合当前阶段；审批前只能协商文档，实施后只能提交实施结果");
+    if (turn.actions.filter((action) => ["plan.submit", "plan.confirm", "execution.report"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交当前阶段的一项计划、确认或实施报告");
+  }
   // Validate the entire batch before applying any action. An Agent can participate in
   // multiple collaborations, but IDs from one run must never affect another.
   for (const action of turn.actions) {
@@ -129,7 +146,11 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const actor = { kind: "participant" as const, id: participant.id };
   let changed = false;
   for (const action of turn.actions) {
-    if (action.type === "artifact.upsert") {
+    if (action.type === "plan.submit" || action.type === "plan.confirm" || action.type === "execution.report") {
+      if (!lifecycle) throw new HttpError(409, "当前协作尚未启用管理员审批流程");
+      const outcome = await applyLifecycleAction(actor, job.collaborationId, action);
+      changed ||= outcome.changed;
+    } else if (action.type === "artifact.upsert") {
       const outcome = await upsertArtifact(actor, job.collaborationId, { artifactId: action.artifactId, title: action.title, type: action.artifactType, content: action.content });
       changed ||= !outcome.unchanged;
     } else if (action.type === "proposal.create") {
@@ -162,7 +183,7 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   }
   await db.insert(messages).values({
     id: newId(), collaborationId: job.collaborationId, participantId: participant.id,
-    authorType: "agent", authorName: participant.id, kind: turn.kind, body: turn.message,
+    authorType: "agent", authorName: detail.participants.find((row) => row.participant.id === participant.id)?.agent?.name ?? participant.id, kind: turn.kind, body: turn.message,
     metadata: { jobId, needsHumanInput: turn.needsHumanInput, actionCount: turn.actions.length, workflowChanged: changed },
   });
   await db.update(collaborations).set({ updatedAt: new Date() }).where(eq(collaborations.id, job.collaborationId));
@@ -183,6 +204,24 @@ export async function advanceAgentWorkflow(jobId: string) {
     // A newer explicit run supersedes a late callback from an older one.
     if (allJobs.some((j) => j.status === "pending" || j.status === "running")) return;
     const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
+    if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
+    if (detail.lifecycle) {
+      if (allJobs.some((j) => j.sequence > job.sequence && (j.payload as { workflow?: Workflow }).workflow?.id !== workflow.id)) return;
+      const snapshot = (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot;
+      if (!snapshot || snapshot.revision !== detail.lifecycle.revision) return;
+      const transitions: Record<string, string[]> = { planning: ["planning", "plan_confirmation"], plan_confirmation: ["plan_confirmation"], executing: ["executing"] };
+      if (!transitions[snapshot.phase]?.includes(detail.lifecycle.phase)) return;
+      // Managed tasks advance by explicit phase receipts, never by the legacy
+      // message heuristic. Both approval and final closure remain human gates.
+      if (["awaiting_approval", "awaiting_review", "terminated"].includes(detail.lifecycle.phase)) return;
+      const targets = lifecycleTargets(detail.lifecycle);
+      if (targets.length && workflow.round < workflow.maxRounds) {
+        await enqueueTurns(detail, { ...workflow, round: workflow.round + 1 }, targets);
+      } else if (targets.length) {
+        await db.insert(messages).values({ id: newId(), collaborationId: collaboration.id, authorType: "system", authorName: "Seam", kind: "system", body: "自动协作连续重试已达上限，请查看失败原因后重试。", metadata: { workflowStopped: workflow.id } });
+      }
+      return;
+    }
     if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
     const lastInputId = detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id;
     const outcome = nextWorkflowTargets({
@@ -218,4 +257,11 @@ export async function advanceAgentWorkflow(jobId: string) {
       await db.update(collaborations).set({ updatedAt: new Date() }).where(eq(collaborations.id, collaboration.id));
     }
   });
+}
+
+function lifecycleTargets(lifecycle: NonNullable<Awaited<ReturnType<typeof getLifecycleContext>>>) {
+  return lifecycle.requiredParticipantIds.filter((id) => lifecycle.phase === "planning"
+    ? !lifecycle.contributions.some((entry) => entry.participantId === id)
+    : lifecycle.phase === "plan_confirmation" ? !lifecycle.confirmations.includes(id)
+    : lifecycle.phase === "executing" ? !lifecycle.reports.some((entry) => entry.participantId === id) : false);
 }

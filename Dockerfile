@@ -1,4 +1,5 @@
-FROM node:22-bookworm AS dependencies
+ARG NODE_IMAGE=node:22-bookworm
+FROM ${NODE_IMAGE} AS dependencies
 WORKDIR /app
 ENV CI=true
 RUN corepack enable
@@ -14,7 +15,7 @@ FROM dependencies AS build
 COPY . .
 RUN pnpm build
 
-FROM node:22-bookworm AS runner
+FROM ${NODE_IMAGE} AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \

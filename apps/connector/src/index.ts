@@ -1,4 +1,5 @@
 import { createAgentAdapter, describeExecutionPolicy } from "@seam/agent-adapters";
+import { createHash } from "node:crypto";
 import { collaborationContextSchema } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
 import { PlatformClient } from "./client.js";
@@ -8,20 +9,34 @@ import { assertOutboundPolicy } from "./outbound-policy.js";
 import { runLocalTest } from "./local-test.js";
 
 export async function runConnector(config: ConnectorConfig) {
-  const adapter = createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox });
+  const adapter = createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox, appServerStateDir: config.appServerStateDir, codexNetworkAccess: config.codexNetworkAccess });
   const health = await adapter.healthCheck(config.projectRoot);
   if (!health.ok) throw new Error(`Agent 不可用：${health.detail}`);
   const client = new PlatformClient(config);
   const credentialStore = new CredentialStore(config.agentId);
   const a2a = createA2AHandler(adapter, config.projectRoot, config.agentId, `${config.platformUrl}/api/a2a/${config.agentId}`);
-  await client.heartbeat({
+  const capabilities = {
     adapter: config.adapter,
-    executionMode: config.adapter === "codex" ? config.codexSandbox ?? "read-only" : "external",
+    executionMode: config.adapter === "codex" || config.adapter === "codex-app-server" ? config.codexSandbox ?? "read-only" : "external" as const,
     testConfigured: Boolean(process.env.SEAM_TEST_COMMAND),
-  });
+  };
+  await client.heartbeat(capabilities);
+  let heartbeatPending = false;
+  let heartbeatStopped = false;
+  let heartbeatController: AbortController | undefined;
+  const heartbeatTimer = setInterval(() => {
+    if (heartbeatPending) return;
+    heartbeatPending = true;
+    heartbeatController = new AbortController();
+    void client.heartbeat(capabilities, AbortSignal.any([heartbeatController.signal, AbortSignal.timeout(15_000)])).catch((error: unknown) => {
+      if (!heartbeatStopped) console.error("Connector 心跳失败", error instanceof Error ? error.message : "中心暂不可达");
+    }).finally(() => { heartbeatPending = false; });
+  }, 20_000);
+  heartbeatTimer.unref();
   console.log(`Seam Connector 已连接：${config.adapter}，项目目录 ${config.projectRoot}`);
-  console.log(`本地执行策略：${describeExecutionPolicy(config.adapter, { codexSandbox: config.codexSandbox })}`);
+  console.log(`本地执行策略：${describeExecutionPolicy(config.adapter, { codexSandbox: config.codexSandbox, codexNetworkAccess: config.codexNetworkAccess })}`);
 
+  try {
   do {
     let phase = "领取任务";
     try {
@@ -38,8 +53,10 @@ export async function runConnector(config: ConnectorConfig) {
         }
         if (job.kind === "collaboration.turn") {
           const context = collaborationContextSchema.parse(job.payload.context);
-          const agentTurn = assertOutboundPolicy(await adapter.run({ context, projectRoot: config.projectRoot }), config.projectRoot);
-          result = { agentTurn };
+          const input = { context, projectRoot: config.projectRoot, jobPayloadHash: createHash("sha256").update(JSON.stringify(job.payload)).digest("hex") };
+          const agentTurn = assertOutboundPolicy(await adapter.run(input), config.projectRoot);
+          const conversation = await adapter.getConversation?.(input);
+          result = { agentTurn, ...(conversation ? { conversation } : {}) };
         } else if (job.kind === "a2a.message") {
           const response = await a2a.transport.handle(job.payload.request);
           if (Symbol.asyncIterator in Object(response)) throw new Error("Connector 不支持流式 A2A 请求");
@@ -63,6 +80,7 @@ export async function runConnector(config: ConnectorConfig) {
     }
     if (!config.once) await new Promise((resolve) => setTimeout(resolve, config.pollMs));
   } while (!config.once);
+  } finally { heartbeatStopped = true; clearInterval(heartbeatTimer); heartbeatController?.abort(); }
 }
 
 export { createA2AHandler } from "./a2a.js";

@@ -147,8 +147,8 @@ async function main() {
   process.env.SEAM_GENERIC_AGENT_COMMAND = process.execPath;
   process.env.SEAM_GENERIC_AGENT_ARGS = JSON.stringify([fakeCli]);
 
-  const email = "owner@seam.test";
-  const password = "SeamTest!12345";
+  const email = process.env.SEAM_TEST_OWNER_EMAIL ?? "owner@seam.test";
+  const password = process.env.SEAM_TEST_OWNER_PASSWORD ?? "SeamTest!12345";
   const setup = await raw("/api/setup", { name: "Seam 测试所有者", email, password, organizationName: "Seam 测试组织" });
   if (setup.response.status === 409) await api("/api/auth/login", { email, password });
   else assert.ok(setup.response.ok, JSON.stringify(setup.data));

@@ -11,8 +11,8 @@ export class PlatformClient {
   private attempts = new Map<string, number>();
   constructor(private config: ConnectorConfig) {}
 
-  async heartbeat(capabilities?: ConnectorCapabilities) {
-    return this.request("/api/connectors/heartbeat", { agentId: this.config.agentId, capabilities });
+  async heartbeat(capabilities?: ConnectorCapabilities, signal = AbortSignal.timeout(15_000)) {
+    return this.request("/api/connectors/heartbeat", { agentId: this.config.agentId, capabilities }, signal);
   }
 
   async poll(): Promise<ConnectorJob | null> {
@@ -35,11 +35,12 @@ export class PlatformClient {
     return response.credential as { name: string; type: string; environment: string; value: string };
   }
 
-  private async request(path: string, body: Record<string, unknown>) {
+  private async request(path: string, body: Record<string, unknown>, signal?: AbortSignal) {
     const response = await fetch(`${this.config.platformUrl}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.config.token}` },
       body: JSON.stringify(body),
+      signal,
     });
     const data = await response.json() as { error?: { message?: string } };
     if (!response.ok) throw new Error(data.error?.message ?? `平台返回 ${response.status}`);

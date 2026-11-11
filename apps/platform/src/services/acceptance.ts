@@ -7,6 +7,7 @@ import { addSystemMessage } from "./collaborations";
 import { audit } from "@/lib/audit";
 import { HttpError } from "@/lib/http";
 import { assertWorkItemDependencies } from "./work-items";
+import { getLifecycleContext } from "./lifecycle";
 
 export async function submitAcceptance(actor: Actor, collaborationId: string, input: {
   workItemId?: string;
@@ -58,6 +59,8 @@ export async function submitAcceptance(actor: Actor, collaborationId: string, in
 }
 
 async function evaluateCollaboration(collaborationId: string) {
+  // Managed collaboration closure is exclusively an administrator decision.
+  if (await getLifecycleContext(collaborationId)) return;
   const items = await db.select().from(workItems).where(eq(workItems.collaborationId, collaborationId));
   if (items.length && items.every((item) => item.status === "completed")) {
     const runs = await db.select().from(acceptanceRuns).where(eq(acceptanceRuns.collaborationId, collaborationId)).orderBy(desc(acceptanceRuns.sequence));

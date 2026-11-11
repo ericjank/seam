@@ -11,12 +11,14 @@ export interface ConnectorConfig {
   pollMs: number;
   codexSandbox?: CodexSandbox;
   doctor?: boolean;
+  appServerStateDir?: string;
+  codexNetworkAccess?: boolean;
 }
 
 export function readConfig(args: string[], env = process.env): ConnectorConfig {
   const flags = new Map<string, string>();
   const booleanFlags = new Set(["once", "doctor", "help"]);
-  const valueFlags = new Set(["platform", "agent-id", "token", "project-root", "adapter", "codex-sandbox"]);
+  const valueFlags = new Set(["platform", "agent-id", "token", "project-root", "adapter", "codex-sandbox", "app-server-state-dir", "codex-network-access"]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg?.startsWith("--")) throw new Error(`无法识别的参数 ${arg}`);
@@ -36,9 +38,11 @@ export function readConfig(args: string[], env = process.env): ConnectorConfig {
     return value;
   };
   const adapter = flags.get("adapter") ?? env.SEAM_ADAPTER ?? "mock";
-  if (!["claude-code", "codex", "generic-cli", "mock"].includes(adapter)) throw new Error("SEAM_ADAPTER 必须为 claude-code、codex、generic-cli 或 mock");
+  if (!["claude-code", "codex", "codex-app-server", "generic-cli", "mock"].includes(adapter)) throw new Error("SEAM_ADAPTER 必须为 claude-code、codex、codex-app-server、generic-cli 或 mock");
   const codexSandbox = flags.get("codex-sandbox") ?? env.SEAM_CODEX_SANDBOX ?? "read-only";
   if (codexSandbox !== "read-only" && codexSandbox !== "workspace-write") throw new Error("SEAM_CODEX_SANDBOX 仅允许 read-only 或 workspace-write");
+  const network = flags.get("codex-network-access") ?? env.SEAM_CODEX_NETWORK_ACCESS ?? "false";
+  if (network !== "true" && network !== "false") throw new Error("SEAM_CODEX_NETWORK_ACCESS 仅允许 true 或 false");
   const pollMs = Number(env.SEAM_POLL_INTERVAL_MS ?? 1000);
   if (!Number.isFinite(pollMs) || pollMs < 100) throw new Error("SEAM_POLL_INTERVAL_MS 必须是至少 100 的有限毫秒数");
   return {
@@ -51,5 +55,7 @@ export function readConfig(args: string[], env = process.env): ConnectorConfig {
     pollMs,
     codexSandbox,
     doctor,
+    appServerStateDir: flags.get("app-server-state-dir") ?? env.SEAM_APP_SERVER_STATE_DIR,
+    codexNetworkAccess: network === "true",
   };
 }

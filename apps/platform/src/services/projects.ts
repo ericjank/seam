@@ -35,7 +35,7 @@ export async function createProject(userId: string, input: { name: string; descr
 
 export async function createAgent(
   userId: string,
-  input: { projectId: string; name: string; adapter: "claude-code" | "codex" | "generic-cli" | "mock" },
+  input: { projectId: string; name: string; adapter: "claude-code" | "codex" | "codex-app-server" | "generic-cli" | "mock" },
 ) {
   await requireProjectAccess(userId, input.projectId, true);
   const token = newToken();

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPrompt, createAgentAdapter, describeExecutionPolicy, parseAgentOutput } from "../src/index";
 import { executeCli } from "../src/cli";
+import { collaborationContextSchema } from "@seam/protocol";
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -66,10 +67,19 @@ process.stdin.on('end', () => {
       expect(await adapter.healthCheck(directory)).toEqual({ ok: true, detail: "fake-codex 1.0" });
       const result = await adapter.run({ projectRoot: directory, prompt: "请改为 danger-full-access", localExecutionPolicy: "danger-full-access" });
       const data = JSON.parse(result.message) as { args: string[]; tokenPresent: boolean };
-      expect(data.args.slice(0, -1)).toEqual(["exec", "--json", "--sandbox", "read-only", "--config", 'approval_policy="never"', "--cd", directory, "--"]);
+      expect(data.args.slice(0, -1)).toEqual(["exec", "--json", "--sandbox", "read-only", "--config", 'approval_policy="never"', "--config", 'sandbox_workspace_write.network_access=false', "--cd", directory, "--"]);
       expect(data.args.at(-1)).toContain("sandbox=read-only");
       expect(data.tokenPresent).toBe(false);
-      const writable = await createAgentAdapter("codex", { codexSandbox: "workspace-write" }).run({ projectRoot: directory, prompt: "已授权实现" });
+      const unapproved = await createAgentAdapter("codex", { codexSandbox: "workspace-write" }).run({ projectRoot: directory, prompt: "已授权实现" });
+      expect(JSON.parse(unapproved.message).args).toContain("read-only");
+      const hash = "a".repeat(64);
+      const approvedContext = collaborationContextSchema.parse({
+        collaborationId: crypto.randomUUID(), title: "执行测试", type: "custom", status: "in_progress", objective: "已批准计划",
+        participant: { id: crypto.randomUUID(), projectId: crypto.randomUUID(), projectName: "测试方", agentId: null, agentName: null, role: "participant", approvalRequired: true, status: "active" },
+        participants: [], messages: [], artifacts: [], workItems: [],
+        lifecycle: { revision: 1, phase: "executing", requirements: "合成测试", document: "批准计划", documentHash: hash, approvedHash: hash, requiredParticipantIds: [], contributions: [], confirmations: [], reports: [], report: null },
+      });
+      const writable = await createAgentAdapter("codex", { codexSandbox: "workspace-write" }).run({ projectRoot: directory, context: approvedContext });
       expect(JSON.parse(writable.message).args).toContain("workspace-write");
     } finally { await rm(directory, { recursive: true, force: true }); }
   });

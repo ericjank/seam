@@ -1,5 +1,7 @@
 "use client";
 
+import { formatDateTime } from "@/lib/date-time";
+
 import { useAction } from "./use-action";
 
 type Member = { id: string; name: string; email: string; role: string; createdAt: string | Date };
@@ -27,7 +29,7 @@ export function OrganizationManager({ organizationName, currentRole, members }: 
       </form>
     </section>}
     <section className="card"><h2>成员列表</h2><table className="table"><thead><tr><th>姓名</th><th>邮箱</th><th>角色</th><th>加入时间</th></tr></thead><tbody>
-      {members.map((member) => <tr key={member.id}><td>{member.name}</td><td>{member.email}</td><td><span className="badge">{member.role}</span></td><td>{new Date(member.createdAt).toLocaleString("zh-CN")}</td></tr>)}
+      {members.map((member) => <tr key={member.id}><td>{member.name}</td><td>{member.email}</td><td><span className="badge">{member.role}</span></td><td>{formatDateTime(member.createdAt)}</td></tr>)}
     </tbody></table></section>
   </div>;
 }
