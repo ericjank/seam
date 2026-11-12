@@ -42,7 +42,7 @@ beforeEach(() => {
   state.jobs = [state.job];
   state.detail = {
     collaboration: { id: "collaboration", createdById: "admin", title: "双端协作", type: "custom", objective: "协商后实施", status: "negotiating", negotiationRound: 2 },
-    lifecycle: { revision: 1, phase: "plan_confirmation", requirements: "目标", document: "完整文档", documentHash: "a".repeat(64), approvedHash: null,
+    lifecycle: { revision: 1, phase: "plan_synthesis", requirements: "目标", document: "完整文档", documentHash: "a".repeat(64), approvedHash: null,
       requiredParticipantIds: ["a", "b"], contributions: [{ participantId: "a", content: "甲计划" }, { participantId: "b", content: "乙计划" }], confirmations: [], reports: [], report: null },
     participants: ["a", "b"].map((id) => ({ participant: { id, projectId: `project-${id}`, agentId: `agent-${id}`, status: "active", role: "participant", approvalRequired: true }, project: { name: id }, agent: { name: id } })),
     messages: [], artifacts: [], workItems: [], proposals: [], credentials: [], acceptanceRuns: [],
@@ -50,10 +50,10 @@ beforeEach(() => {
 });
 
 describe("生命周期自动推进的迟到回调隔离", () => {
-  it("计划收齐后继续给双方派发当前文档确认", async () => {
+  it("计划收齐后仅派发协调方汇总统一契约", async () => {
     await advanceAgentWorkflow("job");
-    expect(newJobs()).toHaveLength(2);
-    for (const job of newJobs()) expect(job.values.payload.lifecycleSnapshot).toMatchObject({ revision: 1, phase: "plan_confirmation", documentHash: "a".repeat(64) });
+    expect(newJobs()).toHaveLength(1);
+    for (const job of newJobs()) expect(job.values.payload.lifecycleSnapshot).toMatchObject({ revision: 1, phase: "plan_synthesis", documentHash: "a".repeat(64) });
   });
 
   it("管理员追加新版本后，旧版本回调不能抢占新流程预算", async () => {
@@ -79,6 +79,7 @@ describe("生命周期自动推进的迟到回调隔离", () => {
   });
 
   it("确认期重写文档后，旧hash批次结束仍会派发最新hash重新确认", async () => {
+    state.detail.lifecycle.phase = "plan_confirmation";
     state.job.payload.lifecycleSnapshot.phase = "plan_confirmation";
     state.job.payload.lifecycleSnapshot.documentHash = "0".repeat(64);
     await advanceAgentWorkflow("job");

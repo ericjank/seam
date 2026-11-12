@@ -156,20 +156,50 @@ export const acceptanceSubmitActionSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
 });
 
-export const lifecyclePhaseSchema = z.enum(["planning", "plan_confirmation", "awaiting_approval", "executing", "awaiting_review", "terminated"]);
+export const workspaceBaselineSchema = z.object({
+  head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(),
+});
+export const sharedContractSchema = z.object({
+  scope: z.string().min(20).max(20_000),
+  interfaces: z.array(z.object({ id: z.string().min(1).max(100), definition: z.string().min(20).max(20_000) })).min(1).max(30),
+  responsibilities: z.array(z.object({ participantId: idSchema, changes: z.string().min(20).max(20_000) })).min(2).max(50),
+  acceptanceCases: z.array(z.object({
+    id: z.string().min(1).max(100), runnerParticipantId: idSchema,
+    description: z.string().min(10).max(5000), command: z.string().min(1).max(2000), expectedResult: z.string().min(1).max(5000),
+  })).min(2).max(100),
+  risks: z.string().min(1).max(10_000),
+  changeSummary: z.string().min(10).max(10_000),
+  impactedParticipantIds: z.array(idSchema).min(1).max(50),
+  retainedDecisions: z.array(z.string().min(1).max(5000)).max(100).default([]),
+});
+export type SharedContract = z.infer<typeof sharedContractSchema>;
+export const integrationCheckSchema = z.object({
+  caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]),
+  command: z.string().max(2000), summary: z.string().min(1).max(10_000),
+  evidence: z.record(z.string(), z.unknown()).default({}),
+});
+export const lifecyclePhaseSchema = z.enum(["planning", "plan_synthesis", "plan_confirmation", "awaiting_approval", "executing", "joint_verifying", "awaiting_review", "terminated"]);
 export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("plan.submit"), revision: z.number().int().positive(), content: z.string().min(100).max(100_000) }),
+  z.object({ type: z.literal("plan.submit"), revision: z.number().int().positive(), content: z.string().min(100).max(100_000), baseline: workspaceBaselineSchema.optional() }),
+  z.object({ type: z.literal("plan.compose"), revision: z.number().int().positive(), baseDocumentHash: z.string().length(64).nullable(), contract: sharedContractSchema }),
+  z.object({ type: z.literal("plan.reject"), revision: z.number().int().positive(), documentHash: z.string().length(64), reason: z.string().min(10).max(10_000) }),
   z.object({ type: z.literal("plan.confirm"), revision: z.number().int().positive(), documentHash: z.string().length(64) }),
   z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}) }),
+  z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100) }),
 ]);
 export type LifecycleAgentAction = z.infer<typeof lifecycleAgentActionSchema>;
 export const lifecycleContextSchema = z.object({
   revision: z.number().int().positive(), phase: lifecyclePhaseSchema, requirements: z.string(),
   document: z.string().nullable(), documentHash: z.string().nullable(), approvedHash: z.string().nullable(),
   requiredParticipantIds: z.array(idSchema),
-  contributions: z.array(z.object({ participantId: idSchema, content: z.string() })),
+  coordinatorParticipantId: idSchema.optional(), paused: z.boolean().default(false),
+  changeRequest: z.string().nullable().optional(), contract: sharedContractSchema.nullable().optional(),
+  objections: z.array(z.object({ participantId: idSchema, documentHash: z.string(), reason: z.string() })).default([]),
+  baseline: z.object({ revision: z.number(), documentHash: z.string().nullable(), document: z.string().nullable(), contract: sharedContractSchema.nullable(), report: z.string().nullable() }).nullable().optional(),
+  contributions: z.array(z.object({ participantId: idSchema, content: z.string(), baseline: workspaceBaselineSchema.nullable().optional() })),
   confirmations: z.array(idSchema),
   reports: z.array(z.object({ participantId: idSchema, status: z.enum(["passed", "failed"]), summary: z.string(), evidence: z.record(z.string(), z.unknown()) })),
+  integrationReports: z.array(z.object({ participantId: idSchema, checks: z.array(integrationCheckSchema) })).default([]),
   report: z.string().nullable(),
 });
 export type LifecycleContext = z.infer<typeof lifecycleContextSchema>;
@@ -237,6 +267,7 @@ export const connectorJobSchema = z.object({
   kind: z.enum(["collaboration.turn", "a2a.message", "local.test"]),
   payload: z.record(z.string(), z.unknown()),
   attempts: z.number().int().nonnegative(),
+  leaseUntil: z.string().optional(),
 });
 export type ConnectorJob = z.infer<typeof connectorJobSchema>;
 

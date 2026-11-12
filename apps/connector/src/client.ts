@@ -7,12 +7,17 @@ export interface ConnectorCapabilities {
   testConfigured: boolean;
 }
 
+export class PlatformError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+  get retryable() { return this.status === 408 || this.status === 429 || this.status >= 500; }
+}
+
 export class PlatformClient {
   private attempts = new Map<string, number>();
   constructor(private config: ConnectorConfig) {}
 
-  async heartbeat(capabilities?: ConnectorCapabilities, signal = AbortSignal.timeout(15_000)) {
-    return this.request("/api/connectors/heartbeat", { agentId: this.config.agentId, capabilities }, signal);
+  async heartbeat(capabilities?: ConnectorCapabilities, signal = AbortSignal.timeout(15_000), activeJob?: { id: string; attempts: number; cancelled?: boolean }) {
+    return this.request("/api/connectors/heartbeat", { agentId: this.config.agentId, capabilities, activeJob }, signal);
   }
 
   async poll(): Promise<ConnectorJob | null> {
@@ -22,10 +27,10 @@ export class PlatformClient {
     return job;
   }
 
-  async complete(jobId: string, result: Record<string, unknown> | undefined, error?: string) {
+  async complete(jobId: string, result: Record<string, unknown> | undefined, error?: string, attempts = this.attempts.get(jobId)) {
     const response = await this.request("/api/connectors/complete", {
-      agentId: this.config.agentId, jobId, attempts: this.attempts.get(jobId), status: error ? "failed" : "completed", result, error,
-    });
+      agentId: this.config.agentId, jobId, attempts, status: error ? "failed" : "completed", result, error,
+    }, AbortSignal.timeout(30_000));
     this.attempts.delete(jobId);
     return response;
   }
@@ -43,7 +48,7 @@ export class PlatformClient {
       signal,
     });
     const data = await response.json() as { error?: { message?: string } };
-    if (!response.ok) throw new Error(data.error?.message ?? `平台返回 ${response.status}`);
+    if (!response.ok) throw new PlatformError(response.status, data.error?.message ?? `平台返回 ${response.status}`);
     return data as Record<string, any>;
   }
 }

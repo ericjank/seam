@@ -29,7 +29,7 @@ function inspectStrictObjects(value: unknown) {
 
 describe("Native response schema", () => {
   it("每阶段生成全required、closed object的结构，避免default与开放record", () => {
-    for (const phase of ["planning", "plan_confirmation", "executing", "awaiting_approval", "awaiting_review", "terminated"]) {
+    for (const phase of ["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying", "awaiting_approval", "awaiting_review", "terminated"]) {
       const schema = buildNativeOutputSchema(input(phase));
       inspectStrictObjects(schema);
       expect(schema).not.toHaveProperty("$schema");

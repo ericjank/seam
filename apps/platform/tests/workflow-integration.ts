@@ -370,12 +370,14 @@ async function main() {
     raw("/api/connectors/complete", completionFrame, provider.agent.token),
     raw("/api/connectors/complete", completionFrame, provider.agent.token),
   ]);
-  assert.deepEqual(completions.map((result) => result.response.status).sort((left, right) => left - right), [200, 409]);
+  assert.deepEqual(completions.map((result) => result.response.status).sort((left, right) => left - right), [200, 200]);
   const concurrentAfter = await detail(concurrent.id);
   assert.equal(concurrentAfter.workItems.length, 1);
   assert.equal(concurrentAfter.messages.filter((message: any) => message.metadata.jobId === concurrentClaim.job.id).length, 1);
   assert.equal((await jobs(concurrent.id))[0]!.status, "completed");
-  checks.push("真实MySQL并发重复complete仅一次生效，第二回执409且无重复任务或消息");
+  const contradictory = await raw("/api/connectors/complete", { ...completionFrame, result: { agentTurn: { ...completionFrame.result.agentTurn, message: "不同回执不能覆盖原始完成结果" } } }, provider.agent.token);
+  assert.equal(contradictory.response.status, 409);
+  checks.push("真实MySQL并发相同complete均获ACK且动作仅生效一次；不同回执409，无重复任务或消息");
 
   assert.equal((await db.select().from(connectorJobs).where(and(eq(connectorJobs.agentId, provider.agent.id), eq(connectorJobs.status, "running")))).length, 0);
   console.log(JSON.stringify({ ok: true, suite: "local workflow integration", runId, checks,

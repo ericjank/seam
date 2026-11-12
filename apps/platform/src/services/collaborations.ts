@@ -168,7 +168,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
   }));
   const jobRows = await db.select({
     id: connectorJobs.id, agentId: connectorJobs.agentId, kind: connectorJobs.kind,
-    status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt, result: connectorJobs.result,
+    cancellationAckAt: connectorJobs.cancellationAckAt, leaseUntil: connectorJobs.leaseUntil, status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt, result: connectorJobs.result,
   }).from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(20);
   const agentIds = participantRows.flatMap((row) => row.agent ? [row.agent.id] : []);
   const capabilityRows = agentIds.length ? await db.select().from(auditEvents).where(and(

@@ -30,11 +30,21 @@ if (!lifecycle) {
 双方先提交方案并确认共同文档的同一个hash；只在管理员批准当前修订后创建或修改代码，历史授权不适用于新修订。文档与approvedHash不匹配时停止实施。
 
 ## 测试与验收
-使用Node内置node:test验证正常两SKU、边界和无效quantity，${lifecycle.revision >= 2 ? "补充0、10、100和无效discountPercent。" : "确认响应金额与CNY币种。"}实施后真实运行node --test service.test.mjs，输出退出码与命令证据；最终由模拟运行器连接消费方实施进行真实HTTP联合检查。没有运行测试不得报告passed。
+使用Node内置node:test验证正常两SKU、边界和无效quantity，${lifecycle.revision >= 2 ? "补充0、10、100和无效discountPercent。" : "确认响应金额与CNY币种。"}实施后真实运行node --test service.test.mjs，输出退出码与命令证据；平台派发joint_verifying后运行node --test joint.test.mjs，逐项检查完整响应、两SKU、数量边界、错误与当前修订折扣。外部模拟器还会独立复核，不能替代平台内建联测。没有运行测试不得报告passed。
 
 ## 本次要求
 ${lifecycle.requirements}` });
   message = "提供方已提交当前修订的完整实施与测试方案，等待共同文档。";
+} else if (lifecycle.phase === "plan_synthesis") {
+  const ids = lifecycle.requiredParticipantIds;
+  actions.push({ type: "plan.compose", revision: lifecycle.revision, baseDocumentHash: lifecycle.documentHash, contract: {
+    scope: "在合成项目中实现并真实联合验证报价 HTTP 契约；服务代码由各端负责，网关由模拟基础设施提供。",
+    interfaces: [{ id: "quote", definition: "POST /quote 使用 JSON。SKU-001 单价12000分，SKU-002单价4500分；quantity为1到100整数，非法请求返回400。响应保留sku、quantity、subtotal和CNY币种。" + (lifecycle.revision >= 2 ? "discountPercent为0到100整数，省略默认0，null和布尔非法；discount向下取整，total=subtotal-discount。" : "") }],
+    responsibilities: ids.map((participantId) => ({ participantId, changes: "读取本项目README并完成本方业务导出和Node单元测试；批准后实施，随后运行已有joint.test.mjs对真实网关执行联合验证。" })),
+    acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index+1}`, runnerParticipantId, description: "运行本项目真实HTTP联合用例，验证正常报价及非法数量和本修订边界", command: "node --test joint.test.mjs", expectedResult: "退出码0，金额正确，非法输入HTTP400" })),
+    risks: "仅本地合成项目；网络不可用如实报告未执行，不部署，不安装依赖。", changeSummary: lifecycle.revision >= 2 ? "保留基础报价，增量增加折扣字段和兼容验证。" : "首次统一字段、错误语义、双方职责及真实联合验收。", impactedParticipantIds: ids, retainedDecisions: lifecycle.revision >= 2 ? ["保留报价路径、SKU单价和数量校验"] : [],
+  } });
+  message = "虚拟协调方汇总统一契约，等待双方审阅。";
 } else if (lifecycle.phase === "plan_confirmation" && !lifecycle.confirmations.includes(context.participant.id)) {
   assert.ok(lifecycle.document && lifecycle.documentHash, "confirmation requires the full shared document and hash");
   actions.push({ type: "plan.confirm", revision: lifecycle.revision, documentHash: lifecycle.documentHash });
@@ -90,6 +100,17 @@ ${supportsDiscount ? `test("discount boundaries and validation", () => {
       changedFiles: ["service.mjs", "service.test.mjs"], outputTail: `${output.stdout ?? ""}\n${output.stderr ?? ""}`.replaceAll(process.cwd(), "[project]").slice(-3000) },
   });
   message = `提供方当前批准修订已实施，并回传实际${status}测试证据。`;
+} else if (lifecycle.phase === "joint_verifying") {
+  let status = "passed", output, exitCode = 0;
+  try { output = await exec(process.execPath, ["--test", "joint.test.mjs"], { cwd: process.cwd(), timeout: 30000 }); }
+  catch (error) { status = "failed"; exitCode = typeof error.code === "number" ? error.code : 1; output = error; }
+  actions.push({ type: "integration.report", revision: lifecycle.revision, documentHash: lifecycle.documentHash,
+    checks: lifecycle.contract.acceptanceCases.filter((item) => item.runnerParticipantId === context.participant.id).map((item) => {
+      const supported = item.command.trim() === "node --test joint.test.mjs";
+      return { caseId: item.id, status: supported ? status : "not_run", command: supported ? item.command : "", summary: supported ? `提供方实际HTTP联测${status}；显式合成报价夹具覆盖两SKU、数量及当前修订边界。` : "虚拟终端只支持已声明的报价联测命令，此用例未执行。", evidence: { exitCode, outputTail: `${output.stdout ?? ""}\n${output.stderr ?? ""}`.replaceAll(process.cwd(), "[project]").slice(-6000) } };
+    }) });
+  message = "提供方已提交平台内建联合验收的真实执行结果。";
+
 }
 
 console.log(JSON.stringify({ message, kind: "status", actions, notifyParticipantIds: [], needsHumanInput }));

@@ -57,11 +57,13 @@ vi.mock("@/services/acceptance", () => ({ submitAcceptance: vi.fn() }));
 vi.mock("@/services/actor", () => ({ authorizeActor: vi.fn(async () => "participant") }));
 vi.mock("@/services/collaborations", () => ({ addSystemMessage: vi.fn() }));
 
+vi.mock("@/services/workflow-outbox", () => ({ queueWorkflowWakeup: vi.fn(async () => {}), drainWorkflowWakeups: vi.fn(async () => {}) }));
+
+import { queueWorkflowWakeup, drainWorkflowWakeups } from "../src/services/workflow-outbox";
 import { completeConnectorJob, pollConnectorJob } from "../src/services/connectors";
 import { advanceAgentWorkflow, completeAgentTurn, refreshAgentJobContext } from "../src/services/agent-engine";
 import { createWorkItem, updateWorkItem } from "../src/services/work-items";
 import { submitAcceptance } from "../src/services/acceptance";
-import { addSystemMessage } from "../src/services/collaborations";
 import { HttpError, handleApiError } from "../src/lib/http";
 
 const job = (extra = {}) => ({
@@ -90,7 +92,8 @@ describe("Connector 结果与任务领取", () => {
     expect(state.effects).toEqual(["artifact"]);
     expect(state.updates.at(-1)?.status).toBe("completed");
     expect(state.transactions).toEqual([false, true]);
-    expect(advanceAgentWorkflow).toHaveBeenCalledOnce();
+    expect(queueWorkflowWakeup).toHaveBeenCalledWith("collaboration", "job");
+    expect(drainWorkflowWakeups).toHaveBeenCalled();
   });
 
   it("任一动作失败回滚前面的动作，并保留 failed 回执", async () => {
@@ -100,13 +103,25 @@ describe("Connector 结果与任务领取", () => {
       .rejects.toMatchObject({ status: 409, message: "前置任务未完成：部署核验" });
     expect(state.effects).toEqual([]);
     expect(state.updates).toEqual([expect.objectContaining({ status: "failed", result: null, error: "前置任务未完成：部署核验" })]);
-    expect(advanceAgentWorkflow).toHaveBeenCalledOnce();
+    expect(queueWorkflowWakeup).toHaveBeenCalledWith("collaboration", "job");
+    expect(drainWorkflowWakeups).toHaveBeenCalled();
   });
 
   it("重复完成回传不能重复应用动作", async () => {
     state.queries.push([job({ status: "completed" })]);
     await expect(completeConnectorJob("agent", { jobId: "job", status: "completed", result: {} })).rejects.toMatchObject({ status: 409 });
     expect(completeAgentTurn).not.toHaveBeenCalled();
+  });
+
+  it("相同完成回执可重发并取得ACK，不再次应用动作", async () => {
+    state.queries.push([job()]);
+    const input = { jobId: "job", status: "completed" as const, attempts: 1, result: { agentTurn: {} } };
+    await completeConnectorJob("agent", input);
+    const receiptHash = state.updates.find((update) => update.status === "completed")!.receiptHash;
+    state.queries.push([job({ status: "completed", receiptHash })]);
+    await completeConnectorJob("agent", input);
+    expect(completeAgentTurn).toHaveBeenCalledTimes(1);
+    expect(state.updates.filter((update) => update.status === "completed")).toHaveLength(1);
   });
 
   it.each([
@@ -127,12 +142,12 @@ describe("Connector 结果与任务领取", () => {
 
   it("后续派发失败不会把已应用动作改为 failed 或抛出让 Connector 重放", async () => {
     state.queries.push([job()]);
-    vi.mocked(advanceAgentWorkflow).mockRejectedValueOnce(new Error("schedule unavailable"));
+    vi.mocked(drainWorkflowWakeups).mockRejectedValueOnce(new Error("schedule unavailable"));
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     await completeConnectorJob("agent", { jobId: "job", status: "completed", result: {} });
     expect(state.updates.at(-1)?.status).toBe("completed");
     expect(log).toHaveBeenCalledOnce();
-    expect(addSystemMessage).toHaveBeenCalledWith("collaboration", expect.stringContaining("点击继续推进重试"));
+    expect(queueWorkflowWakeup).toHaveBeenCalledWith("collaboration", "job");
     log.mockRestore();
   });
 
@@ -160,7 +175,8 @@ describe("Connector 结果与任务领取", () => {
     await completeConnectorJob("agent", { jobId: "job", status: "failed", error: "CLI 无法执行" });
     expect(state.updates.at(-1)).toMatchObject({ status: "failed", error: "CLI 无法执行", result: null });
     expect(completeAgentTurn).not.toHaveBeenCalled();
-    expect(advanceAgentWorkflow).toHaveBeenCalledOnce();
+    expect(queueWorkflowWakeup).toHaveBeenCalledWith("collaboration", "job");
+    expect(drainWorkflowWakeups).toHaveBeenCalled();
   });
 
   it("领取竞争失败的 worker 不会返回另一个 worker 已领取的任务", async () => {
@@ -183,7 +199,7 @@ describe("Connector 结果与任务领取", () => {
     vi.mocked(refreshAgentJobContext).mockRejectedValueOnce(new HttpError(409, "参与方已退出"));
     await expect(pollConnectorJob("agent", 0)).rejects.toMatchObject({ status: 409, message: "参与方已退出" });
     expect(state.updates.at(-1)).toMatchObject({ status: "failed", error: "参与方已退出", leaseUntil: null });
-    expect(advanceAgentWorkflow).toHaveBeenCalledWith("job");
+    expect(queueWorkflowWakeup).toHaveBeenCalledWith("collaboration", "job");
   });
 });
 

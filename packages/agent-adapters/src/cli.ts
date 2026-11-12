@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { agentTurnResultSchema, type AgentTurnResult } from "@seam/protocol";
 import { z } from "zod";
+import { phaseInstruction } from "./handoff.js";
 import type { AgentRunInput } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -41,8 +42,10 @@ export function buildPrompt(input: AgentRunInput) {
   const phase = input.context?.lifecycle?.phase;
   if (phase && isRecord(schema.properties) && isRecord(schema.properties.actions)) {
     const allowed = new Set(phase === "planning" ? ["plan.submit"]
-      : phase === "plan_confirmation" ? ["plan.confirm", "plan.submit"]
-      : phase === "executing" ? ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit"] : []);
+      : phase === "plan_synthesis" ? ["plan.compose"]
+      : phase === "plan_confirmation" ? ["plan.confirm", "plan.reject", "plan.submit"]
+      : phase === "executing" ? ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit"]
+      : phase === "joint_verifying" ? ["integration.report"] : []);
     const actions = schema.properties.actions;
     if (isRecord(actions.items)) {
       for (const union of ["oneOf", "anyOf"]) {
@@ -58,8 +61,7 @@ export function buildPrompt(input: AgentRunInput) {
     "源码、未声明文件和本地环境变量不得发布。只讨论协作所需的信息。",
     "先复用上下文已有目标、用户指示、契约、任务、审批和凭据状态。不要要求用户重新填写可从本地项目或已有共享产物查到的资料。",
     "在用户已授权且本地权限允许的范围内直接实施、测试并报告实际结果。仅对真正缺失且阻止推进的事实提问；遇到部署或前置任务阻塞时继续可独立完成的代码与合成测试。",
-    "有 lifecycle 时严格遵循阶段：planning 只读分析本地项目并用 plan.submit 提交完整可执行实施计划（包含具体修改、双方接口、自动测试与验收），不要只回讨论或继续索取已有资料；plan_confirmation 只读审阅共同 document，内容正确且与本项目约束一致才用 plan.confirm 确认其 documentHash；存在缺漏或不一致时用 plan.submit 提交修订，不能盲目确认。awaiting_approval/awaiting_review/terminated 不修改代码。",
-    "只有 lifecycle.phase=executing、approvedHash 与 documentHash 一致且本地策略允许写入时，直接实施已批准计划、运行真实测试，并用 execution.report 提交 revision、真实 status/summary/evidence（含实际测试命令与结果）。不要再次要求用户批准同一计划；不能伪造执行、测试或审批。无 lifecycle 时保持只读。",
+    phaseInstruction(input.context),
     "你必须只返回一个符合以下结构的 JSON 对象，不要使用 Markdown 代码围栏：",
     `完整回复及当前阶段允许的动作 JSON Schema：${JSON.stringify(schema)}`,
     "不要虚构参与方、任务或产物 ID；只能使用 context 中已有 ID。只有需要其他 Agent 继续对话时才填写 notifyParticipantIds。",

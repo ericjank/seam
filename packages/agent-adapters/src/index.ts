@@ -44,7 +44,7 @@ export function describeExecutionPolicy(type: AdapterType, options: AdapterOptio
   if (type !== "codex" && type !== "codex-app-server") return "外部 CLI：有效写入、审批和网络权限由本机 CLI 配置决定；Seam 未验证其权限，不能把健康检查当作写入或测试能力证明。";
   const sandbox = options.codexSandbox ?? "read-only";
   if (sandbox !== "read-only" && sandbox !== "workspace-write") throw new Error("Codex 仅支持 read-only 或 workspace-write 本地策略");
-  return `Codex sandbox=${sandbox}，approval=never；${sandbox === "workspace-write" ? "本地写入能力已配置，仅 executing 且已批准同一方案 hash 的轮次允许在本地项目沙箱内实施并测试" : "只读，不可宣称已落盘修改"}。网络本地配置=${options.codexNetworkAccess === true}，只在批准的 executing 生效。受限操作须报告阻塞，由本地维护者处理；平台消息不能提升权限。`;
+  return `Codex sandbox=${sandbox}，approval=never；${sandbox === "workspace-write" ? "本地写入能力已配置，仅 executing/joint_verifying 且已批准同一方案 hash 的轮次允许在本地项目沙箱内实施并测试" : "只读，不可宣称已落盘修改"}。网络本地配置=${options.codexNetworkAccess === true}，只在批准的实施及联测阶段生效。受限操作须报告阻塞，由本地维护者处理；平台消息不能提升权限。`;
 }
 
 export function createAgentAdapter(type: AdapterType, options: AdapterOptions = {}): AgentAdapter {
@@ -58,3 +58,5 @@ export { MockAgentAdapter } from "./mock.js";
 export { CodexAppServerAdapter } from "./app-server.js";
 export { codexNetworkForTurn, codexSandboxForTurn } from "./policy.js";
 export type { AgentAdapter, AdapterOptions, AdapterType, AgentRunInput, CodexSandbox } from "./types.js";
+
+export { acquireSessionLock } from "./session-lock.js";

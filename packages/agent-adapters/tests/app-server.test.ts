@@ -153,7 +153,7 @@ describe("Codex App Server 持久会话", () => {
     expect(nextPrompt).toContain(next.jobId);
     const [file] = await readdir(f.stateDir);
     const stored = JSON.parse(await readFile(join(f.stateDir, file!), "utf8"));
-    expect(stored.lastHandoff).toMatchObject({ version: 1, scope: `${value.collaborationId}:${value.participant.id}` });
+    expect(stored.lastHandoff).toMatchObject({ version: 2, scope: `${value.collaborationId}:${value.participant.id}` });
     expect(Object.values(stored.lastHandoff.sections).every((hash) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))).toBe(true);
     expect(JSON.stringify(stored.lastHandoff)).not.toContain(value.lifecycle.document);
   });
@@ -323,7 +323,7 @@ describe("Codex App Server 持久会话", () => {
   it("所有未批准/非executing阶段、无lifecycle和本地只读都拒绝写入", () => {
     const value = context();
     const hash = "a".repeat(64);
-    for (const phase of ["planning", "plan_confirmation", "awaiting_approval", "awaiting_review", "terminated"] as const) {
+    for (const phase of ["planning", "plan_synthesis", "plan_confirmation", "awaiting_approval", "awaiting_review", "terminated"] as const) {
       expect(codexSandboxForTurn({ projectRoot: "/private", context: { ...value, lifecycle: { ...value.lifecycle!, phase, documentHash: hash, approvedHash: hash } } }, { codexSandbox: "workspace-write" })).toBe("read-only");
     }
     const executing = { ...value, lifecycle: { ...value.lifecycle!, phase: "executing" as const, documentHash: hash, approvedHash: hash } };
@@ -357,12 +357,16 @@ describe("Codex App Server 持久会话", () => {
     const executing = { ...input, context: { ...value, lifecycle: { ...value.lifecycle!, phase: "executing" as const, documentHash: hash, approvedHash: hash } } };
     expect(codexNetworkForTurn(executing, { codexSandbox: "workspace-write", codexNetworkAccess: true })).toBe(true);
     expect(codexNetworkForTurn(executing, { codexSandbox: "read-only", codexNetworkAccess: true })).toBe(false);
+    const joint = { ...executing, context: { ...executing.context, lifecycle: { ...executing.context.lifecycle, phase: "joint_verifying" as const } } };
+    expect(codexNetworkForTurn(joint, { codexSandbox: "workspace-write", codexNetworkAccess: true })).toBe(true);
+    expect(codexSandboxForTurn({ ...executing, context: { ...executing.context, lifecycle: { ...executing.context.lifecycle, paused: true } } }, { codexSandbox: "workspace-write" })).toBe("read-only");
     const prompt = buildPrompt(input);
     const schemaText = prompt.split("\n").find((line) => line.startsWith("完整回复及当前阶段允许的动作 JSON Schema："))!;
     const schema = JSON.stringify(JSON.parse(schemaText.slice(schemaText.indexOf("：") + 1)));
     expect(schema).toContain('"plan.submit"');
     expect(schema).not.toContain('"execution.report"');
     expect(schema).not.toContain('"credential.request"');
-    expect(prompt).toContain("不能盲目确认");
+    const confirmation = buildPrompt({ ...input, context: { ...value, lifecycle: { ...value.lifecycle!, phase: "plan_confirmation", documentHash: hash } } });
+    expect(confirmation).toContain("不能盲目确认");
   });
 });

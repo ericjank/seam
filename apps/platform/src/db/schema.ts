@@ -207,6 +207,8 @@ export const connectorJobs = mysqlTable("connector_jobs", {
   attempts: int("attempts").notNull().default(0),
   availableAt: timestamp("available_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
   leaseUntil: timestamp("lease_until", { fsp: 3 }),
+  receiptHash: varchar("receipt_hash", { length: 64 }),
+  cancellationAckAt: timestamp("cancellation_ack_at", { fsp: 3 }),
   ...timestamps,
 }, (table) => [index("connector_jobs_agent_status_idx").on(table.agentId, table.status, table.availableAt)]);
 
@@ -225,7 +227,8 @@ export const auditEvents = mysqlTable("audit_events", {
 export const collaborationLifecycles = mysqlTable("collaboration_lifecycles", {
   collaborationId: varchar("collaboration_id", { length: 36 }).primaryKey().references(() => collaborations.id, { onDelete: "cascade" }),
   revision: int("revision").notNull().default(1),
-  phase: mysqlEnum("phase", ["planning", "plan_confirmation", "awaiting_approval", "executing", "awaiting_review", "terminated"]).notNull().default("planning"),
+  phase: mysqlEnum("phase", ["planning", "plan_synthesis", "plan_confirmation", "awaiting_approval", "executing", "joint_verifying", "awaiting_review", "terminated"]).notNull().default("planning"),
+  pausedAt: timestamp("paused_at", { fsp: 3 }),
   requiredParticipantIds: json("required_participant_ids").$type<string[]>().notNull(),
   documentHash: varchar("document_hash", { length: 64 }),
   approvedHash: varchar("approved_hash", { length: 64 }),
@@ -241,6 +244,9 @@ export const lifecycleRevisions = mysqlTable("lifecycle_revisions", {
   collaborationId: varchar("collaboration_id", { length: 36 }).notNull().references(() => collaborations.id, { onDelete: "cascade" }),
   revision: int("revision").notNull(),
   requirements: longtext("requirements").notNull(),
+  changeRequest: longtext("change_request"),
+  sharedContract: json("shared_contract").$type<import("@seam/protocol").SharedContract>(),
+  objections: json("objections").$type<{ participantId: string; documentHash: string; reason: string }[]>(),
   document: longtext("document"),
   documentHash: varchar("document_hash", { length: 64 }),
   report: longtext("report"),
@@ -254,9 +260,25 @@ export const lifecycleContributions = mysqlTable("lifecycle_contributions", {
   revision: int("revision").notNull(),
   participantId: varchar("participant_id", { length: 36 }).notNull().references(() => participants.id),
   content: longtext("content"),
+  workspaceBaseline: json("workspace_baseline").$type<import("@seam/protocol").LifecycleContext["contributions"][number]["baseline"]>(),
   confirmedHash: varchar("confirmed_hash", { length: 64 }),
   reportStatus: mysqlEnum("report_status", ["passed", "failed"]),
   reportSummary: longtext("report_summary"),
   reportEvidence: json("report_evidence").$type<Record<string, unknown>>(),
+  integrationChecks: json("integration_checks").$type<import("@seam/protocol").LifecycleContext["integrationReports"][number]["checks"]>(),
   ...timestamps,
 }, (table) => [uniqueIndex("lifecycle_contributions_collab_revision_participant_unique").on(table.collaborationId, table.revision, table.participantId)]);
+
+// Written in the same transaction as its triggering state change. Polls and
+// heartbeats reconcile these records after a process crash or dispatch failure.
+export const workflowWakeups = mysqlTable("workflow_wakeups", {
+  id: id().primaryKey(),
+  collaborationId: varchar("collaboration_id", { length: 36 }).notNull().references(() => collaborations.id, { onDelete: "cascade" }),
+  sourceJobId: varchar("source_job_id", { length: 36 }),
+  snapshot: json("snapshot").$type<{ revision: number; phase: string; documentHash: string | null }>(),
+  attempts: int("attempts").notNull().default(0),
+  availableAt: timestamp("available_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
+  completedAt: timestamp("completed_at", { fsp: 3 }),
+  error: text("error"),
+  ...timestamps,
+}, (table) => [index("workflow_wakeups_pending_idx").on(table.completedAt, table.availableAt)]);

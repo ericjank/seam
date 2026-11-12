@@ -13,12 +13,14 @@ export interface ConnectorConfig {
   doctor?: boolean;
   appServerStateDir?: string;
   codexNetworkAccess?: boolean;
+  stateDir?: string;
+  workspaceLockDir?: string;
 }
 
 export function readConfig(args: string[], env = process.env): ConnectorConfig {
   const flags = new Map<string, string>();
   const booleanFlags = new Set(["once", "doctor", "help"]);
-  const valueFlags = new Set(["platform", "agent-id", "token", "project-root", "adapter", "codex-sandbox", "app-server-state-dir", "codex-network-access"]);
+  const valueFlags = new Set(["platform", "agent-id", "token", "project-root", "adapter", "codex-sandbox", "app-server-state-dir", "codex-network-access", "connector-state-dir", "workspace-lock-dir"]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg?.startsWith("--")) throw new Error(`无法识别的参数 ${arg}`);
@@ -57,5 +59,7 @@ export function readConfig(args: string[], env = process.env): ConnectorConfig {
     doctor,
     appServerStateDir: flags.get("app-server-state-dir") ?? env.SEAM_APP_SERVER_STATE_DIR,
     codexNetworkAccess: network === "true",
+    stateDir: flags.get("connector-state-dir") ?? env.SEAM_CONNECTOR_STATE_DIR,
+    workspaceLockDir: flags.get("workspace-lock-dir") ?? env.SEAM_WORKSPACE_LOCK_DIR,
   };
 }

@@ -1,14 +1,22 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runConnector } from "../src/index";
 import { readConfig } from "../src/config";
 
+let stateRoot: string;
+beforeEach(async () => { stateRoot = await mkdtemp(join(tmpdir(), "seam-connector-test-")); });
+afterEach(async () => { await rm(stateRoot, { recursive: true, force: true }); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("Connector 回执交付", () => {
   it("中心拒绝完成回执时保留原始错误，不再发第二个failed回执", async () => {
     vi.stubEnv("SEAM_TEST_COMMAND", "exit 0");
     const config = readConfig(["--once"], { SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "local-secret" });
+    config.stateDir = join(stateRoot, "journal"); config.workspaceLockDir = join(stateRoot, "locks");
     const jobId = crypto.randomUUID();
+    config.stateDir = join(stateRoot, "journal"); config.workspaceLockDir = join(stateRoot, "locks");
     const request = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ job: { id: jobId, agentId: config.agentId, collaborationId: null, kind: "local.test", payload: {}, attempts: 1 } })))
@@ -26,6 +34,7 @@ describe("Connector 回执交付", () => {
   it("本地执行失败正常回传一个failed回执", async () => {
     vi.stubEnv("SEAM_TEST_COMMAND", "");
     const config = readConfig(["--once"], { SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "local-secret" });
+    config.stateDir = join(stateRoot, "journal"); config.workspaceLockDir = join(stateRoot, "locks");
     const request = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ job: { id: crypto.randomUUID(), agentId: config.agentId, collaborationId: null, kind: "local.test", payload: {}, attempts: 1 } })))

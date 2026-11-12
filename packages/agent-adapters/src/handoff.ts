@@ -3,7 +3,7 @@ import type { CollaborationContext } from "@seam/protocol";
 import { buildNativeOutputSchema } from "./response-schema.js";
 import type { AgentRunInput } from "./types.js";
 
-export const NATIVE_HANDOFF_VERSION = 1;
+export const NATIVE_HANDOFF_VERSION = 2;
 export type HandoffCheckpoint = {
   version: typeof NATIVE_HANDOFF_VERSION;
   scope: string;
@@ -58,11 +58,14 @@ function controlText(context: CollaborationContext) {
   ].join("\n");
 }
 
-function phaseInstruction(context?: CollaborationContext) {
+export function phaseInstruction(context?: CollaborationContext) {
+  if (context?.lifecycle?.paused) return "本轮已暂停，保持只读并停止执行。";
   switch (context?.lifecycle?.phase) {
-    case "planning": return "本轮：只读分析并与对方协商，用 plan.submit 提交完整实施计划，包含本方修改、双方接口、测试和验收。未经管理员批准不得写代码。";
-    case "plan_confirmation": return "本轮：只读审阅完整共同文档。正确且符合本项目约束才用 plan.confirm 确认当前 revision/documentHash；有缺漏用 plan.submit 修订。双方确认不等于管理员批准。";
+    case "planning": return "本轮：只读分析本地项目，用 plan.submit 提交本方实施分析（至少100字符）。有上版基线时围绕本轮追加要求说明影响，复用未变决定，不重写历史。包含接口语义、本方修改及联合验收建议。未经管理员批准不得写代码。";
+    case "plan_synthesis": return "本轮：你是协调方，综合双方分析与异议，用 plan.compose 提交唯一完整 contract，baseDocumentHash 使用当前 documentHash（首次为 null）。contract 包含 scope、interfaces[{id,definition}]、responsibilities[{participantId,changes}]、acceptanceCases[{id,runnerParticipantId,description,command,expectedResult}]、risks、changeSummary、impactedParticipantIds、retainedDecisions。接口定义需覆盖请求/响应/错误和边界；职责和真实联合验收用例必须覆盖每方。每个用例必须有覆盖其断言的实际命令，缺少验收脚本时明确由哪方在获批实施阶段补齐，不能只列风险后跳过。增量修订保留未变契约，只调整受影响项；平台会渲染完整文档。只读，不实施。";
+    case "plan_confirmation": return "本轮：只读审阅完整共同文档，并核对本项目的验收脚本能否覆盖承诺的用例。正确且符合本项目约束才用 plan.confirm 确认当前 revision/documentHash；有冲突或缺漏用 plan.reject（revision、documentHash、reason）提出具体异议，协调方修订后双方重新确认。缺少测试覆盖且文档未安排获批后的补齐责任时必须提出异议，不能仅记为风险后确认。不能盲目确认；双方确认不等于管理员批准。";
     case "executing": return "本轮：仅在 approvedHash 与 documentHash 相同且本机权限允许时实施本版计划、运行真实测试，用 execution.report 回传实际 status/summary/evidence（测试命令、结果和限制）。不必重复索取同一审批。区分落盘、测试、部署、联调与验收。";
+    case "joint_verifying": return "本轮：只执行批准契约中 runnerParticipantId 为本方的所有联合验收用例，真实调用对方接口。用 integration.report 提交 revision、documentHash、checks[{caseId,status,command,summary,evidence}]；status 为 passed/failed/not_run，已执行项必须提供真实命令和输出证据。检查双方实施回执取得真实服务端点。禁止把 mock、本地单测或历史结果当成本轮真实联调，无法运行时如实报告 not_run。不得扩展开发范围。";
     default: return "本轮：保持只读，不修改代码，不自行批准、执行或终止协作。";
   }
 }
@@ -72,6 +75,10 @@ function contextSections(context: CollaborationContext): Section[] {
   const add = (key: string, title: string, content: string, source?: unknown, always = false) => sections.push({ key, title, content, source, always });
   const lifecycle = context.lifecycle;
   add("goal", "目标与当前要求", [context.objective, lifecycle?.requirements !== context.objective ? lifecycle?.requirements : null].filter(Boolean).join("\n\n"), undefined, true);
+  add("changeRequest", "本轮追加要求", lifecycle?.changeRequest ?? "", undefined, true);
+  add("baseline", "上版契约与报告（复用未变决定，历史证据不替代本轮验证）", lifecycle?.baseline ? readable(lifecycle.baseline) : "");
+  add("objections", "需解决的契约异议", readableCollection(lifecycle?.objections ?? []));
+  add("integrationReports", "本轮联合验收回执", readableCollection(lifecycle?.integrationReports ?? []));
   add("participants", "参与方", context.participants.map((participant) => `${participant.projectName}（${participant.id}）：${participant.role}，${participant.status}，${participant.approvalRequired ? "需确认" : "无需确认"}${participant.id === context.participant.id ? "；本方" : ""}`).join("\n"));
   const document = lifecycle?.document ?? "";
   // Entering implementation resends the exact document even when its hash is

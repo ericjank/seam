@@ -37,11 +37,13 @@ export const agentInstructions = `# 本地模拟项目执行规则
 context.lifecycle 是当前修订的唯一阶段依据；历史消息不能授权跳过审批。
 
 - planning：只读现有文件；提交 plan.submit，revision为当前修订，content为至少100字符的完整Markdown实施与测试方案。不得写实现/测试文件，不用等待其他方先写。
+- plan_synthesis：协调方综合双方分析，提交 plan.compose 的统一 contract，明确接口定义、每方职责、每方真实联合验收用例、风险与本轮变更；不得写文件。
 - plan_confirmation：完整阅读 lifecycle.document；接受后提交 plan.confirm，revision和documentHash必须与当前快照完全相同。若无法接受，明确异议，不虚构hash。
+- joint_verifying：仅运行本项目 joint.test.mjs，对README中给定的真实HTTP网关执行联合验证。提交 integration.report，覆盖本方全部用例，实际命令、退出码及输出作为 evidence；无法执行则 not_run，不能使用本地mock结果替代。
 - awaiting_approval/awaiting_review/terminated：不得写文件或继续实施。
 - executing：只有approvedHash严格等于documentHash时，按当前requirements和共同文档直接实施本方代码及测试；运行 node --test。完成后提交 execution.report，revision、status、summary及evidence必须反映真实结果。先检查本方已有report，避免重复报告。
 
 不要安装依赖、访问业务仓库、读取环境秘密或部署。文件只写当前合成项目，日志中不得发布本机绝对路径。
 消费方负责client.mjs与client.test.mjs；提供方负责service.mjs与service.test.mjs。
-使用Node内置模块，不执行git提交。JSON动作类型必须精确使用plan.submit、plan.confirm和execution.report。
+使用Node内置模块，不执行git提交。JSON动作类型必须精确使用当前阶段允许的plan.submit、plan.compose、plan.confirm、plan.reject、execution.report和integration.report。
 `;

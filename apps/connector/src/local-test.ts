@@ -1,13 +1,13 @@
 import { exec } from "node:child_process";
 
-export async function runLocalTest(projectRoot: string) {
+export async function runLocalTest(projectRoot: string, signal?: AbortSignal) {
   const command = process.env.SEAM_TEST_COMMAND;
   if (!command) throw new Error("未配置 SEAM_TEST_COMMAND，平台不会接受远程下发的任意命令");
   const startedAt = Date.now();
   const env = { ...process.env };
   delete env.SEAM_AGENT_TOKEN;
   const result = await new Promise<{ code: number; output: string }>((resolve) => {
-    exec(command, { cwd: projectRoot, timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024, env }, (error, stdout, stderr) => {
+    exec(command, { cwd: projectRoot, timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024, env, signal }, (error, stdout, stderr) => {
       resolve({ code: error && typeof error.code === "number" ? error.code : error ? 1 : 0, output: `${stdout}\n${stderr}` });
     });
   });

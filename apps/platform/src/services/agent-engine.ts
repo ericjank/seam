@@ -27,7 +27,7 @@ export async function dispatchAgentTurns(userId: string, collaborationId: string
     if (active.length) return active.map((job) => job.id);
     const detail = await getCollaborationDetail(userId, collaborationId);
     if (detail.lifecycle) {
-      if (!["planning", "plan_confirmation", "executing"].includes(detail.lifecycle.phase)) throw new HttpError(409, "当前阶段等待管理员确认，不能继续派发实施");
+      if (detail.lifecycle.paused || !["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(detail.lifecycle.phase)) throw new HttpError(409, "当前阶段等待管理员确认，不能继续派发实施");
       const eligible = lifecycleTargets(detail.lifecycle);
       participantIds = participantIds ? participantIds.filter((id) => eligible.includes(id)) : eligible;
     }
@@ -131,9 +131,13 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
   const lifecycle = await assertLifecycleJobCurrent(collaboration.id, (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot);
   if (lifecycle) {
-    const allowed = lifecycle.phase === "planning" ? ["plan.submit"] : lifecycle.phase === "plan_confirmation" ? ["plan.confirm", "plan.submit"] : lifecycle.phase === "executing" ? ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit"] : [];
-    if (turn.actions.some((action) => !allowed.includes(action.type))) throw new HttpError(409, "动作不符合当前阶段；审批前只能协商文档，实施后只能提交实施结果");
-    if (turn.actions.filter((action) => ["plan.submit", "plan.confirm", "execution.report"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交当前阶段的一项计划、确认或实施报告");
+    const allowedByPhase: Record<string, string[]> = {
+      planning: ["plan.submit"], plan_synthesis: ["plan.compose"], plan_confirmation: ["plan.confirm", "plan.reject", "plan.submit"],
+      executing: ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit"], joint_verifying: ["integration.report"],
+    };
+    const allowed = allowedByPhase[lifecycle.phase] ?? [];
+    if (turn.actions.some((action) => !allowed.includes(action.type))) throw new HttpError(409, "动作不符合当前生命周期阶段");
+    if (turn.actions.filter((action) => ["plan.submit", "plan.compose", "plan.confirm", "plan.reject", "execution.report", "integration.report"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交当前阶段的一项计划、契约、确认、异议或报告");
   }
   // Validate the entire batch before applying any action. An Agent can participate in
   // multiple collaborations, but IDs from one run must never affect another.
@@ -146,7 +150,7 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const actor = { kind: "participant" as const, id: participant.id };
   let changed = false;
   for (const action of turn.actions) {
-    if (action.type === "plan.submit" || action.type === "plan.confirm" || action.type === "execution.report") {
+    if (action.type === "plan.submit" || action.type === "plan.compose" || action.type === "plan.reject" || action.type === "plan.confirm" || action.type === "execution.report" || action.type === "integration.report") {
       if (!lifecycle) throw new HttpError(409, "当前协作尚未启用管理员审批流程");
       const outcome = await applyLifecycleAction(actor, job.collaborationId, action);
       changed ||= outcome.changed;
@@ -209,11 +213,11 @@ export async function advanceAgentWorkflow(jobId: string) {
       if (allJobs.some((j) => j.sequence > job.sequence && (j.payload as { workflow?: Workflow }).workflow?.id !== workflow.id)) return;
       const snapshot = (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot;
       if (!snapshot || snapshot.revision !== detail.lifecycle.revision) return;
-      const transitions: Record<string, string[]> = { planning: ["planning", "plan_confirmation"], plan_confirmation: ["plan_confirmation"], executing: ["executing"] };
+      const transitions: Record<string, string[]> = { planning: ["planning", "plan_synthesis"], plan_synthesis: ["plan_confirmation"], plan_confirmation: ["plan_confirmation", "plan_synthesis"], executing: ["executing", "joint_verifying"], joint_verifying: ["joint_verifying"] };
       if (!transitions[snapshot.phase]?.includes(detail.lifecycle.phase)) return;
       // Managed tasks advance by explicit phase receipts, never by the legacy
       // message heuristic. Both approval and final closure remain human gates.
-      if (["awaiting_approval", "awaiting_review", "terminated"].includes(detail.lifecycle.phase)) return;
+      if (detail.lifecycle.paused || ["awaiting_approval", "awaiting_review", "terminated"].includes(detail.lifecycle.phase)) return;
       const targets = lifecycleTargets(detail.lifecycle);
       if (targets.length && workflow.round < workflow.maxRounds) {
         await enqueueTurns(detail, { ...workflow, round: workflow.round + 1 }, targets);
@@ -260,8 +264,11 @@ export async function advanceAgentWorkflow(jobId: string) {
 }
 
 function lifecycleTargets(lifecycle: NonNullable<Awaited<ReturnType<typeof getLifecycleContext>>>) {
+  if (lifecycle.paused) return [];
+  if (lifecycle.phase === "plan_synthesis") return [lifecycle.coordinatorParticipantId ?? lifecycle.requiredParticipantIds[0]!];
   return lifecycle.requiredParticipantIds.filter((id) => lifecycle.phase === "planning"
     ? !lifecycle.contributions.some((entry) => entry.participantId === id)
     : lifecycle.phase === "plan_confirmation" ? !lifecycle.confirmations.includes(id)
-    : lifecycle.phase === "executing" ? !lifecycle.reports.some((entry) => entry.participantId === id) : false);
+    : lifecycle.phase === "executing" ? !lifecycle.reports.some((entry) => entry.participantId === id)
+    : lifecycle.phase === "joint_verifying" ? !lifecycle.integrationReports.some((entry) => entry.participantId === id) : false);
 }

@@ -1,4 +1,4 @@
-import { agentTurnResultSchema, ARTIFACT_TYPES, CREDENTIAL_TYPES, WORK_STATUSES, type AgentTurnResult } from "@seam/protocol";
+import { agentTurnResultSchema, sharedContractSchema, ARTIFACT_TYPES, CREDENTIAL_TYPES, WORK_STATUSES, type AgentTurnResult } from "@seam/protocol";
 import { z } from "zod";
 import type { AgentRunInput } from "./types.js";
 
@@ -28,18 +28,25 @@ function nativeResponseSchema(input: AgentRunInput) {
   if (!lifecycle) actions = Object.values(auxiliaryActions);
   else {
     const submit = z.object({ type: z.literal("plan.submit"), revision: z.literal(lifecycle.revision), content: z.string().min(100).max(100_000) }).strict();
-    switch (lifecycle.phase) {
+    switch (lifecycle.paused ? "paused" : lifecycle.phase) {
       case "planning": actions = [submit]; break;
+      case "plan_synthesis": actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: sharedContractSchema.required() }).strict()]; break;
       case "plan_confirmation":
         actions = [submit];
         // A missing/invalid snapshot cannot be confirmed, even by a response
         // that bypasses the model-side schema. It can still be revised.
-        if (lifecycle.documentHash?.length === 64) actions.push(z.object({ type: z.literal("plan.confirm"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash) }).strict());
+        if (lifecycle.documentHash?.length === 64) actions.push(
+          z.object({ type: z.literal("plan.confirm"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash) }).strict(),
+          z.object({ type: z.literal("plan.reject"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash), reason: z.string().min(10).max(10_000) }).strict(),
+        );
         break;
       case "executing": actions = [
         z.object({ type: z.literal("execution.report"), revision: z.literal(lifecycle.revision), status: z.enum(["passed", "failed"]), summary, evidence }).strict(),
         auxiliaryActions["artifact.upsert"], auxiliaryActions["work.create"], auxiliaryActions["work.update"], auxiliaryActions["acceptance.submit"],
       ]; break;
+      case "joint_verifying": actions = [z.object({ type: z.literal("integration.report"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash), checks: z.array(z.object({
+        caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]), command: z.string().max(2000), summary: z.string().min(1).max(10_000), evidence,
+      }).strict()).min(1).max(100) }).strict()]; break;
       default: actions = [];
     }
   }
@@ -64,6 +71,7 @@ export function buildNativeOutputSchema(input: AgentRunInput): Record<string, un
     if (!node || typeof node !== "object") return;
     if (Array.isArray(node)) { node.forEach(compact); return; }
     const record = node as Record<string, unknown>;
+    delete record.default;
     if (record.format === "uuid") delete record.pattern;
     Object.values(record).forEach(compact);
   };

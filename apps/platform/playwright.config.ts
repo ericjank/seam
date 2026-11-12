@@ -12,6 +12,7 @@ export default defineConfig({
   use: {
     baseURL,
     channel: "chrome",
+    launchOptions: { chromiumSandbox: true },
     // Docker renders in UTC. Deliberately use the local timezone so date text
     // must remain stable through hydration rather than hiding a mismatch.
     timezoneId: "Asia/Shanghai",

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import { runConnector } from "../../apps/connector/dist/index.js";
 import { SimulationApi } from "./http.mjs";
 import { agentInstructions, contract, revisionOne, revisionTwo } from "./contract.mjs";
 import { publishJointEvidence } from "./publish-joint-evidence.mjs";
+import { jointFixture } from "./joint-fixture.mjs";
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,6 +22,8 @@ let runRoot;
 let collaborationId;
 let locals = [];
 let heartbeatTimer;
+let liveGateway;
+let gatewayRevision = 1;
 
 function lifecycle(detail) {
   const value = detail.lifecycle ?? detail.collaboration.lifecycle;
@@ -29,7 +32,7 @@ function lifecycle(detail) {
 }
 
 function progress(event, fields = {}) {
-  console.log(JSON.stringify({ event, ...fields }));
+  console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
 }
 
 async function snapshot(root, relative = "") {
@@ -66,7 +69,7 @@ async function runAgent(local) {
     await runConnector({
       platformUrl: api.base, agentId: local.agent.id, token: local.agent.token, projectRoot: local.root,
       adapter: local.role === "consumer" ? "codex-app-server" : "generic-cli", codexSandbox: "workspace-write",
-      appServerStateDir: join(runRoot, "codex-state"), once: true, pollMs: 100,
+      appServerStateDir: join(runRoot, "codex-state"), stateDir: join(runRoot, "connector-state"), workspaceLockDir: join(runRoot, "workspace-locks"), codexNetworkAccess: true, once: true, pollMs: 100,
     });
   } finally {
     for (const [key, value] of [["SEAM_GENERIC_AGENT_COMMAND", original.command], ["SEAM_GENERIC_AGENT_ARGS", original.args], ["SEAM_APP_SERVER_STATE_DIR", original.state]]) {
@@ -83,7 +86,7 @@ async function runUntilPhase(expected, maximum = 18) {
     progress("lifecycle", { revision: current.revision, phase: current.phase, turn });
     if (current.phase === expected) return detail;
     assert.notEqual(current.phase, "terminated", "simulation was terminated before the requested checkpoint");
-    assert.ok(["planning", "plan_confirmation", "executing"].includes(current.phase), `unexpected stop before ${expected}: ${current.phase}`);
+    assert.ok(["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(current.phase), `unexpected stop before ${expected}: ${current.phase}`);
     const failed = detail.jobs.find((job) => job.status === "failed");
     assert.ok(!failed, `Connector failed: ${failed?.error ?? ""}`);
     const pending = detail.jobs.filter((job) => job.status === "pending");
@@ -187,6 +190,8 @@ async function approveAndExecute(detail, baseline) {
   const completed = lifecycle(reviewed);
   assert.equal(completed.reports.length, 2, "both endpoints must submit actual execution.report actions");
   assert.ok(completed.reports.every((report) => report.status === "passed"), "a failed test cannot be counted as a passed simulation");
+  assert.equal(completed.integrationReports.length, 2);
+  assert.ok(completed.integrationReports.every((entry) => entry.checks.every((check) => check.status === "passed")), "built-in joint verification must actually pass");
   assert.ok(completed.report, "Seam must produce the administrator's implementation report");
   const joint = await jointHttpCheck(ready.revision);
   await writeFile(join(runRoot, `revision-${ready.revision}-report.json`), JSON.stringify({ lifecycle: completed, joint }, null, 2));
@@ -213,6 +218,30 @@ async function main() {
     await exec("git", ["init", "--quiet", root]);
     locals.push({ ...registered, root, role });
   }
+  // Test infrastructure supplies a live transport; all quote/client business
+  // behavior is implemented by the project Agents after administrator approval.
+  liveGateway = createServer(async (request, response) => {
+    try {
+      if (request.method === "GET" && request.url === "/__seam_acceptance__/revision") {
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ revision: gatewayRevision }));
+        return;
+      }
+      if (request.method !== "POST" || request.url !== "/quote") { response.writeHead(404).end(); return; }
+      let body = ""; for await (const chunk of request) { body += chunk; if (body.length > 10000) throw new Error("request too large"); }
+      const path = join(locals[0].root, "service.mjs");
+      const provider = await import(`${pathToFileURL(path)}?version=${(await stat(path)).mtimeMs}`);
+      const value = provider.quote(JSON.parse(body));
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value));
+    } catch (error) { response.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: error.message })); }
+  });
+  await new Promise((resolve) => liveGateway.listen(0, "127.0.0.1", resolve));
+  const liveURL = `http://127.0.0.1:${liveGateway.address().port}`;
+  for (const local of locals) {
+    await writeFile(join(local.root, "README.md"), `${contract}\n\n本项目职责：${local.role}。\n联合验收使用 node --test joint.test.mjs；真实HTTP网关为 ${liveURL}，已由模拟器提供，网关业务函数来自提供方实际 service.mjs。测试配置GET /__seam_acceptance__/revision提供当前验收修订；脚本逐项断言完整响应、两个SKU、数量边界、真实400及客户端Error包含HTTP状态码，修订2增加折扣省略/0/10/100及非法值，不能以进程成功代替用例覆盖。\n`);
+    await writeFile(join(local.root, "joint.test.mjs"), jointFixture({ liveURL, role: local.role }));
+    await exec("git", ["-C", local.root, "add", "README.md", "AGENTS.md", "joint.test.mjs"]);
+    await exec("git", ["-C", local.root, "-c", "user.name=Seam Simulation", "-c", "user.email=simulation@seam.test", "commit", "--quiet", "-m", "Initialize isolated acceptance fixture"]);
+  }
   const sendHeartbeats = () => Promise.all(locals.map((local) => api.call("/api/connectors/heartbeat", {
     agentId: local.agent.id,
     capabilities: {
@@ -229,6 +258,7 @@ async function main() {
     targetProjectId: locals[0].project.id, targetAgentId: locals[0].agent.id,
   });
   collaborationId = created.id;
+  progress("collaboration-created", { collaborationId });
   assert.ok(created.jobs?.length === 2, "the simple create path must automatically join both Agents and start planning");
   const initialDetail = await api.detail(collaborationId);
   assert.equal(initialDetail.participants.filter((item) => item.participant.status === "active").length, 2);
@@ -255,6 +285,7 @@ async function main() {
   await approveAndExecute(readyOne, initial);
   const beforeRevision = await Promise.all(locals.map((local) => snapshot(local.root)));
   await api.lifecycle(collaborationId, { action: "append", requirements: revisionTwo });
+  gatewayRevision = 2;
   const appended = lifecycle(await api.detail(collaborationId));
   assert.equal(appended.revision, 2);
   assert.equal(appended.phase, "planning");
@@ -292,4 +323,4 @@ main().catch(async (error) => {
   if (runRoot) await writeFile(join(runRoot, "failure.json"), JSON.stringify(result, null, 2)).catch(() => undefined);
   console.error(JSON.stringify(result, null, 2));
   process.exitCode = 1;
-}).finally(() => clearInterval(heartbeatTimer));
+}).finally(async () => { clearInterval(heartbeatTimer); if (liveGateway) await new Promise((resolve) => liveGateway.close(resolve)); });

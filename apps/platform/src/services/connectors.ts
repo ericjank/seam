@@ -1,11 +1,12 @@
-import { and, asc, desc, eq, lte } from "drizzle-orm";
+import { createHash } from "node:crypto";
+import { gt, and, asc, desc, eq, lte } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
 import { agents, collaborations, connectorJobs, auditEvents } from "@/db/schema";
 import { hashToken, newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
-import { advanceAgentWorkflow, completeAgentTurn, refreshAgentJobContext } from "./agent-engine";
+import { completeAgentTurn, refreshAgentJobContext } from "./agent-engine";
 import { submitAcceptance } from "./acceptance";
-import { addSystemMessage } from "./collaborations";
+import { drainWorkflowWakeups, queueWorkflowWakeup } from "./workflow-outbox";
 import { z, ZodError } from "zod";
 
 const localTestResultSchema = z.object({
@@ -14,15 +15,10 @@ const localTestResultSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
 });
 
+const canonical = (value: unknown): string => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
+
 async function advanceWithReceipt(jobId: string, collaborationId: string | null) {
-  try { await advanceAgentWorkflow(jobId); }
-  catch (error) {
-    console.error("Agent 后续协作派发失败", error);
-    if (collaborationId) {
-      try { await addSystemMessage(collaborationId, "本轮执行结果已保存，但后续协作暂未派发。请点击继续推进重试。"); }
-      catch (receiptError) { console.error("Agent 调度失败提示写入失败", receiptError); }
-    }
-  }
+  if (collaborationId) try { await drainWorkflowWakeups({ collaborationId }); } catch (error) { console.error("后续调度暂不可用，已保存待恢复记录", error); }
 }
 
 export async function authenticateConnector(request: Request, agentId: string) {
@@ -37,7 +33,7 @@ export async function heartbeat(agentId: string, capabilities?: {
   adapter: "codex" | "codex-app-server" | "claude-code" | "generic-cli" | "mock";
   executionMode: "read-only" | "workspace-write" | "external";
   testConfigured: boolean;
-}) {
+}, activeJob?: { id: string; attempts: number; cancelled?: boolean }) {
   await db.update(agents).set({ status: "online", lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(agents.id, agentId));
   if (capabilities) {
     const [latest] = await db.select({ metadata: auditEvents.metadata }).from(auditEvents).where(and(
@@ -48,6 +44,20 @@ export async function heartbeat(agentId: string, capabilities?: {
       await db.insert(auditEvents).values({ id: newId(), actorType: "connector", actorId: agentId, action: "connector.capabilities", metadata: capabilities });
     }
   }
+  let jobState: { cancelRequested: boolean; leaseUntil?: string } | undefined;
+  if (activeJob) {
+    const [job] = await db.select().from(connectorJobs).where(and(eq(connectorJobs.id, activeJob.id), eq(connectorJobs.agentId, agentId))).limit(1);
+    const current = job && job.attempts === activeJob.attempts;
+    if (activeJob.cancelled && current && job.status === "cancelled") await db.update(connectorJobs).set({ cancellationAckAt: new Date(), updatedAt: new Date() }).where(eq(connectorJobs.id, job.id));
+    const valid = current && job.status === "running" && job.leaseUntil && job.leaseUntil.getTime() > Date.now();
+    if (valid) {
+      const leaseUntil = new Date(Date.now() + 20 * 60 * 1000);
+      const [renewal] = await db.update(connectorJobs).set({ leaseUntil, updatedAt: new Date() }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, activeJob.attempts), gt(connectorJobs.leaseUntil, new Date())));
+      jobState = renewal.affectedRows === 1 ? { cancelRequested: false, leaseUntil: leaseUntil.toISOString() } : { cancelRequested: true };
+    } else jobState = { cancelRequested: true };
+  }
+  await drainWorkflowWakeups({ agentId });
+  return jobState;
 }
 
 export async function pollConnectorJob(agentId: string, waitMs: number) {
@@ -79,6 +89,7 @@ export async function pollConnectorJob(agentId: string, waitMs: number) {
             await db.update(connectorJobs).set({ status: "failed", error: message, leaseUntil: null, updatedAt: new Date() })
               .where(and(eq(connectorJobs.id, claimed.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, claimed.attempts)));
             if (!(error instanceof HttpError)) console.error("Agent 上下文刷新失败", error);
+            if (claimed.collaborationId) await queueWorkflowWakeup(claimed.collaborationId, claimed.id);
             await advanceWithReceipt(claimed.id, claimed.collaborationId);
             throw new HttpError(error instanceof HttpError ? error.status : 409, message);
           }
@@ -97,6 +108,7 @@ export async function completeConnectorJob(agentId: string, input: {
   error?: string;
   attempts?: number;
 }) {
+  const receiptHash = createHash("sha256").update(canonical({ status: input.status, result: input.result ?? null, error: input.error ?? null, attempts: input.attempts ?? null })).digest("hex");
   let actionError: unknown;
   let advance = false;
   const [candidate] = await db.select().from(connectorJobs)
@@ -109,6 +121,11 @@ export async function completeConnectorJob(agentId: string, input: {
       .where(eq(collaborations.id, candidate.collaborationId)).limit(1).for("update");
     const [job] = await db.select().from(connectorJobs)
       .where(and(eq(connectorJobs.id, input.jobId), eq(connectorJobs.agentId, agentId))).limit(1).for("update");
+    if (job && ["completed", "failed"].includes(job.status) && job.receiptHash === receiptHash) {
+      if (job.status === "failed" && input.status === "completed") throw new HttpError(422, job.error ?? "动作已拒绝");
+      advance = job.kind === "collaboration.turn";
+      return;
+    }
     if (!job || job.status !== "running" || !job.leaseUntil || job.leaseUntil.getTime() <= Date.now()) {
       throw new HttpError(409, "任务不存在、已完成或租约已失效");
     }
@@ -117,10 +134,11 @@ export async function completeConnectorJob(agentId: string, input: {
     }
     if (input.status === "failed") {
       await db.update(connectorJobs).set({
-        status: "failed", result: null, error: input.error ?? "Connector 执行失败",
+        status: "failed", receiptHash, result: null, error: input.error ?? "Connector 执行失败",
         leaseUntil: null, updatedAt: new Date(),
       }).where(eq(connectorJobs.id, input.jobId));
       advance = job.kind === "collaboration.turn";
+      if (advance && job.collaborationId) await queueWorkflowWakeup(job.collaborationId, job.id);
       return;
     }
 
@@ -143,7 +161,7 @@ export async function completeConnectorJob(agentId: string, input: {
           });
         }
         await db.update(connectorJobs).set({
-          status: "completed", result: input.result ?? null, error: null, leaseUntil: null, updatedAt: new Date(),
+          status: "completed", receiptHash, result: input.result ?? null, error: null, leaseUntil: null, updatedAt: new Date(),
         }).where(eq(connectorJobs.id, input.jobId));
       }, { savepoint: true });
       advance = job.kind === "collaboration.turn";
@@ -152,11 +170,12 @@ export async function completeConnectorJob(agentId: string, input: {
         error instanceof ZodError ? "Agent 返回结果格式不正确，本轮修改已回滚" : "Agent 动作应用失败，本轮修改已回滚");
       if (!(error instanceof HttpError) && !(error instanceof ZodError)) console.error("Agent 动作事务已回滚", error);
       await db.update(connectorJobs).set({
-        status: "failed", result: null, error: (actionError as Error).message,
+        status: "failed", receiptHash, result: null, error: (actionError as Error).message,
         leaseUntil: null, updatedAt: new Date(),
       }).where(eq(connectorJobs.id, input.jobId));
       advance = job.kind === "collaboration.turn";
     }
+    if (advance && job.collaborationId) await queueWorkflowWakeup(job.collaborationId, job.id);
   });
   // Scheduling happens after the action transaction commits. A scheduling
   // failure must never cause a successfully applied turn to be replayed.

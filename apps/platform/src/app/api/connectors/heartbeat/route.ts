@@ -5,15 +5,16 @@ import { authenticateConnector, heartbeat } from "@/services/connectors";
 
 export async function POST(request: Request) {
   try {
-    const { agentId, capabilities } = z.object({
+    const { agentId, capabilities, activeJob } = z.object({
       agentId: z.string().uuid(),
+      activeJob: z.object({ id: z.string().uuid(), attempts: z.number().int().positive(), cancelled: z.boolean().optional() }).optional(),
       capabilities: z.object({
         adapter: z.enum(["codex", "codex-app-server", "claude-code", "generic-cli", "mock"]),
         executionMode: z.enum(["read-only", "workspace-write", "external"]), testConfigured: z.boolean(),
       }).optional(),
     }).parse(await request.json());
     await authenticateConnector(request, agentId);
-    await heartbeat(agentId, capabilities);
-    return NextResponse.json({ ok: true, serverTime: new Date().toISOString() });
+    const jobState = await heartbeat(agentId, capabilities, activeJob);
+    return NextResponse.json({ ok: true, serverTime: new Date().toISOString(), jobState });
   } catch (error) { return handleApiError(error); }
 }

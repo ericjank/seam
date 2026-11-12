@@ -1,3 +1,4 @@
+import { fixtureContract } from "../tests/fixtures/shared-contract";
 import { randomUUID } from "node:crypto";
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 
@@ -56,7 +57,9 @@ async function submitGoal(page: Page, peers: Peer[], objective: string) {
 }
 
 async function completePhase(request: APIRequestContext, collaborationId: string, peers: Peer[], phase: string) {
-  for (const peer of peers) {
+  const detail = await (await request.get(`/api/collaborations/${collaborationId}`)).json();
+  const targets = phase === "plan_synthesis" ? peers.filter((peer) => detail.participants.find((row: any) => row.participant.agentId === peer.agent.id)?.participant.id === detail.lifecycle.coordinatorParticipantId) : peers;
+  for (const peer of targets) {
     const { job } = await post(request, "/api/connectors/poll", { agentId: peer.agent.id, waitMs: 0 }, peer.agent);
     expect(job?.collaborationId).toBe(collaborationId);
     expect(job.kind).toBe("collaboration.turn");
@@ -66,8 +69,12 @@ async function completePhase(request: APIRequestContext, collaborationId: string
     const action = phase === "planning" ? {
       type: "plan.submit", revision,
       content: `# ${peer.project.name} 修订${revision}完整方案\n\n## 目标与接口\n使用合成POST /quote接口验证浏览器受控协作流程，不访问业务数据。当前管理员要求：${lifecycle.requirements}。\n\n## 分工与实施\n双方先确认相同文档hash，再由管理员批准。提供方校验SKU和数量，消费方验证金额和错误响应；修订2增加折扣兼容。不得在批准前创建代码、安装依赖、部署或调用实际业务服务。\n\n## 测试证据\n本浏览器场景以合成Connector HTTP回执验证文档、审批与报告展示，真实Codex及代码测试由独立完整模拟运行器验证。本回执不冒充真实模型实施或业务验收。`,
+    } : phase === "plan_synthesis" ? {
+      type: "plan.compose", revision, baseDocumentHash: lifecycle.documentHash, contract: fixtureContract(lifecycle.requiredParticipantIds, revision),
     } : phase === "plan_confirmation" ? {
       type: "plan.confirm", revision, documentHash: lifecycle.documentHash,
+    } : phase === "joint_verifying" ? {
+      type: "integration.report", revision, documentHash: lifecycle.documentHash, checks: lifecycle.contract.acceptanceCases.filter((item: any) => item.runnerParticipantId === job.payload.context.participant.id).map((item: any) => ({ caseId: item.id, status: "passed", command: item.command, summary: "浏览器流程合成回执，不代表真实模型或业务验收", evidence: { fixture: true } })),
     } : {
       type: "execution.report", revision, status: "passed",
       summary: `${peer.project.name} 修订${revision}浏览器流程合成回执，仅验证报告展示；不代表真实模型或业务验收。`,
@@ -105,7 +112,12 @@ test("管理员通过真实界面审阅两轮文档和报告，明确批准后�
   const earlyTermination = await page.request.post(`/api/collaborations/${id}/lifecycle`, { data: { action: "terminate" } });
   expect(earlyTermination.status()).toBe(409);
 
+  await panel.getByRole("button", { name: "暂停自动协作", exact: true }).click();
+  await expect(panel.getByRole("button", { name: "恢复自动协作", exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("paused.png"), fullPage: true });
+  await panel.getByRole("button", { name: "恢复自动协作", exact: true }).click();
   await completePhase(page.request, id, peers, "planning");
+  await completePhase(page.request, id, peers, "plan_synthesis");
   await completePhase(page.request, id, peers, "plan_confirmation");
   await expect(panel.getByRole("heading", { name: "开发对接实施文档 · v1" })).toBeVisible({ timeout: 15_000 });
   await expect(panel.getByText(/计划 2\/2 · 确认 2\/2 · 实施回执 0\/2/)).toBeVisible();
@@ -135,6 +147,10 @@ test("管理员通过真实界面审阅两轮文档和报告，明确批准后�
   await panel.getByRole("button", { name: "确认文档并执行" }).click();
   await expect(panel.getByText("两端正在按已批准文档修改各自项目并运行测试", { exact: false })).toBeVisible();
   await completePhase(page.request, id, peers, "executing");
+  { const beforeJoint = await (await page.request.get(`/api/collaborations/${id}`)).json();
+  expect(beforeJoint.lifecycle.phase).toBe("joint_verifying");
+  expect(beforeJoint.lifecycle.report).toBeNull(); }
+  await completePhase(page.request, id, peers, "joint_verifying");
   await expect(panel.getByRole("heading", { name: "完整实施报告 · v1" })).toBeVisible({ timeout: 15_000 });
   await expect(panel.getByText(/实施回执 2\/2/)).toBeVisible();
   await expect(panel.locator("pre").last()).toContainText("不代表真实模型或业务验收");
@@ -157,12 +173,17 @@ test("管理员通过真实界面审阅两轮文档和报告，明确批准后�
   const stale = await page.request.post(`/api/collaborations/${id}/lifecycle`, { data: { action: "approve", revision: 1, documentHash: versionOne.lifecycle.documentHash } });
   expect(stale.status()).toBe(409);
   await completePhase(page.request, id, peers, "planning");
+  await completePhase(page.request, id, peers, "plan_synthesis");
   await completePhase(page.request, id, peers, "plan_confirmation");
   await expect(panel.getByRole("heading", { name: "开发对接实施文档 · v2" })).toBeVisible({ timeout: 15_000 });
   await expect(panel.locator("pre").first()).toContainText("增加折扣字段");
   await panel.getByRole("button", { name: "确认文档并执行" }).click();
   await expect(panel.getByText("两端正在按已批准文档修改各自项目并运行测试", { exact: false })).toBeVisible();
   await completePhase(page.request, id, peers, "executing");
+  { const beforeJoint = await (await page.request.get(`/api/collaborations/${id}`)).json();
+  expect(beforeJoint.lifecycle.phase).toBe("joint_verifying");
+  expect(beforeJoint.lifecycle.report).toBeNull(); }
+  await completePhase(page.request, id, peers, "joint_verifying");
   await expect(panel.getByRole("heading", { name: "完整实施报告 · v2" })).toBeVisible({ timeout: 15_000 });
   await page.screenshot({ path: testInfo.outputPath("revision-2-full-report.png"), fullPage: true });
   await panel.getByRole("button", { name: "满意，确认终止任务" }).click();
