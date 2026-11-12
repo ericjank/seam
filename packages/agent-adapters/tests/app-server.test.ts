@@ -1,6 +1,7 @@
 import { chmod, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collaborationContextSchema, type CollaborationContext } from "@seam/protocol";
 import { buildPrompt, codexNetworkForTurn, codexSandboxForTurn, createAgentAdapter } from "../src/index";
@@ -59,10 +60,21 @@ createInterface({input: process.stdin}).on('line', line => {
   if (process.env.SEAM_FAKE_HOLD) return;
   const finish=()=>setTimeout(()=>{
    const data={threadId,turnNumber:current.turns,sandbox:msg.params.sandboxPolicy,tokenPresent:Boolean(process.env.SEAM_AGENT_TOKEN)};
-   const item={type:'agentMessage',id:'message-'+turnId,text:JSON.stringify({message:JSON.stringify(data),kind:'status',actions:[]})};
+   const item={type:'agentMessage',id:'message-'+turnId,text:process.env.SEAM_FAKE_RAW_REPLY ?? JSON.stringify({message:JSON.stringify(data),kind:'status',actions:[],notifyParticipantIds:[],needsHumanInput:false})};
+   if (process.env.SEAM_FAKE_COMPACT && process.env.SEAM_FAKE_COMPACT!=='after-completed') {
+    // A foreign thread's compaction must not invalidate this handoff.
+    const compactThread=process.env.SEAM_FAKE_COMPACT==='foreign'?'another-thread':threadId;
+    if (process.env.SEAM_FAKE_COMPACT==='legacy') send({method:'thread/compacted',params:{threadId:compactThread,turnId}});
+    else send({method:'item/completed',params:{threadId:compactThread,turnId,item:{type:'contextCompaction',id:'compact-'+turnId}}});
+   }
    send({method:'item/completed',params:{threadId,turnId,item:{type:'commandExecution',id:'command',aggregatedOutput:'private source'}}});
    send({method:'item/completed',params:{threadId,turnId,item}});
-   send({method:'turn/completed',params:{threadId,turn:{id:turnId,status:process.env.SEAM_FAKE_FAIL?'failed':'completed',items:[item]}}});
+   const completed={method:'turn/completed',params:{threadId,turn:{id:turnId,status:process.env.SEAM_FAKE_FAIL?'failed':'completed',items:[item]}}};
+   if (process.env.SEAM_FAKE_COMPACT==='after-completed') {
+    // Emit both notifications in one write, with compaction after completion.
+    const compacted={method:'thread/compacted',params:{threadId,turnId}};
+    process.stdout.write(JSON.stringify(completed)+'\\n'+JSON.stringify(compacted)+'\\n');
+   } else send(completed);
   },25);
   if (process.env.SEAM_FAKE_APPROVALS) {
    complete=finish;
@@ -119,6 +131,156 @@ describe("Codex App Server 持久会话", () => {
     expect(new Set(results.map((result) => JSON.parse(result.message).threadId)).size).toBe(1);
     const other = await f.adapter().run({ projectRoot: f.directory, context: { ...value, participant: { ...value.participant, id: crypto.randomUUID() } } });
     expect(JSON.parse(other.message).threadId).not.toBe(JSON.parse(results[0]!.message).threadId);
+  });
+
+  it("native schema通过turn/start传递，跨实例仅发送变更资料且成功后保存哈希checkpoint", async () => {
+    const f = await fixture();
+    const value = context();
+    value.lifecycle!.document = "只有第一轮需要发送的完整共同文档。".repeat(40);
+    await f.adapter().run({ projectRoot: f.directory, context: value });
+    const next = { ...value, jobId: crypto.randomUUID() };
+    await f.adapter().run({ projectRoot: f.directory, context: next });
+    const turns = (await f.calls()).filter((call) => call.method === "turn/start");
+    expect(turns[0].params.outputSchema.type).toBe("object");
+    expect(JSON.stringify(turns[0].params.outputSchema)).toContain('"const":"plan.submit"');
+    const firstPrompt = turns[0].params.input[0].text;
+    const nextPrompt = turns[1].params.input[0].text;
+    expect(firstPrompt).toContain(value.lifecycle.document);
+    expect(nextPrompt).not.toContain(value.lifecycle.document);
+    expect(nextPrompt.length).toBeLessThan(firstPrompt.length);
+    expect(firstPrompt).not.toContain("JSON Schema");
+    expect(firstPrompt).not.toContain('"additionalProperties"');
+    expect(nextPrompt).toContain(next.jobId);
+    const [file] = await readdir(f.stateDir);
+    const stored = JSON.parse(await readFile(join(f.stateDir, file!), "utf8"));
+    expect(stored.lastHandoff).toMatchObject({ version: 1, scope: `${value.collaborationId}:${value.participant.id}` });
+    expect(Object.values(stored.lastHandoff.sections).every((hash) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))).toBe(true);
+    expect(JSON.stringify(stored.lastHandoff)).not.toContain(value.lifecycle.document);
+  });
+
+  it("旧session缓存缺少handoff版本会重新完整同步，失败/非法回复不能前推checkpoint", async () => {
+    const f = await fixture();
+    const value = context();
+    value.lifecycle!.document = "迁移时必须完整重新交接的共同文档";
+    await f.adapter().run({ projectRoot: f.directory, context: value });
+    const [file] = await readdir(f.stateDir);
+    const path = join(f.stateDir, file!);
+    const stored = JSON.parse(await readFile(path, "utf8"));
+    delete stored.lastHandoff;
+    // Fingerprint used by the previous adapter, before protocol handoff v1.
+    stored.lastInputHash = createHash("sha256").update(JSON.stringify({ context: value, prompt: null, jobPayloadHash: null, sandbox: "read-only", networkAccess: false })).digest("hex");
+    await writeFile(path, JSON.stringify(stored));
+    await f.adapter().run({ projectRoot: f.directory, context: value });
+    let turns = (await f.calls()).filter((call) => call.method === "turn/start");
+    expect(turns).toHaveLength(2);
+    expect(turns[1].params.input[0].text).toContain(value.lifecycle.document);
+    const saved = await readFile(path, "utf8");
+    const changed = { ...value, jobId: crypto.randomUUID(), lifecycle: { ...value.lifecycle!, requirements: "新的需求不能在失败时被记为已交接。" } };
+    vi.stubEnv("SEAM_FAKE_RAW_REPLY", "纯文本不是原生结构化回执");
+    await expect(f.adapter().run({ projectRoot: f.directory, context: changed })).rejects.toThrow("未返回有效结构化 JSON");
+    expect(await readFile(path, "utf8")).toBe(saved);
+    vi.stubEnv("SEAM_FAKE_RAW_REPLY", JSON.stringify({ message: "错误版本", kind: "status", actions: [{ type: "plan.submit", revision: 99, content: "错误版本的方案".repeat(30) }], notifyParticipantIds: [], needsHumanInput: false }));
+    await expect(f.adapter().run({ projectRoot: f.directory, context: changed })).rejects.toThrow("revision/documentHash");
+    expect(await readFile(path, "utf8")).toBe(saved);
+    vi.unstubAllEnvs();
+    const priorLength = turns[1].params.input[0].text.length;
+    vi.stubEnv("SEAM_CODEX_COMMAND", join(f.directory, "fake-codex.mjs"));
+    await f.adapter().run({ projectRoot: f.directory, context: changed });
+    turns = (await f.calls()).filter((call) => call.method === "turn/start");
+    expect(turns.at(-1).params.input[0].text).toContain(changed.lifecycle.requirements);
+    expect(turns.at(-1).params.input[0].text.length).toBeLessThan(priorLength + 200);
+  });
+
+  it.each(["item", "legacy"])("当轮%s compaction后仅下个新job全量重同步，同job仍命中成功缓存", async (mode) => {
+    const f = await fixture();
+    const value = context();
+    value.lifecycle!.document = "压缩后不可仅依赖摘要的完整审批方案".repeat(20);
+    vi.stubEnv("SEAM_FAKE_COMPACT", mode);
+    const first = await f.adapter().run({ projectRoot: f.directory, context: value });
+    const [file] = await readdir(f.stateDir);
+    expect(JSON.parse(await readFile(join(f.stateDir, file!), "utf8"))).not.toHaveProperty("lastHandoff");
+    expect(await f.adapter().run({ projectRoot: f.directory, context: value })).toEqual(first);
+    expect((await f.calls()).filter((call) => call.method === "turn/start")).toHaveLength(1);
+    vi.stubEnv("SEAM_FAKE_COMPACT", "");
+    await f.adapter().run({ projectRoot: f.directory, context: { ...value, jobId: crypto.randomUUID() } });
+    const turns = (await f.calls()).filter((call) => call.method === "turn/start");
+    expect(turns).toHaveLength(2);
+    expect(turns[1].params.input[0].text).toContain(value.lifecycle.document);
+    expect(JSON.parse(await readFile(join(f.stateDir, file!), "utf8"))).toHaveProperty("lastHandoff");
+  });
+
+  it.each([
+    { mode: "item", outcome: "failed" },
+    { mode: "legacy", outcome: "failed" },
+    { mode: "item", outcome: "invalidJSON" },
+    { mode: "legacy", outcome: "invalidJSON" },
+  ])("$mode compaction后$outcome只清除旧checkpoint，保留成功缓存并完整重试失败job", async ({ mode, outcome }) => {
+    const f = await fixture();
+    const value = context();
+    value.lifecycle!.document = "失败前已经交接且压缩后必须完整恢复的文档 FAILED_COMPACTION_DOCUMENT".repeat(20);
+    const first = await f.adapter().run({ projectRoot: f.directory, context: value });
+    const [file] = await readdir(f.stateDir);
+    const path = join(f.stateDir, file!);
+    const before = JSON.parse(await readFile(path, "utf8"));
+    expect(before).toHaveProperty("lastHandoff");
+    const failed = { ...value, jobId: crypto.randomUUID(), lifecycle: { ...value.lifecycle!, requirements: "失败轮次的新资料不得前推成功baseline。" } };
+    vi.stubEnv("SEAM_FAKE_COMPACT", mode);
+    if (outcome === "failed") vi.stubEnv("SEAM_FAKE_FAIL", "1");
+    else vi.stubEnv("SEAM_FAKE_RAW_REPLY", "压缩后返回的非法JSON");
+    await expect(f.adapter().run({ projectRoot: f.directory, context: failed })).rejects.toThrow(
+      outcome === "failed" ? "轮次未完成" : "未返回有效结构化 JSON",
+    );
+    const after = JSON.parse(await readFile(path, "utf8"));
+    expect(after).not.toHaveProperty("lastHandoff");
+    expect(after).toMatchObject({
+      lastTurnId: before.lastTurnId, lastJobId: before.lastJobId,
+      lastInputHash: before.lastInputHash, lastResult: before.lastResult,
+    });
+    expect(after.lastJobId).not.toBe(failed.jobId);
+    // Lost delivery of the previous successful receipt still reuses its cache,
+    // even while the next attempted job failed after compaction.
+    expect(await f.adapter().run({ projectRoot: f.directory, context: value })).toEqual(first);
+    expect((await f.calls()).filter((call) => call.method === "turn/start")).toHaveLength(2);
+    vi.stubEnv("SEAM_FAKE_COMPACT", "");
+    vi.stubEnv("SEAM_FAKE_FAIL", "");
+    vi.stubEnv("SEAM_FAKE_RAW_REPLY", JSON.stringify({ message: "失败后完整重新交接。", kind: "status", actions: [], notifyParticipantIds: [], needsHumanInput: false }));
+    await f.adapter().run({ projectRoot: f.directory, context: failed });
+    const turns = (await f.calls()).filter((call) => call.method === "turn/start");
+    expect(turns).toHaveLength(3);
+    expect(turns[1].params.input[0].text).not.toContain(value.lifecycle.document);
+    expect(turns[2].params.input[0].text).toContain(value.lifecycle.document);
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ lastJobId: failed.jobId });
+    expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("lastHandoff");
+  });
+
+  it("completed后同一stdout块的compaction仍清checkpoint，同成功job重投不再次执行", async () => {
+    const f = await fixture();
+    const value = context();
+    value.lifecycle!.document = "完成事件后才到达的压缩通知也必须恢复完整文档 LATE_COMPACTION_DOCUMENT".repeat(20);
+    await f.adapter().run({ projectRoot: f.directory, context: value });
+    const compacted = { ...value, jobId: crypto.randomUUID() };
+    vi.stubEnv("SEAM_FAKE_COMPACT", "after-completed");
+    const result = await f.adapter().run({ projectRoot: f.directory, context: compacted });
+    const [file] = await readdir(f.stateDir);
+    const path = join(f.stateDir, file!);
+    expect(JSON.parse(await readFile(path, "utf8"))).not.toHaveProperty("lastHandoff");
+    expect(await f.adapter().run({ projectRoot: f.directory, context: compacted })).toEqual(result);
+    expect((await f.calls()).filter((call) => call.method === "turn/start")).toHaveLength(2);
+    vi.stubEnv("SEAM_FAKE_COMPACT", "");
+    await f.adapter().run({ projectRoot: f.directory, context: { ...value, jobId: crypto.randomUUID() } });
+    const turns = (await f.calls()).filter((call) => call.method === "turn/start");
+    expect(turns).toHaveLength(3);
+    expect(turns[1].params.input[0].text).not.toContain(value.lifecycle.document);
+    expect(turns[2].params.input[0].text).toContain(value.lifecycle.document);
+    expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("lastHandoff");
+  });
+
+  it("其他thread的compaction不清除本方checkpoint", async () => {
+    const f = await fixture();
+    vi.stubEnv("SEAM_FAKE_COMPACT", "foreign");
+    await f.adapter().run({ projectRoot: f.directory, context: context() });
+    const [file] = await readdir(f.stateDir);
+    expect(JSON.parse(await readFile(join(f.stateDir, file!), "utf8"))).toHaveProperty("lastHandoff");
   });
 
   it("后台审批请求全部拒绝或空回答，未知请求返回错误且不会挂死", async () => {

@@ -4,7 +4,9 @@ import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promis
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { agentTurnResultSchema, type AgentTurnResult } from "@seam/protocol";
-import { buildPrompt, checkCli, parseAgentOutput } from "./cli.js";
+import { checkCli } from "./cli.js";
+import { buildNativeHandoff, NATIVE_HANDOFF_VERSION, type HandoffCheckpoint } from "./handoff.js";
+import { parseNativeAgentOutput } from "./response-schema.js";
 import { codexNetworkForTurn, codexSandboxForTurn } from "./policy.js";
 import type { AdapterOptions, AgentAdapter, AgentRunInput } from "./types.js";
 import { acquireSessionLock } from "./session-lock.js";
@@ -14,6 +16,7 @@ type Session = {
   version: 1; threadId: string; projectRoot: string; collaborationId: string; participantId: string;
   lastTurnId?: string; lastJobId?: string; lastResult?: AgentTurnResult;
   lastInputHash?: string;
+  lastHandoff?: HandoffCheckpoint;
 };
 const queues = new Map<string, Promise<void>>();
 const isRecord = (value: unknown): value is RecordValue => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -27,8 +30,9 @@ class AppServerConnection {
   private buffer = "";
   private failed: Error | undefined;
   deniedRequests = 0;
+  contextCompacted = false;
 
-  constructor(projectRoot: string) {
+  constructor(projectRoot: string, private trackedThreadId?: string) {
     const env = { ...process.env };
     delete env.SEAM_AGENT_TOKEN;
     this.process = spawn(process.env.SEAM_CODEX_COMMAND ?? "codex", ["app-server", "--listen", "stdio://"], {
@@ -62,6 +66,15 @@ class AppServerConnection {
     if (!isRecord(value)) return;
     if (typeof value.method === "string") {
       const params = isRecord(value.params) ? value.params : {};
+      // Observe independently of turn success and the temporary turn listener.
+      // A compaction may arrive after turn/completed in the same stdout chunk,
+      // during resume/close, or before a failed/invalid final response.
+      if (params.threadId === this.trackedThreadId) {
+        const items = isRecord(params.turn) && Array.isArray(params.turn.items) ? params.turn.items : [];
+        if (value.method === "thread/compacted"
+          || (value.method === "item/completed" && isRecord(params.item) && params.item.type === "contextCompaction")
+          || items.some((item) => isRecord(item) && item.type === "contextCompaction")) this.contextCompacted = true;
+      }
       if (value.id !== undefined) {
         this.deniedRequests += 1;
         // Never grant interactive approvals on a background Connector channel.
@@ -124,6 +137,7 @@ class AppServerConnection {
   }
 
   async turn(threadId: string, params: RecordValue, signal?: AbortSignal): Promise<{ text: string; turnId: string }> {
+    this.trackedThreadId = threadId;
     let turnId: string | undefined;
     let cancellation: Promise<void> | undefined;
     let cancelled = false;
@@ -147,7 +161,10 @@ class AppServerConnection {
         // Completed-turn items are authoritative when provided. Never consume
         // reasoning or command stdout as the public Agent reply.
         const items = Array.isArray(turn.items) ? turn.items : [];
-        for (const item of items) if (isRecord(item) && item.type === "agentMessage" && typeof item.text === "string") messages.set(String(item.id), item.text);
+        for (const item of items) {
+          if (!isRecord(item)) continue;
+          if (item.type === "agentMessage" && typeof item.text === "string") messages.set(String(item.id), item.text);
+        }
         const text = [...messages.values()].at(-1);
         if (!text || typeof turn.id !== "string") rejectTurn(new Error("Codex App Server 缺少已完成 Agent 回复"));
         else finish({ text, turnId: turn.id });
@@ -237,7 +254,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       const path = join(directory, `${key}.json`);
       let unlock: (() => Promise<void>) | undefined;
       let session: Session | undefined;
-      const inputHash = createHash("sha256").update(JSON.stringify({ context: input.context ?? null, prompt: input.prompt ?? null, jobPayloadHash: input.jobPayloadHash ?? null, sandbox: codexSandboxForTurn(input, this.options), networkAccess: codexNetworkForTurn(input, this.options) })).digest("hex");
+      const inputHash = createHash("sha256").update(JSON.stringify({ handoffVersion: NATIVE_HANDOFF_VERSION, context: input.context ?? null, prompt: input.prompt ?? null, jobPayloadHash: input.jobPayloadHash ?? null, sandbox: codexSandboxForTurn(input, this.options), networkAccess: codexNetworkForTurn(input, this.options) })).digest("hex");
       if (identity) {
         await mkdir(directory, { recursive: true, mode: 0o700 });
         unlock = await acquireSessionLock(path, input.signal);
@@ -254,7 +271,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") { await unlock(); throw error; }
         }
       }
-      const connection = new AppServerConnection(projectRoot);
+      const connection = new AppServerConnection(projectRoot, session?.threadId);
       const save = async () => {
         const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
         try { await writeFile(temporary, JSON.stringify(session), { mode: 0o600, flag: "wx" }); await rename(temporary, path); }
@@ -276,19 +293,35 @@ export class CodexAppServerAdapter implements AgentAdapter {
           // is cosmetic and must not replace or derail a created conversation.
           await connection.request("thread/name/set", { threadId: session.threadId, name: `Seam · ${input.context!.title} · ${input.context!.participant.projectName}`.slice(0, 200) }, 10_000).catch(() => {});
         }
-        const prompt = buildPrompt({ ...input, conversationMode: "persistent", localExecutionPolicy: `Codex App Server sandbox=${sandbox}，approval=never。当前策略由本地能力与平台批准的阶段交集决定；不得提升权限。` });
+        const handoff = buildNativeHandoff({ ...input, conversationMode: "persistent", localExecutionPolicy: `Codex App Server sandbox=${sandbox}，approval=never。当前策略由本地能力与平台批准的阶段交集决定；不得提升权限。` }, session?.lastHandoff);
         const finished = await connection.turn(response.thread.id, {
           cwd: projectRoot, approvalPolicy: "never",
           sandboxPolicy: sandbox === "workspace-write"
             ? { type: "workspaceWrite", writableRoots: [projectRoot], networkAccess: codexNetworkForTurn(input, this.options), excludeTmpdirEnvVar: true, excludeSlashTmp: true }
             : { type: "readOnly", networkAccess: false },
-          input: [{ type: "text", text: prompt }],
+          input: [{ type: "text", text: handoff.prompt }],
+          outputSchema: handoff.outputSchema,
         }, input.signal);
-        const result = parseAgentOutput(finished.text);
-        if (session) { session.lastTurnId = finished.turnId; session.lastJobId = input.context?.jobId; session.lastInputHash = inputHash; session.lastResult = result; await save(); }
+        const result = parseNativeAgentOutput(finished.text, input);
+        if (session) {
+          session.lastTurnId = finished.turnId; session.lastJobId = input.context?.jobId; session.lastInputHash = inputHash; session.lastResult = result;
+          // Compaction can replace exact shared facts with a summary. A later
+          // turn must receive a full handoff, even though this result is valid.
+          if (connection.contextCompacted) delete session.lastHandoff;
+          else session.lastHandoff = handoff.checkpoint;
+          await save();
+        }
         return result;
       } finally {
-        try { await connection.close(); } finally { await unlock?.(); }
+        try { await connection.close(); }
+        finally {
+          try {
+            if (session?.lastHandoff && connection.contextCompacted) {
+              delete session.lastHandoff;
+              await save();
+            }
+          } finally { await unlock?.(); }
+        }
       }
     });
   }

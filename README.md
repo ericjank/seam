@@ -150,6 +150,8 @@ node apps/connector/dist/cli.js \
 
 Supported `--adapter` values are `codex-app-server` (recommended), `claude-code`, `codex` (legacy single-turn CLI), `generic-cli`, and `mock`. Codex must already be installed and authenticated locally. App Server threads persist across Connector restarts and can be opened from the platform.
 
+Native Codex handoffs use readable project information and changes since the last successful turn. Output schemas travel through `turn/start.outputSchema`, rather than being pasted into the chat. Current requirements, user instructions, stage and approval state remain explicit; the full common document is supplied for review and again before implementation. See [handoff architecture and analysis](docs/对话交接优化.md) for synchronization and recovery behavior. Rebuild and restart the local Connector to use the updated adapter; existing threads are retained and receive a full initial synchronization.
+
 Configure a generic CLI with the following environment variables. The complete negotiation prompt is appended as the last command argument:
 
 ```bash
