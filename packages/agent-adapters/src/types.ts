@@ -19,6 +19,10 @@ export interface AgentRunInput {
   conversationMode?: "persistent" | "independent";
   /** Hash of the claimed job payload, computed by Connector outside model text. */
   jobPayloadHash?: string;
+  /** A locally verified checkpoint from this approved revision, never model supplied. */
+  resuming?: boolean;
+  resources?: Array<{ key: string; path: string; hash: string; bytes: number }>;
+  onCommand?: (record: { id: string; command: string; exitCode: number | null; output: string }) => void;
 }
 
 export interface AgentAdapter {

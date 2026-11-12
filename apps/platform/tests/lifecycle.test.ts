@@ -233,9 +233,12 @@ describe("管理员控制的共同开发生命周期", () => {
     expect((await getLifecycleContext("collab"))!.phase).toBe("plan_synthesis");
     await compose();
     const before = (await getLifecycleContext("collab"))!;
+    state.rows.connector_jobs!.push(...before.requiredParticipantIds.map((id, index) => ({ id: `review-${index}`, collaborationId: "collab", kind: "collaboration.turn", agentId: `agent-${id}`, status: "running", payload: { lifecycleSnapshot: { revision: 1, phase: "plan_confirmation", documentHash: before.documentHash } } })));
     await applyLifecycleAction(actor("00000000-0000-4000-8000-000000000001"), "collab", { type: "plan.confirm", revision: 1, documentHash: before.documentHash! });
     await applyLifecycleAction(actor("00000000-0000-4000-8000-000000000002"), "collab", { type: "plan.reject", revision: 1, documentHash: before.documentHash!, reason: "缺少无效数量返回 400 的明确边界约定，请补充" });
     expect((await getLifecycleContext("collab"))!.confirmations).toEqual([]);
+    expect(state.rows.connector_jobs!.find((job) => job.id === "review-0")!.status).toBe("cancelled");
+    expect(state.rows.connector_jobs!.find((job) => job.id === "review-1")!.status).toBe("running"); // The rejecting receipt must still commit normally.
     await expect(compose()).rejects.toMatchObject({ status: 422 });
     await compose(1, "明确无效数量返回400");
     expect((await getLifecycleContext("collab"))!.documentHash).not.toBe(before.documentHash);
@@ -262,6 +265,63 @@ describe("管理员控制的共同开发生命周期", () => {
     await expect(assertLifecycleJobCurrent("collab", snapshot)).rejects.toMatchObject({ status: 409 });
     await expect(report("00000000-0000-4000-8000-000000000001")).rejects.toMatchObject({ status: 409 });
     expect((await pauseLifecycle("admin", "collab", false)).approvedHash).toBe(snapshot!.approvedHash);
+  });
+
+  it("临时故障有界退避，第三次转需管理员事实，补充后清除阻塞并保留原批准", async () => {
+    await startLifecycle("admin", "collab"); const approval = await approved();
+    const id = approval.requiredParticipantIds[0]!;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await applyLifecycleAction(actor(id), "collab", { type: "workflow.blocked", revision: 1, kind: "retryable", reason: "本地测试服务暂时不可达，等待真实就绪。", retryAfterSeconds: 5 });
+      const context = (await getLifecycleContext("collab"))!;
+      expect(context.blocks[0]!.attempts).toBe(attempt);
+      expect(context.blocks[0]!.kind).toBe(attempt < 3 ? "retryable" : "needs_admin");
+    }
+    await expect(pauseLifecycle("admin", "collab", false)).rejects.toMatchObject({ status: 422 });
+    const resumed = await pauseLifecycle("admin", "collab", false, "本地服务已恢复，继续原批准版本。");
+    expect(resumed.blocks).toEqual([]); expect(resumed.approvedHash).toBe(approval.approvedHash);
+    expect(state.rows.messages!.some((row) => row.metadata?.blockResolution && row.body.includes("本地服务已恢复"))).toBe(true);
+  });
+
+  it("双方循环等待检测为明确阻塞，拒绝等待自己或无关参与方", async () => {
+    await startLifecycle("admin", "collab"); const approval = await approved(); const [a, b] = approval.requiredParticipantIds as [string, string];
+    await expect(applyLifecycleAction(actor(a), "collab", { type: "workflow.blocked", revision: 1, kind: "waiting_peer", reason: "等待自己不应进入无穷循环。", dependencyParticipantIds: [a] })).rejects.toMatchObject({ status: 422 });
+    await applyLifecycleAction(actor(a), "collab", { type: "workflow.blocked", revision: 1, kind: "waiting_peer", reason: "等待乙方服务就绪后继续本方调用。", dependencyParticipantIds: [b] });
+    await applyLifecycleAction(actor(b), "collab", { type: "workflow.blocked", revision: 1, kind: "waiting_peer", reason: "等待甲方服务就绪后继续本方调用。", dependencyParticipantIds: [a] });
+    const blocks = (await getLifecycleContext("collab"))!.blocks;
+    expect(blocks).toHaveLength(2); expect(blocks.every((block) => block.kind === "needs_admin" && block.reason.includes("循环等待"))).toBe(true);
+  });
+
+  it("服务只能获批后发布且必须有健康探测，过期端点从交接上下文移除", async () => {
+    await startLifecycle("admin", "collab"); const id = "00000000-0000-4000-8000-000000000001";
+    const service = { type: "service.publish" as const, revision: 1, name: "quote", baseUrl: "http://127.0.0.1:19001", healthPath: "/health", ttlSeconds: 30 };
+    await expect(applyLifecycleAction(actor(id), "collab", service)).rejects.toMatchObject({ status: 409 }); await approved();
+    await expect(applyLifecycleAction(actor(id), "collab", service)).rejects.toMatchObject({ status: 422 });
+    await applyLifecycleAction(actor(id), "collab", { ...service, probe: { ok: true, status: 200, checkedAt: new Date().toISOString() } });
+    expect((await getLifecycleContext("collab"))!.services).toHaveLength(1);
+    state.rows.lifecycle_contributions!.find((row) => row.participantId === id)!.services[0].expiresAt = new Date(0).toISOString();
+    expect((await getLifecycleContext("collab"))!.services).toEqual([]);
+  });
+
+  it("联合验收必须关联批准命令、实际断言及成功退出码，日志只按运行ID保存一次", async () => {
+    await startLifecycle("admin", "collab"); await approved();
+    const [a,b] = (await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string]; await report(a); await report(b);
+    const context = (await getLifecycleContext("collab"))!, testCase = context.contract!.acceptanceCases[0]!;
+    const run = { id: "observed-command", command: testCase.command, exitCode: 0, output: "ok 1 - real HTTP error", assertions: ["real HTTP error"], source: "local-test" as const, capturedAt: new Date().toISOString() };
+    const action = { type: "integration.report" as const, revision: 1, documentHash: context.documentHash!, runs: [run], checks: [{ caseId: testCase.id, status: "passed" as const, command: testCase.command, summary: "实际HTTP错误测试", assertionNames: ["real HTTP error"], runIds: [run.id], evidence: { details: "关联原始记录" } }] };
+    await expect(applyLifecycleAction(actor(a), "collab", { ...action, runs: [{ ...run, command: "node --test wrong.test.mjs" }] })).rejects.toMatchObject({ status: 422 });
+    await expect(applyLifecycleAction(actor(a), "collab", { ...action, runs: [{ ...run, exitCode: 1 }] })).rejects.toMatchObject({ status: 422 });
+    await expect(applyLifecycleAction(actor(a), "collab", { ...action, runs: [{ ...run, assertions: ["unrelated"] }] })).rejects.toMatchObject({ status: 422 });
+    await applyLifecycleAction(actor(a), "collab", action); await applyLifecycleAction(actor(a), "collab", action);
+    expect((await getLifecycleContext("collab"))!.evidenceRuns.filter((record) => record.id === run.id)).toHaveLength(1);
+  });
+
+  it("历史联合回执缺少新增引用字段时正常读取，并保持未关联证据状态", async () => {
+    await startLifecycle("admin", "collab"); await approved();
+    const [a,b] = (await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string]; await report(a); await report(b); await joint();
+    for (const row of state.rows.lifecycle_contributions!) for (const check of row.integrationChecks ?? []) { delete check.assertionNames; delete check.runIds; }
+    const context = (await getLifecycleContext("collab"))!;
+    expect(context.integrationReports.every((entry) => entry.checks.every((check) => check.runIds.length === 0 && check.assertionNames.length === 0))).toBe(true);
+    expect(context.evidenceRuns).toEqual([]); expect(context.phase).toBe("awaiting_review");
   });
 
 });

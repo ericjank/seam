@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { collaborationContextSchema, type CollaborationContext, type CollaborationMessage } from "@seam/protocol";
-import { buildNativeHandoff, type HandoffCheckpoint } from "../src/handoff";
+import { buildNativeHandoff, materializeHandoffResources, type HandoffCheckpoint } from "../src/handoff";
+import { buildPrompt } from "../src/cli";
 import type { AgentRunInput } from "../src/types";
 
 const id = (value: number) => `00000000-0000-4000-8000-${String(value).padStart(12, "0")}`;
@@ -26,6 +30,24 @@ function input(value = context()): AgentRunInput {
 }
 
 describe("Native human-readable handoff", () => {
+  it("长资料变为可校验的私有资源，原文完整保留；重连恢复引用，篡改则拒绝调用", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "seam-handoff-resource-test-"));
+    try {
+      const value = context(), document = `# DOC_START\n${"接口完整语义和断言条件\n".repeat(2000)}DOC_END`;
+      value.lifecycle = { ...value.lifecycle!, phase: "plan_confirmation", document, documentHash: digest(document) };
+      const prepared = await materializeHandoffResources(input(value), directory);
+      const handoff = buildNativeHandoff(prepared), resource = prepared.resources!.find((item) => item.key === "document")!;
+      expect(handoff.prompt.length).toBeLessThan(5000); expect(handoff.prompt).not.toContain(document);
+      expect(await readFile(resource.path, "utf8")).toBe(document); expect(resource.hash).toBe(digest(document));
+      expect((await stat(resource.path)).mode & 0o777).toBe(0o600);
+      expect(handoff.prompt).toContain(resource.path); expect(handoff.prompt).toContain(resource.hash);
+      const cli = buildPrompt(prepared); expect(cli).toContain("回复协议文件："); expect(cli).toContain("协作上下文文件："); expect(cli).not.toContain('"properties"');
+      const continuing = buildNativeHandoff(prepared, handoff.checkpoint); expect(continuing.prompt).not.toContain(resource.path);
+      expect(buildNativeHandoff(prepared).prompt).toContain(resource.path);
+      await writeFile(resource.path, "tampered document");
+      await expect(materializeHandoffResources(input(value), directory)).rejects.toThrow("指纹不符");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it("首轮保留窗口外旧指令与新指令，重复消息只交接一次；后续新增指示仍可见", () => {
     const value = context();
     const oldInstruction = message(10, "OLD_INSTRUCTION_SENTINEL：兼容原有字段，不能部署。");
@@ -62,7 +84,7 @@ describe("Native human-readable handoff", () => {
     const next = buildNativeHandoff(input(execution), first.checkpoint);
     expect(next.prompt).toContain(digest(document));
     expect(next.prompt).toContain("executing");
-    expect(occurrences(next.prompt, document)).toBe(1);
+    expect(occurrences(next.prompt, document)).toBe(0);
     const samePhase = buildNativeHandoff(input({ ...execution, jobId: id(6) }), next.checkpoint);
     expect(occurrences(samePhase.prompt, document)).toBe(0);
   });

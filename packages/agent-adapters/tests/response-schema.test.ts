@@ -24,6 +24,7 @@ function inspectStrictObjects(value: unknown) {
     expect(schema.required ?? []).toEqual(Object.keys(schema.properties as object));
   }
   if (schema.format === "uuid") expect(schema).not.toHaveProperty("pattern");
+  expect(schema.format).not.toBe("uri");
   Object.values(schema).forEach(inspectStrictObjects);
 }
 

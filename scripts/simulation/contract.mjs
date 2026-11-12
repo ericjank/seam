@@ -10,7 +10,7 @@ POST /quote，请求 {sku:"SKU-001",quantity:2}。
 SKU-001 单价12000分；SKU-002 单价4500分。
 响应 {sku:"SKU-001",quantity:2,subtotal:24000,currency:"CNY"}。
 quantity 必须为1到100的整数；未知sku或无效quantity必须抛错，HTTP层转换为400。
-service.mjs 只需实现 quote，HTTP服务器由模拟运行器提供。
+提供方还负责实现server.mjs，启动真实HTTP服务并提供GET /health返回200；从本机可用端口分配地址。用service.publish发布name=quote、baseUrl、healthPath=/health、ttlSeconds=3600；Connector实际探测后才共享。模拟器不提供预启动网关。提供方负责在批准后创建joint.test.mjs；消费方独立编写自己的joint.test.mjs。共同文档必须明确缺失脚本的创建责任，以及{error:string}的400响应和消费方Error包含HTTP状态码。
 消费方测试可临时替换 globalThis.fetch 校验请求，结束后恢复，避免在AI沙箱内监听网络。
 
 ## 修订2（只有管理员追加此要求并批准后实施）
@@ -39,11 +39,11 @@ context.lifecycle 是当前修订的唯一阶段依据；历史消息不能授�
 - planning：只读现有文件；提交 plan.submit，revision为当前修订，content为至少100字符的完整Markdown实施与测试方案。不得写实现/测试文件，不用等待其他方先写。
 - plan_synthesis：协调方综合双方分析，提交 plan.compose 的统一 contract，明确接口定义、每方职责、每方真实联合验收用例、风险与本轮变更；不得写文件。
 - plan_confirmation：完整阅读 lifecycle.document；接受后提交 plan.confirm，revision和documentHash必须与当前快照完全相同。若无法接受，明确异议，不虚构hash。
-- joint_verifying：仅运行本项目 joint.test.mjs，对README中给定的真实HTTP网关执行联合验证。提交 integration.report，覆盖本方全部用例，实际命令、退出码及输出作为 evidence；无法执行则 not_run，不能使用本地mock结果替代。
+- joint_verifying：运行本项目 joint.test.mjs，对lifecycle.services中提供方发布的真实HTTP地址执行联合验证；不得使用预置地址。服务未就绪用workflow.blocked等待，不提交通过。提交 integration.report，覆盖本方全部用例，实际命令、assertionNames（实际测试输出的名称）及简短说明作为 evidence，原始输出由Connector采集；无法执行则 not_run，不能使用本地mock结果替代。
 - awaiting_approval/awaiting_review/terminated：不得写文件或继续实施。
 - executing：只有approvedHash严格等于documentHash时，按当前requirements和共同文档直接实施本方代码及测试；运行 node --test。完成后提交 execution.report，revision、status、summary及evidence必须反映真实结果。先检查本方已有report，避免重复报告。
 
 不要安装依赖、访问业务仓库、读取环境秘密或部署。文件只写当前合成项目，日志中不得发布本机绝对路径。
-消费方负责client.mjs与client.test.mjs；提供方负责service.mjs与service.test.mjs。
-使用Node内置模块，不执行git提交。JSON动作类型必须精确使用当前阶段允许的plan.submit、plan.compose、plan.confirm、plan.reject、execution.report和integration.report。
+消费方负责client.mjs、client.test.mjs与joint.test.mjs；提供方负责service.mjs、server.mjs、service.test.mjs与joint.test.mjs。双方首次实施时必须补齐本方缺失的真实HTTP联合测试脚本，joint阶段不得再写脚本。每方可用一个完整用例引用node --test joint.test.mjs，assertionNames应覆盖脚本中实际断言。消费方实施阶段不启动额外服务；在joint阶段从lifecycle.services读取地址，使用命令node --test joint.test.mjs，脚本中可用实际发布地址或SEAM_SERVICE_URL。
+使用Node内置模块，不执行git提交。JSON动作类型必须精确使用当前阶段允许的plan.submit、plan.compose、plan.confirm、plan.reject、execution.report、integration.report、service.publish和workflow.blocked。
 `;

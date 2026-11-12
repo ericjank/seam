@@ -173,10 +173,27 @@ export const sharedContractSchema = z.object({
   retainedDecisions: z.array(z.string().min(1).max(5000)).max(100).default([]),
 });
 export type SharedContract = z.infer<typeof sharedContractSchema>;
+export const commandEvidenceSchema = z.object({
+  id: z.string().min(1).max(100), command: z.string().max(10_000), invocation: z.string().max(10_000).optional(), exitCode: z.number().int().nullable(),
+  output: z.string().max(100_000), assertions: z.array(z.string().max(2000)).max(500),
+  source: z.enum(["codex-app-server", "local-test"]), capturedAt: z.string(),
+});
+export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
+export const workflowBlockSchema = z.object({
+  kind: z.enum(["waiting_peer", "retryable", "needs_admin"]), reason: z.string().min(10).max(5000),
+  dependencyParticipantIds: z.array(idSchema).max(50).default([]), retryAfterSeconds: z.number().int().min(1).max(300).default(5),
+});
+export const servicePublicationSchema = z.object({
+  name: z.string().min(1).max(100), baseUrl: z.string().url().max(2000), healthPath: z.string().max(1000),
+  ttlSeconds: z.number().int().min(30).max(3600).default(300),
+  probe: z.object({ ok: z.boolean(), status: z.number().int().nullable(), checkedAt: z.string() }).optional(),
+});
 export const integrationCheckSchema = z.object({
   caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]),
   command: z.string().max(2000), summary: z.string().min(1).max(10_000),
   evidence: z.record(z.string(), z.unknown()).default({}),
+  assertionNames: z.array(z.string().min(1).max(2000)).max(100).default([]),
+  runIds: z.array(z.string().min(1).max(100)).max(100).default([]),
 });
 export const lifecyclePhaseSchema = z.enum(["planning", "plan_synthesis", "plan_confirmation", "awaiting_approval", "executing", "joint_verifying", "awaiting_review", "terminated"]);
 export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
@@ -184,10 +201,17 @@ export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("plan.compose"), revision: z.number().int().positive(), baseDocumentHash: z.string().length(64).nullable(), contract: sharedContractSchema }),
   z.object({ type: z.literal("plan.reject"), revision: z.number().int().positive(), documentHash: z.string().length(64), reason: z.string().min(10).max(10_000) }),
   z.object({ type: z.literal("plan.confirm"), revision: z.number().int().positive(), documentHash: z.string().length(64) }),
-  z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}) }),
-  z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100) }),
+  z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}), runs: z.array(commandEvidenceSchema).max(200).default([]) }),
+  z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100), runs: z.array(commandEvidenceSchema).max(200).default([]) }),
+  z.object({ type: z.literal("workflow.blocked"), revision: z.number().int().positive(), ...workflowBlockSchema.shape }),
+  z.object({ type: z.literal("service.publish"), revision: z.number().int().positive(), ...servicePublicationSchema.shape }),
 ]);
 export type LifecycleAgentAction = z.infer<typeof lifecycleAgentActionSchema>;
+export function lifecycleActions(phase: string): string[] {
+  const actions: Record<string, string[]> = { planning: ["plan.submit"], plan_synthesis: ["plan.compose"], plan_confirmation: ["plan.confirm", "plan.reject", "plan.submit"],
+    executing: ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit", "service.publish"], joint_verifying: ["integration.report", "service.publish"] };
+  return actions[phase] ? [...actions[phase]!, "workflow.blocked"] : [];
+}
 export const lifecycleContextSchema = z.object({
   revision: z.number().int().positive(), phase: lifecyclePhaseSchema, requirements: z.string(),
   document: z.string().nullable(), documentHash: z.string().nullable(), approvedHash: z.string().nullable(),
@@ -201,6 +225,9 @@ export const lifecycleContextSchema = z.object({
   reports: z.array(z.object({ participantId: idSchema, status: z.enum(["passed", "failed"]), summary: z.string(), evidence: z.record(z.string(), z.unknown()) })),
   integrationReports: z.array(z.object({ participantId: idSchema, checks: z.array(integrationCheckSchema) })).default([]),
   report: z.string().nullable(),
+  blocks: z.array(workflowBlockSchema.extend({ participantId: idSchema, phase: z.string(), attempts: z.number(), retryAt: z.string().nullable() })).default([]),
+  services: z.array(servicePublicationSchema.extend({ participantId: idSchema, expiresAt: z.string() })).default([]),
+  evidenceRuns: z.array(commandEvidenceSchema.extend({ participantId: idSchema })).default([]),
 });
 export type LifecycleContext = z.infer<typeof lifecycleContextSchema>;
 

@@ -3,9 +3,9 @@ import { db } from "@/db";
 import { collaborationLifecycles, collaborations, participants, workflowWakeups } from "@/db/schema";
 import { newId } from "@/lib/ids";
 
-export async function queueWorkflowWakeup(collaborationId: string, sourceJobId?: string) {
+export async function queueWorkflowWakeup(collaborationId: string, sourceJobId?: string, delayMs = 0) {
   const [control] = await db.select().from(collaborationLifecycles).where(eq(collaborationLifecycles.collaborationId, collaborationId)).limit(1);
-  await db.insert(workflowWakeups).values({ id: newId(), collaborationId, sourceJobId: sourceJobId ?? null,
+  await db.insert(workflowWakeups).values({ id: newId(), collaborationId, sourceJobId: sourceJobId ?? null, availableAt: new Date(Date.now() + delayMs),
     snapshot: control ? { revision: control.revision, phase: control.phase, documentHash: control.documentHash } : null });
 }
 

@@ -50,6 +50,26 @@ beforeEach(() => {
 });
 
 describe("生命周期自动推进的迟到回调隔离", () => {
+  it("需要管理员事实时停止派发，等待对端服务时不按轮询反复唤起模型", async () => {
+    state.detail.lifecycle.phase = "executing"; state.job.payload.lifecycleSnapshot.phase = "executing";
+    state.detail.lifecycle.blocks = [{ participantId: "a", kind: "needs_admin" }];
+    await advanceAgentWorkflow("job"); expect(newJobs()).toHaveLength(0);
+    state.detail.lifecycle.blocks = [{ participantId: "a", kind: "waiting_peer", dependencyParticipantIds: ["b"], retryAt: new Date(0).toISOString() }];
+    state.detail.lifecycle.reports = [{ participantId: "b", status: "passed" }]; state.detail.lifecycle.services = [];
+    await advanceAgentWorkflow("job"); expect(newJobs()).toHaveLength(0);
+    state.detail.lifecycle.services.push({ participantId: "b", expiresAt: new Date(Date.now() + 60000).toISOString() });
+    await advanceAgentWorkflow("job"); expect(newJobs()).toHaveLength(1);
+    expect(newJobs()[0]!.values.agentId).toBe("agent-a");
+  });
+
+  it("临时错误退避时间到达前不派发，过期后只派发未完成方", async () => {
+    state.detail.lifecycle.phase = "executing"; state.job.payload.lifecycleSnapshot.phase = "executing";
+    state.detail.lifecycle.reports = [{ participantId: "b", status: "passed" }];
+    state.detail.lifecycle.blocks = [{ participantId: "a", kind: "retryable", retryAt: new Date(Date.now() + 60000).toISOString() }];
+    await advanceAgentWorkflow("job"); expect(newJobs()).toHaveLength(0);
+    state.detail.lifecycle.blocks[0].retryAt = new Date(0).toISOString();
+    await advanceAgentWorkflow("job"); expect(newJobs()).toHaveLength(1);
+  });
   it("计划收齐后仅派发协调方汇总统一契约", async () => {
     await advanceAgentWorkflow("job");
     expect(newJobs()).toHaveLength(1);

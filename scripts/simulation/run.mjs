@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
@@ -8,11 +8,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { runConnector } from "../../apps/connector/dist/index.js";
 import { SimulationApi } from "./http.mjs";
 import { agentInstructions, contract, revisionOne, revisionTwo } from "./contract.mjs";
 import { publishJointEvidence } from "./publish-joint-evidence.mjs";
-import { jointFixture } from "./joint-fixture.mjs";
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,9 +19,7 @@ const checks = [];
 let runRoot;
 let collaborationId;
 let locals = [];
-let heartbeatTimer;
-let liveGateway;
-let gatewayRevision = 1;
+const workers = [];
 
 function lifecycle(detail) {
   const value = detail.lifecycle ?? detail.collaboration.lifecycle;
@@ -53,52 +49,49 @@ async function assertNoUnapprovedWrites(baseline) {
   }
 }
 
-async function runAgent(local) {
-  progress("connector-turn", { role: local.role });
-  const original = {
-    command: process.env.SEAM_GENERIC_AGENT_COMMAND,
-    args: process.env.SEAM_GENERIC_AGENT_ARGS,
-    state: process.env.SEAM_APP_SERVER_STATE_DIR,
-  };
-  try {
+async function startConnectors() {
+  for (const local of locals) {
+    const env = { ...process.env, SEAM_PLATFORM_URL: api.base, SEAM_AGENT_ID: local.agent.id, SEAM_AGENT_TOKEN: local.agent.token,
+      SEAM_PROJECT_ROOT: local.root, SEAM_ADAPTER: local.role === "consumer" ? "codex-app-server" : "generic-cli",
+      SEAM_CODEX_SANDBOX: "workspace-write", SEAM_CODEX_NETWORK_ACCESS: "true",
+      SEAM_CONNECTOR_STATE_DIR: join(runRoot, "connector-state"), SEAM_WORKSPACE_LOCK_DIR: join(runRoot, "workspace-locks"),
+      SEAM_APP_SERVER_STATE_DIR: join(runRoot, "codex-state"), SEAM_MOCK_STATE_DIR: join(runRoot, "mock-state"),
+      SEAM_POLL_INTERVAL_MS: "200" };
     if (local.role === "provider") {
-      process.env.SEAM_GENERIC_AGENT_COMMAND = process.execPath;
-      process.env.SEAM_GENERIC_AGENT_ARGS = JSON.stringify([join(here, "virtual-agent.mjs")]);
-    }
-    process.env.SEAM_APP_SERVER_STATE_DIR = join(runRoot, "codex-state");
-    await runConnector({
-      platformUrl: api.base, agentId: local.agent.id, token: local.agent.token, projectRoot: local.root,
-      adapter: local.role === "consumer" ? "codex-app-server" : "generic-cli", codexSandbox: "workspace-write",
-      appServerStateDir: join(runRoot, "codex-state"), stateDir: join(runRoot, "connector-state"), workspaceLockDir: join(runRoot, "workspace-locks"), codexNetworkAccess: true, once: true, pollMs: 100,
-    });
-  } finally {
-    for (const [key, value] of [["SEAM_GENERIC_AGENT_COMMAND", original.command], ["SEAM_GENERIC_AGENT_ARGS", original.args], ["SEAM_APP_SERVER_STATE_DIR", original.state]]) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
+      env.SEAM_GENERIC_AGENT_COMMAND = process.execPath;
+      env.SEAM_GENERIC_AGENT_ARGS = JSON.stringify([join(here, "virtual-agent.mjs")]);
+      env.SEAM_TEST_COMMAND = "node --test joint.test.mjs";
+    } else delete env.SEAM_TEST_COMMAND;
+    const child = spawn(process.execPath, [join(here, "../../apps/connector/dist/cli.js")], { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const logs = [];
+    child.stdout.on("data", (chunk) => logs.push(chunk.toString()));
+    child.stderr.on("data", (chunk) => logs.push(chunk.toString()));
+    child.on("exit", (code, signal) => { local.exit = { code, signal }; });
+    workers.push({ child, local, logs });
   }
+  progress("independent-connectors-started", { pids: workers.map(({child}) => child.pid) });
 }
 
-async function runUntilPhase(expected, maximum = 18) {
-  for (let turn = 0; turn < maximum; turn += 1) {
-    const detail = await api.detail(collaborationId);
-    const current = lifecycle(detail);
-    progress("lifecycle", { revision: current.revision, phase: current.phase, turn });
+async function runUntilPhase(expected) {
+  const deadline = Date.now() + 25 * 60_000;
+  let previous;
+  while (Date.now() < deadline) {
+    const detail = await api.detail(collaborationId), current = lifecycle(detail);
+    const state = JSON.stringify([current.revision, current.phase, detail.jobs.map((job) => [job.id, job.status]), current.blocks]);
+    if (state !== previous) {
+      progress("lifecycle", { revision: current.revision, phase: current.phase, jobs: detail.jobs.map((job) => ({id:job.id,status:job.status})), blocks: current.blocks });
+      await writeFile(join(runRoot, `state-${Date.now()}.json`), JSON.stringify(detail, null, 2));
+      previous = state;
+    }
     if (current.phase === expected) return detail;
-    assert.notEqual(current.phase, "terminated", "simulation was terminated before the requested checkpoint");
-    assert.ok(["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(current.phase), `unexpected stop before ${expected}: ${current.phase}`);
+    assert.notEqual(current.phase, "terminated");
     const failed = detail.jobs.find((job) => job.status === "failed");
     assert.ok(!failed, `Connector failed: ${failed?.error ?? ""}`);
-    const pending = detail.jobs.filter((job) => job.status === "pending");
-    assert.ok(!detail.jobs.some((job) => job.status === "running"), "an unexpected competing Connector owns a simulation task");
-    assert.ok(pending.length, `the platform did not automatically generate the next ${current.phase} task; the harness will not compensate with a manual dispatch`);
-    // Prefer the deterministic provider so Codex can consume its concrete plan.
-    const next = pending.find((job) => job.agentId === locals[0].agent.id) ?? pending[0];
-    const local = locals.find((item) => item.agent.id === next.agentId);
-    assert.ok(local, "task must belong to one of this run's isolated Agents");
-    await runAgent(local);
+    assert.ok(!current.blocks.some((block) => block.kind === "needs_admin"), `unexpected administrator dependency: ${JSON.stringify(current.blocks)}`);
+    assert.ok(workers.every(({local}) => !local.exit), "a long-running Connector exited unexpectedly");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   }
-  assert.fail(`did not reach ${expected} within ${maximum} actual Connector turns`);
+  assert.fail(`did not reach ${expected} before deadline`);
 }
 
 async function jointHttpCheck(revision) {
@@ -191,6 +184,10 @@ async function approveAndExecute(detail, baseline) {
   assert.equal(completed.reports.length, 2, "both endpoints must submit actual execution.report actions");
   assert.ok(completed.reports.every((report) => report.status === "passed"), "a failed test cannot be counted as a passed simulation");
   assert.equal(completed.integrationReports.length, 2);
+  assert.ok(completed.integrationReports.every((entry) => entry.checks.every((check) => check.runIds.length && check.assertionNames.length)), "every passed case needs automatically captured command/assertion references");
+  assert.ok(completed.services.some((service) => service.probe?.ok), "endpoint must be published by a project Connector after a real health probe");
+  if (ready.revision === 1) progress("contract-review-result", { objections: completed.objections.length,
+    scope: "Virtual peer rejects a concrete readiness omission when present. A complete initial contract is valid and must not be forced to contain a defect." });
   assert.ok(completed.integrationReports.every((entry) => entry.checks.every((check) => check.status === "passed")), "built-in joint verification must actually pass");
   assert.ok(completed.report, "Seam must produce the administrator's implementation report");
   const joint = await jointHttpCheck(ready.revision);
@@ -218,40 +215,15 @@ async function main() {
     await exec("git", ["init", "--quiet", root]);
     locals.push({ ...registered, root, role });
   }
-  // Test infrastructure supplies a live transport; all quote/client business
-  // behavior is implemented by the project Agents after administrator approval.
-  liveGateway = createServer(async (request, response) => {
-    try {
-      if (request.method === "GET" && request.url === "/__seam_acceptance__/revision") {
-        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ revision: gatewayRevision }));
-        return;
-      }
-      if (request.method !== "POST" || request.url !== "/quote") { response.writeHead(404).end(); return; }
-      let body = ""; for await (const chunk of request) { body += chunk; if (body.length > 10000) throw new Error("request too large"); }
-      const path = join(locals[0].root, "service.mjs");
-      const provider = await import(`${pathToFileURL(path)}?version=${(await stat(path)).mtimeMs}`);
-      const value = provider.quote(JSON.parse(body));
-      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value));
-    } catch (error) { response.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: error.message })); }
-  });
-  await new Promise((resolve) => liveGateway.listen(0, "127.0.0.1", resolve));
-  const liveURL = `http://127.0.0.1:${liveGateway.address().port}`;
   for (const local of locals) {
-    await writeFile(join(local.root, "README.md"), `${contract}\n\n本项目职责：${local.role}。\n联合验收使用 node --test joint.test.mjs；真实HTTP网关为 ${liveURL}，已由模拟器提供，网关业务函数来自提供方实际 service.mjs。测试配置GET /__seam_acceptance__/revision提供当前验收修订；脚本逐项断言完整响应、两个SKU、数量边界、真实400及客户端Error包含HTTP状态码，修订2增加折扣省略/0/10/100及非法值，不能以进程成功代替用例覆盖。\n`);
-    await writeFile(join(local.root, "joint.test.mjs"), jointFixture({ liveURL, role: local.role }));
-    await exec("git", ["-C", local.root, "add", "README.md", "AGENTS.md", "joint.test.mjs"]);
-    await exec("git", ["-C", local.root, "-c", "user.name=Seam Simulation", "-c", "user.email=simulation@seam.test", "commit", "--quiet", "-m", "Initialize isolated acceptance fixture"]);
+    await exec("git", ["-C", local.root, "add", "README.md", "AGENTS.md"]);
+    await exec("git", ["-C", local.root, "-c", "user.name=Seam Simulation", "-c", "user.email=simulation@seam.test", "commit", "--quiet", "-m", "Initialize isolated acceptance fixture without implementations or tests"]);
   }
-  const sendHeartbeats = () => Promise.all(locals.map((local) => api.call("/api/connectors/heartbeat", {
-    agentId: local.agent.id,
-    capabilities: {
-      adapter: local.role === "consumer" ? "codex-app-server" : "generic-cli",
-      executionMode: local.role === "consumer" ? "workspace-write" : "external", testConfigured: false,
-    },
-  }, { token: local.agent.token })));
-  await sendHeartbeats();
-  heartbeatTimer = setInterval(() => { void sendHeartbeats().catch((error) => progress("heartbeat-error", { message: error.message })); }, 20_000);
-  heartbeatTimer.unref();
+  await mkdir(join(runRoot, "mock-state"));
+  await startConnectors();
+  // Real Connector heartbeats establish online state; the harness never pretends
+  // that a worker is connected and never chooses the order of project turns.
+  await new Promise((resolve) => setTimeout(resolve, 3000));
   const initial = await Promise.all(locals.map((local) => snapshot(local.root)));
   const created = await api.call("/api/collaborations", {
     objective: revisionOne, projectId: locals[1].project.id, agentId: locals[1].agent.id,
@@ -285,7 +257,6 @@ async function main() {
   await approveAndExecute(readyOne, initial);
   const beforeRevision = await Promise.all(locals.map((local) => snapshot(local.root)));
   await api.lifecycle(collaborationId, { action: "append", requirements: revisionTwo });
-  gatewayRevision = 2;
   const appended = lifecycle(await api.detail(collaborationId));
   assert.equal(appended.revision, 2);
   assert.equal(appended.phase, "planning");
@@ -312,6 +283,7 @@ async function main() {
   checks.push("管理员终止后无运行任务，禁止继续派发/批准，拒绝旧回执，项目文件保持不变");
 
   const result = { ok: true, collaborationId, base: api.base, runRoot, checks,
+    concurrency: "two independent continuously polling Connector processes; no provider-first scheduler",
     realAI: "local Codex app-server", virtualPeer: "deterministic provider implemented and tested locally",
     scope: "本地Docker中心及MySQL、两个隔离合成项目、真实HTTP报价接口；不代表实际业务项目联调或生产部署" };
   await writeFile(join(runRoot, "result.json"), JSON.stringify(result, null, 2));
@@ -323,4 +295,14 @@ main().catch(async (error) => {
   if (runRoot) await writeFile(join(runRoot, "failure.json"), JSON.stringify(result, null, 2)).catch(() => undefined);
   console.error(JSON.stringify(result, null, 2));
   process.exitCode = 1;
-}).finally(async () => { clearInterval(heartbeatTimer); if (liveGateway) await new Promise((resolve) => liveGateway.close(resolve)); });
+}).finally(async () => {
+  for (const { child, local, logs } of workers) {
+    try { process.kill(-child.pid, "SIGTERM"); } catch {}
+    await writeFile(join(runRoot, `${local.role}-connector.log`), logs.join(""));
+  }
+  if (runRoot) for (const name of await readdir(join(runRoot, "mock-state")).catch(() => [])) {
+    if (!name.endsWith(".json")) continue;
+    const service = JSON.parse(await readFile(join(runRoot, "mock-state", name), "utf8"));
+    if (service.pid) try { process.kill(service.pid, "SIGTERM"); } catch {}
+  }
+});

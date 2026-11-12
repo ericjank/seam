@@ -27,6 +27,8 @@ function nativeResponseSchema(input: AgentRunInput) {
   let actions: z.ZodType[];
   if (!lifecycle) actions = Object.values(auxiliaryActions);
   else {
+    const blocked = z.object({ type: z.literal("workflow.blocked"), revision: z.literal(lifecycle.revision), kind: z.enum(["waiting_peer", "retryable", "needs_admin"]), reason: z.string().min(10).max(5000), dependencyParticipantIds: z.array(id).max(50), retryAfterSeconds: z.number().int().min(1).max(300) }).strict();
+    const publish = z.object({ type: z.literal("service.publish"), revision: z.literal(lifecycle.revision), name: z.string().min(1).max(100), baseUrl: z.string().url().max(2000), healthPath: z.string().max(1000), ttlSeconds: z.number().int().min(30).max(3600) }).strict();
     const submit = z.object({ type: z.literal("plan.submit"), revision: z.literal(lifecycle.revision), content: z.string().min(100).max(100_000) }).strict();
     switch (lifecycle.paused ? "paused" : lifecycle.phase) {
       case "planning": actions = [submit]; break;
@@ -43,12 +45,14 @@ function nativeResponseSchema(input: AgentRunInput) {
       case "executing": actions = [
         z.object({ type: z.literal("execution.report"), revision: z.literal(lifecycle.revision), status: z.enum(["passed", "failed"]), summary, evidence }).strict(),
         auxiliaryActions["artifact.upsert"], auxiliaryActions["work.create"], auxiliaryActions["work.update"], auxiliaryActions["acceptance.submit"],
+        publish,
       ]; break;
       case "joint_verifying": actions = [z.object({ type: z.literal("integration.report"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash), checks: z.array(z.object({
-        caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]), command: z.string().max(2000), summary: z.string().min(1).max(10_000), evidence,
-      }).strict()).min(1).max(100) }).strict()]; break;
+        caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]), command: z.string().max(2000), summary: z.string().min(1).max(10_000), assertionNames: z.array(z.string().min(1).max(2000)).max(100), evidence,
+      }).strict()).min(1).max(100) }).strict(), publish]; break;
       default: actions = [];
     }
+    if (actions.length) actions.push(blocked);
   }
   const item = actions.length === 0 ? z.object({}).strict()
     : actions.length === 1 ? actions[0]!
@@ -73,6 +77,9 @@ export function buildNativeOutputSchema(input: AgentRunInput): Record<string, un
     const record = node as Record<string, unknown>;
     delete record.default;
     if (record.format === "uuid") delete record.pattern;
+    // Native Structured Outputs accepts a subset of JSON Schema formats.
+    // URL syntax remains enforced by the local Zod parser and health probe.
+    if (record.format === "uri") delete record.format;
     Object.values(record).forEach(compact);
   };
   compact(schema);

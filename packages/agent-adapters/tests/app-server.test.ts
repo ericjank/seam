@@ -67,9 +67,10 @@ createInterface({input: process.stdin}).on('line', line => {
     if (process.env.SEAM_FAKE_COMPACT==='legacy') send({method:'thread/compacted',params:{threadId:compactThread,turnId}});
     else send({method:'item/completed',params:{threadId:compactThread,turnId,item:{type:'contextCompaction',id:'compact-'+turnId}}});
    }
-   send({method:'item/completed',params:{threadId,turnId,item:{type:'commandExecution',id:'command',aggregatedOutput:'private source'}}});
+   const command={type:'commandExecution',id:'command',aggregatedOutput:process.env.SEAM_FAKE_TEST_COMMAND?'ok 1 - HTTP error':'private source',...(process.env.SEAM_FAKE_TEST_COMMAND?{command:'node --test joint.test.mjs',exitCode:0}:{})};
+   if(!process.env.SEAM_FAKE_COMMAND_FINAL_ONLY)send({method:'item/completed',params:{threadId,turnId,item:command}});
    send({method:'item/completed',params:{threadId,turnId,item}});
-   const completed={method:'turn/completed',params:{threadId,turn:{id:turnId,status:process.env.SEAM_FAKE_FAIL?'failed':'completed',items:[item]}}};
+   const completed={method:'turn/completed',params:{threadId,turn:{id:turnId,status:process.env.SEAM_FAKE_FAIL?'failed':'completed',items:[command,item]}}};
    if (process.env.SEAM_FAKE_COMPACT==='after-completed') {
     // Emit both notifications in one write, with compaction after completion.
     const compacted={method:'thread/compacted',params:{threadId,turnId}};
@@ -98,6 +99,15 @@ createInterface({input: process.stdin}).on('line', line => {
 }
 
 describe("Codex App Server 持久会话", () => {
+  it.each([false, true])("实际命令事件只交付一次，完成轮次单独携带记录时也采集（%s）", async (finalOnly) => {
+    const f = await fixture(); vi.stubEnv("SEAM_FAKE_TEST_COMMAND", "1");
+    if (finalOnly) vi.stubEnv("SEAM_FAKE_COMMAND_FINAL_ONLY", "1");
+    const onCommand = vi.fn();
+    const result = await f.adapter().run({ projectRoot: f.directory, context: context(), onCommand });
+    expect(onCommand).toHaveBeenCalledTimes(1);
+    expect(onCommand).toHaveBeenCalledWith({ id: "command", command: "node --test joint.test.mjs", exitCode: 0, output: "ok 1 - HTTP error" });
+    expect(result.message).not.toContain("HTTP error");
+  });
   it("首次start、跨实例resume保持同一thread，重复job不重复执行且映射为私有权限", async () => {
     const f = await fixture();
     const value = context();
@@ -114,7 +124,7 @@ describe("Codex App Server 持久会话", () => {
     expect(calls.filter((call) => call.method === "thread/start")).toHaveLength(1);
     expect(calls.filter((call) => call.method === "thread/resume")).toHaveLength(3);
     expect(calls.filter((call) => call.method === "turn/start")).toHaveLength(4);
-    const files = await readdir(f.stateDir);
+    const files = (await readdir(f.stateDir)).filter((file) => file.endsWith(".json"));
     expect(files).toHaveLength(1);
     expect((await stat(join(f.stateDir, files[0]!))).mode & 0o777).toBe(0o600);
     expect(JSON.stringify(cached)).not.toContain("private source");
@@ -153,7 +163,7 @@ describe("Codex App Server 持久会话", () => {
     expect(nextPrompt).toContain(next.jobId);
     const [file] = await readdir(f.stateDir);
     const stored = JSON.parse(await readFile(join(f.stateDir, file!), "utf8"));
-    expect(stored.lastHandoff).toMatchObject({ version: 2, scope: `${value.collaborationId}:${value.participant.id}` });
+    expect(stored.lastHandoff).toMatchObject({ version: 3, scope: `${value.collaborationId}:${value.participant.id}` });
     expect(Object.values(stored.lastHandoff.sections).every((hash) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))).toBe(true);
     expect(JSON.stringify(stored.lastHandoff)).not.toContain(value.lifecycle.document);
   });

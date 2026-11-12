@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { agentTurnResultSchema, type AgentTurnResult } from "@seam/protocol";
 import { checkCli } from "./cli.js";
-import { buildNativeHandoff, NATIVE_HANDOFF_VERSION, type HandoffCheckpoint } from "./handoff.js";
+import { buildNativeHandoff, materializeHandoffResources, NATIVE_HANDOFF_VERSION, type HandoffCheckpoint } from "./handoff.js";
 import { parseNativeAgentOutput } from "./response-schema.js";
 import { codexNetworkForTurn, codexSandboxForTurn } from "./policy.js";
 import type { AdapterOptions, AgentAdapter, AgentRunInput } from "./types.js";
@@ -136,12 +136,18 @@ class AppServerConnection {
     this.send({ method: "initialized", params: {} });
   }
 
-  async turn(threadId: string, params: RecordValue, signal?: AbortSignal): Promise<{ text: string; turnId: string }> {
+  async turn(threadId: string, params: RecordValue, signal?: AbortSignal, onCommand?: AgentRunInput["onCommand"]): Promise<{ text: string; turnId: string }> {
     this.trackedThreadId = threadId;
     let turnId: string | undefined;
     let cancellation: Promise<void> | undefined;
     let cancelled = false;
     const messages = new Map<string, string>();
+    const commands = new Set<string>();
+    const collectCommand = (item: RecordValue) => {
+      if (item.type !== "commandExecution" || typeof item.command !== "string" || commands.has(String(item.id))) return;
+      commands.add(String(item.id));
+      onCommand?.({ id: String(item.id), command: item.command, exitCode: typeof item.exitCode === "number" ? item.exitCode : null, output: typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "" });
+    };
     let finish!: (value: { text: string; turnId: string }) => void;
     let rejectTurn!: (error: Error) => void;
     const done = new Promise<{ text: string; turnId: string }>((resolveTurn, reject) => { finish = resolveTurn; rejectTurn = reject; });
@@ -151,6 +157,7 @@ class AppServerConnection {
       if (method === "connection/failed") { rejectTurn(this.failed ?? new Error("Codex App Server 连接中断")); return; }
       if (event.threadId !== threadId) return;
       if (typeof event.turnId === "string" && turnId && event.turnId !== turnId) return;
+      if (method === "item/completed" && isRecord(event.item)) collectCommand(event.item);
       if (method === "item/completed" && isRecord(event.item) && event.item.type === "agentMessage" && typeof event.item.text === "string") {
         messages.set(String(event.item.id), event.item.text);
       }
@@ -163,6 +170,7 @@ class AppServerConnection {
         const items = Array.isArray(turn.items) ? turn.items : [];
         for (const item of items) {
           if (!isRecord(item)) continue;
+          collectCommand(item);
           if (item.type === "agentMessage" && typeof item.text === "string") messages.set(String(item.id), item.text);
         }
         const text = [...messages.values()].at(-1);
@@ -293,7 +301,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
           // is cosmetic and must not replace or derail a created conversation.
           await connection.request("thread/name/set", { threadId: session.threadId, name: `Seam · ${input.context!.title} · ${input.context!.participant.projectName}`.slice(0, 200) }, 10_000).catch(() => {});
         }
-        const handoff = buildNativeHandoff({ ...input, conversationMode: "persistent", localExecutionPolicy: `Codex App Server sandbox=${sandbox}，approval=never。当前策略由本地能力与平台批准的阶段交集决定；不得提升权限。` }, session?.lastHandoff);
+        const prepared = await materializeHandoffResources(input, join(directory, "resources"));
+        const handoff = buildNativeHandoff({ ...prepared, conversationMode: "persistent", localExecutionPolicy: `Codex App Server sandbox=${sandbox}，approval=never。当前策略由本地能力与平台批准的阶段交集决定；不得提升权限。` }, session?.lastHandoff);
         const finished = await connection.turn(response.thread.id, {
           cwd: projectRoot, approvalPolicy: "never",
           sandboxPolicy: sandbox === "workspace-write"
@@ -301,7 +310,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
             : { type: "readOnly", networkAccess: false },
           input: [{ type: "text", text: handoff.prompt }],
           outputSchema: handoff.outputSchema,
-        }, input.signal);
+        }, input.signal, input.onCommand);
         const result = parseNativeAgentOutput(finished.text, input);
         if (session) {
           session.lastTurnId = finished.turnId; session.lastJobId = input.context?.jobId; session.lastInputHash = inputHash; session.lastResult = result;

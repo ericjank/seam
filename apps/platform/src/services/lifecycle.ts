@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { and, asc, eq, inArray } from "drizzle-orm";
-import { lifecycleAgentActionSchema, type LifecycleAgentAction, type LifecycleContext } from "@seam/protocol";
+import { integrationCheckSchema, lifecycleAgentActionSchema, type LifecycleContext } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
 import {
   agents, collaborations, collaborationLifecycles, connectorJobs, lifecycleContributions,
@@ -48,6 +48,15 @@ async function getContributions(control: Lifecycle) {
   return db.select().from(lifecycleContributions).where(currentContribution(control.collaborationId, control.revision));
 }
 
+async function cancelSupersededReviews(control: Lifecycle, currentAgentId: string | null) {
+  const jobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, ["pending", "running"])));
+  for (const job of jobs) {
+    const snapshot = (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot;
+    if (job.agentId === currentAgentId || snapshot?.revision !== control.revision || !["plan_synthesis", "plan_confirmation"].includes(snapshot.phase)) continue;
+    await db.update(connectorJobs).set({ status: "cancelled", error: "共同文档已更新，旧只读任务已被替代", leaseUntil: null, updatedAt: new Date() }).where(eq(connectorJobs.id, job.id));
+  }
+}
+
 function contextFrom(control: Lifecycle, revision: Revision, contributions: Contribution[], previous?: Revision): LifecycleContext {
   const relevant = contributions.filter((row) => control.requiredParticipantIds.includes(row.participantId));
   return {
@@ -61,8 +70,11 @@ function contextFrom(control: Lifecycle, revision: Revision, contributions: Cont
     reports: relevant.flatMap((row) => row.reportStatus && row.reportSummary ? [{
       participantId: row.participantId, status: row.reportStatus, summary: row.reportSummary, evidence: row.reportEvidence ?? {},
     }] : []),
-    integrationReports: relevant.flatMap((row) => row.integrationChecks ? [{ participantId: row.participantId, checks: row.integrationChecks }] : []),
+    integrationReports: relevant.flatMap((row) => row.integrationChecks ? [{ participantId: row.participantId, checks: row.integrationChecks.map((check) => integrationCheckSchema.parse(check)) }] : []),
     report: revision.report,
+    blocks: relevant.flatMap((row) => row.block?.phase === control.phase ? [{ ...row.block, participantId: row.participantId }] : []),
+    services: relevant.flatMap((row) => (row.services ?? []).filter((service) => Date.parse(service.expiresAt) > Date.now()).map((service) => ({ ...service, participantId: row.participantId }))),
+    evidenceRuns: relevant.flatMap((row) => (row.evidenceRuns ?? []).map((run) => ({ ...run, participantId: row.participantId }))),
   };
 }
 
@@ -138,16 +150,45 @@ export async function startLifecycle(userId: string, collaborationId: string): P
   });
 }
 
-export async function applyLifecycleAction(actor: Actor, collaborationId: string, rawAction: LifecycleAgentAction): Promise<{ changed: boolean }> {
+export async function applyLifecycleAction(actor: Actor, collaborationId: string, rawAction: import("zod").input<typeof lifecycleAgentActionSchema>): Promise<{ changed: boolean }> {
   const action = lifecycleAgentActionSchema.parse(rawAction);
   return locked(collaborationId, async (control, collaboration) => {
     if (!control) throw new HttpError(409, "该协作尚未启用管理员确认开发流程");
     const participantId = await authorizeActor(actor, collaborationId);
     if (!participantId || actor.kind !== "participant" || !control.requiredParticipantIds.includes(participantId)) throw new HttpError(403, "仅本轮指定的项目 Agent 可提交计划、确认或实施报告");
     if (control.pausedAt || action.revision !== control.revision || control.phase === "terminated") throw new HttpError(409, "协作修订已失效或已终止");
-    await requiredProjects(control);
+    const required = await requiredProjects(control);
+    const currentAgentId = required.find((row) => row.participant.id === participantId)?.participant.agentId ?? null;
     const revision = await getRevision(control);
     const existing = (await getContributions(control)).find((row) => row.participantId === participantId);
+    if (action.type === "workflow.blocked") {
+      if (action.dependencyParticipantIds.some((id) => id === participantId || !control.requiredParticipantIds.includes(id))) throw new HttpError(422, "等待对象必须为当前协作的其他参与方");
+      const attempts = existing?.block?.phase === control.phase && existing.block.kind === action.kind ? existing.block.attempts + 1 : 1;
+      const kind = action.kind === "retryable" && attempts >= 3 ? "needs_admin" : action.kind;
+      const block = { kind, reason: action.reason, dependencyParticipantIds: action.dependencyParticipantIds, retryAfterSeconds: action.retryAfterSeconds, phase: control.phase, attempts,
+        retryAt: kind === "needs_admin" ? null : new Date(Date.now() + action.retryAfterSeconds * 1000).toISOString() };
+      await db.insert(lifecycleContributions).values({ id: newId(), collaborationId, revision: control.revision, participantId, block }).onDuplicateKeyUpdate({ set: { block, updatedAt: new Date() } });
+      const blockedRows = (await getContributions(control)).filter((row) => row.block?.phase === control.phase);
+      const waiting = new Set(blockedRows.filter((row) => row.block?.kind === "waiting_peer").map((row) => row.participantId));
+      if (control.requiredParticipantIds.every((id) => waiting.has(id)) && blockedRows.every((row) => row.block!.dependencyParticipantIds.length && row.block!.dependencyParticipantIds.every((id) => waiting.has(id)))) {
+        for (const row of blockedRows) await db.update(lifecycleContributions).set({ block: { ...row.block!, kind: "needs_admin", retryAt: null, reason: `检测到双方循环等待，需要明确先启动的服务或补充依赖事实。${row.block!.reason}`.slice(0, 5000) } }).where(eq(lifecycleContributions.id, row.id));
+        await notify(collaborationId, "检测到双方循环等待，已停止自动重试，请管理员补充依赖事实后继续。");
+        return { changed: true };
+      }
+      if (kind !== "needs_admin") await queueWorkflowWakeup(collaborationId, undefined, action.retryAfterSeconds * 1000);
+      await notify(collaborationId, `${kind === "needs_admin" ? "需要管理员补充必要信息" : kind === "waiting_peer" ? "等待对端资料或服务就绪" : "临时故障，等待退避重试"}：${action.reason}`);
+      return { changed: true };
+    }
+    if (action.type === "service.publish") {
+      if (!["executing", "joint_verifying"].includes(control.phase) || control.approvedHash !== control.documentHash || !control.approvedHash) throw new HttpError(409, "服务端点只能在本版获批后发布");
+      const url = new URL(action.baseUrl);
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || !action.probe?.ok) throw new HttpError(422, "服务端点必须经本机实际健康探测，地址不得包含凭据");
+      const service = { name: action.name, baseUrl: action.baseUrl, healthPath: action.healthPath, ttlSeconds: action.ttlSeconds, probe: action.probe, expiresAt: new Date(Date.now() + action.ttlSeconds * 1000).toISOString() };
+      const services = [...(existing?.services ?? []).filter((item) => item.name !== action.name), service];
+      await db.insert(lifecycleContributions).values({ id: newId(), collaborationId, revision: control.revision, participantId, services }).onDuplicateKeyUpdate({ set: { services, updatedAt: new Date() } });
+      return { changed: true };
+    }
+    if (existing?.block) await db.update(lifecycleContributions).set({ block: null, updatedAt: new Date() }).where(eq(lifecycleContributions.id, existing.id));
     if (action.type === "plan.submit") {
       if (!["planning", "plan_synthesis", "plan_confirmation"].includes(control.phase)) throw new HttpError(409, "当前阶段不能修改开发文档");
       if (existing?.content === action.content && JSON.stringify(existing.workspaceBaseline ?? null) === JSON.stringify(action.baseline ?? null)) return { changed: false };
@@ -159,6 +200,7 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
       await db.update(lifecycleRevisions).set({ document: null, documentHash: null, sharedContract: null, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
       await db.update(collaborationLifecycles).set({ phase: allSubmitted ? "plan_synthesis" : "planning", documentHash: null, approvedHash: null, approvedById: null, approvedAt: null, updatedAt: new Date() })
         .where(eq(collaborationLifecycles.collaborationId, collaborationId));
+      if (control.phase !== "planning") await cancelSupersededReviews(control, currentAgentId);
       await notify(collaborationId, allSubmitted ? "各方分析已收齐，由协调方 Agent 汇总唯一接口契约、责任和联合验收用例。" : "已收到本方分析，等待其他项目补齐。");
       return { changed: true };
     }
@@ -183,6 +225,7 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
       await db.update(lifecycleRevisions).set({ objections: [...(revision.objections ?? []), { participantId, documentHash: action.documentHash, reason: action.reason }].slice(-50), updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
       await db.update(lifecycleContributions).set({ confirmedHash: null, updatedAt: new Date() }).where(currentContribution(collaborationId, control.revision));
       await db.update(collaborationLifecycles).set({ phase: "plan_synthesis", updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
+      await cancelSupersededReviews(control, currentAgentId);
       await notify(collaborationId, `项目 Agent 提出契约异议：${action.reason}。协调方将修订，双方需重新确认。`);
       return { changed: true };
     }
@@ -204,15 +247,22 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
       const expected = revision.sharedContract.acceptanceCases.filter((item) => item.runnerParticipantId === participantId);
       if (action.checks.length !== expected.length || new Set(action.checks.map((item) => item.caseId)).size !== action.checks.length || expected.some((item) => !action.checks.some((check) => check.caseId === item.id))) throw new HttpError(422, "必须完整报告本方所有已批准的联合验收用例，不得跨方或遗漏");
       if (action.checks.some((check) => check.status !== "not_run" && (!check.command.trim() || !Object.keys(check.evidence).length))) throw new HttpError(422, "已执行用例必须提供真实命令和证据");
-      await db.update(lifecycleContributions).set({ integrationChecks: action.checks, updatedAt: new Date() }).where(and(currentContribution(collaborationId, control.revision), eq(lifecycleContributions.participantId, participantId)));
+      for (const check of action.checks) {
+        if (!check.runIds.length) continue; // Historical clients remain explicitly identified as Agent-only reports.
+        const runs = action.runs.filter((run) => check.runIds.includes(run.id));
+        const approvedCommand = expected.find((item) => item.id === check.caseId)!.command.trim();
+        if (new Set(action.runs.map((run) => run.id)).size !== action.runs.length || runs.length !== check.runIds.length || check.command.trim() !== approvedCommand || runs.some((run) => run.command.trim() !== approvedCommand) || !check.assertionNames.length || check.assertionNames.some((name) => !runs.some((run) => run.assertions.includes(name))) || (check.status === "passed" && runs.some((run) => run.exitCode !== 0))) throw new HttpError(422, "用例引用的批准命令、实际断言或退出码不匹配");
+      }
+      const evidenceRuns = [...new Map([...(existing?.evidenceRuns ?? []), ...action.runs].map((run) => [run.id, run])).values()];
+      await db.update(lifecycleContributions).set({ integrationChecks: action.checks, evidenceRuns, updatedAt: new Date() }).where(and(currentContribution(collaborationId, control.revision), eq(lifecycleContributions.participantId, participantId)));
       const contributions = await getContributions(control);
       if (control.requiredParticipantIds.every((id) => contributions.some((row) => row.participantId === id && row.integrationChecks))) await finishReport(control, revision, collaboration.title, contributions);
       return { changed: true };
     }
     if (control.phase !== "executing") throw new HttpError(409, "当前阶段不能提交实施报告");
     if (existing?.reportStatus === action.status && existing.reportSummary === action.summary && JSON.stringify(existing.reportEvidence) === JSON.stringify(action.evidence)) return { changed: false };
-    await db.insert(lifecycleContributions).values({ id: newId(), collaborationId, revision: control.revision, participantId, reportStatus: action.status, reportSummary: action.summary, reportEvidence: action.evidence })
-      .onDuplicateKeyUpdate({ set: { reportStatus: action.status, reportSummary: action.summary, reportEvidence: action.evidence, updatedAt: new Date() } });
+    await db.insert(lifecycleContributions).values({ id: newId(), collaborationId, revision: control.revision, participantId, reportStatus: action.status, reportSummary: action.summary, reportEvidence: action.evidence, evidenceRuns: action.runs })
+      .onDuplicateKeyUpdate({ set: { reportStatus: action.status, reportSummary: action.summary, reportEvidence: action.evidence, evidenceRuns: action.runs, updatedAt: new Date() } });
     const contributions = await getContributions(control);
     if (control.requiredParticipantIds.every((id) => contributions.some((row) => row.participantId === id && row.reportStatus && row.reportSummary))) {
       if (contributions.some((row) => row.reportStatus === "failed") || !revision.sharedContract) await finishReport(control, revision, collaboration.title, contributions);
@@ -235,7 +285,7 @@ async function finishReport(control: Lifecycle, revision: Revision, title: strin
     `## 验收概览\n\n本地实施：${contributions.some((row) => row.reportStatus === "failed") ? "存在失败或阻塞" : "双方已报告完成"}\n\n联合验证：${allPassed ? "全部用例报告通过" : checks.length ? "存在失败或未执行用例" : "未执行，不能宣称联调通过"}\n\n管理员验收：待人工审阅，未自动接受。`,
     ...rows.map((row) => {
       const result = contributions.find((item) => item.participantId === row.participant.id)!;
-      return `## ${row.project.name}：${result.reportStatus === "passed" ? "报告通过" : "存在失败或阻塞"}\n\n${result.reportSummary}\n\n### 实际证据\n\n${JSON.stringify(result.reportEvidence ?? {}, null, 2)}\n\n### 联合验证\n\n${(result.integrationChecks ?? []).map((check) => `${check.caseId}：${check.status}\n命令：${check.command}\n${check.summary}\n${JSON.stringify(check.evidence, null, 2)}`).join("\n\n") || "未执行"}`;
+      return `## ${row.project.name}：${result.reportStatus === "passed" ? "报告通过" : "存在失败或阻塞"}\n\n${result.reportSummary}\n\n### 实际证据\n\n${JSON.stringify(result.reportEvidence ?? {}, null, 2)}\n\n### 联合验证\n\n${(result.integrationChecks ?? []).map((check) => `${check.caseId}：${check.status}\n命令：${check.command}\n${check.summary}\n证据来源：${check.runIds?.length ? `Connector采集 ${check.runIds.join("、")}；断言：${check.assertionNames.join("、")}` : "Agent回报，未关联自动采集的断言记录"}\n${JSON.stringify(check.evidence, null, 2)}`).join("\n\n") || "未执行"}\n\n### 命令原始记录（每次执行仅归档一份）\n\n${(result.evidenceRuns ?? []).map((run) => `${run.id} · ${run.command} · exit=${run.exitCode}\n${run.output}`).join("\n\n")}`;
     }),
     "## 管理员后续操作\n\n可补充要求启动下一版增量协商，或在审阅证据并满意后手动终止。失败与未执行结果会保留，报告收齐不代表自动验收。",
   ].join("\n\n");
@@ -305,11 +355,17 @@ export async function terminateLifecycle(userId: string, collaborationId: string
   });
 }
 
-export async function pauseLifecycle(userId: string, collaborationId: string, paused: boolean): Promise<LifecycleContext> {
+export async function pauseLifecycle(userId: string, collaborationId: string, paused: boolean, resolution?: string): Promise<LifecycleContext> {
   return locked(collaborationId, async (control) => {
     await requireAdministrator(userId, collaborationId);
     if (!control || control.phase === "terminated") throw new HttpError(409, "已终止或未开始的协作不能暂停或恢复");
-    if (Boolean(control.pausedAt) === paused) return (await getLifecycleContext(collaborationId))!;
+    const blocks = (await getContributions(control)).filter((row) => row.block);
+    if (Boolean(control.pausedAt) === paused && (paused || !blocks.length)) return (await getLifecycleContext(collaborationId))!;
+    if (!paused && blocks.some((row) => row.block?.kind === "needs_admin") && !resolution?.trim()) throw new HttpError(422, "请补充阻塞所缺的必要事实后继续；需求变更须重新起草文档");
+    if (!paused) {
+      await db.update(lifecycleContributions).set({ block: null, updatedAt: new Date() }).where(currentContribution(collaborationId, control.revision));
+      if (resolution?.trim()) await db.insert(messages).values({ id: newId(), collaborationId, authorType: "user", authorName: "管理员补充事实", kind: "clarification", body: resolution.trim().slice(0, 5000), metadata: { blockResolution: true, dispatch: false } });
+    }
     await db.update(collaborationLifecycles).set({ pausedAt: paused ? new Date() : null, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
     if (paused) await db.update(connectorJobs).set({ status: "cancelled", error: "管理员暂停协作，等待执行端停止确认", leaseUntil: null, updatedAt: new Date() }).where(and(eq(connectorJobs.collaborationId, collaborationId), inArray(connectorJobs.status, ["pending", "running"])));
     else await queueWorkflowWakeup(collaborationId);

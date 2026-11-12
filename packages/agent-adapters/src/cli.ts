@@ -1,14 +1,16 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { agentTurnResultSchema, type AgentTurnResult } from "@seam/protocol";
+import { join } from "node:path";
+import { agentTurnResultSchema, lifecycleActions, type AgentTurnResult } from "@seam/protocol";
 import { z } from "zod";
-import { phaseInstruction } from "./handoff.js";
+import { phaseInstruction, buildNativeHandoff, materializeHandoffResources } from "./handoff.js";
 import type { AgentRunInput } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
 export async function executeCli(input: AgentRunInput, command: string, args: string[]) {
-  const prompt = buildPrompt(input);
+  const resourceDirectory = process.env.SEAM_HANDOFF_RESOURCE_DIR ?? (process.env.SEAM_CONNECTOR_STATE_DIR ? join(process.env.SEAM_CONNECTOR_STATE_DIR, "resources") : undefined);
+  const prompt = buildPrompt(await materializeHandoffResources(input, resourceDirectory, cliOutputSchema(input)));
   const env: NodeJS.ProcessEnv = { ...process.env, SEAM_COLLABORATION_MODE: "1" };
   // Connector control-plane credentials are not needed by project tooling.
   delete env.SEAM_AGENT_TOKEN;
@@ -38,22 +40,12 @@ export async function executeCli(input: AgentRunInput, command: string, args: st
 }
 
 export function buildPrompt(input: AgentRunInput) {
-  const schema = z.toJSONSchema(agentTurnResultSchema);
-  const phase = input.context?.lifecycle?.phase;
-  if (phase && isRecord(schema.properties) && isRecord(schema.properties.actions)) {
-    const allowed = new Set(phase === "planning" ? ["plan.submit"]
-      : phase === "plan_synthesis" ? ["plan.compose"]
-      : phase === "plan_confirmation" ? ["plan.confirm", "plan.reject", "plan.submit"]
-      : phase === "executing" ? ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit"]
-      : phase === "joint_verifying" ? ["integration.report"] : []);
-    const actions = schema.properties.actions;
-    if (isRecord(actions.items)) {
-      for (const union of ["oneOf", "anyOf"]) {
-        if (Array.isArray(actions.items[union])) actions.items[union] = actions.items[union].filter((option) => isRecord(option) && isRecord(option.properties) && isRecord(option.properties.type) && allowed.has(String(option.properties.type.const)));
-      }
-      if (allowed.size === 0) { actions.maxItems = 0; actions.items = false; }
-    }
-  }
+  if (input.resources) return [buildNativeHandoff(input).prompt,
+    "只返回一个 JSON 对象。先读取本轮回复协议文件；完整机器上下文仅在需要精确字段时读取。",
+    `回复协议文件：${input.resources.find((item) => item.key === "schema")?.path}`,
+    `协作上下文文件：${input.resources.find((item) => item.key === "context")?.path}`,
+  ].join("\n\n");
+  const schema = cliOutputSchema(input);
   return [
     input.context ? "你是 Seam 多方项目协作中的一个项目 Agent。你只代表 context.participant 指定的项目。" : "你是 Seam 项目本地 Connector 调用的 AI Agent。",
     input.conversationMode === "persistent" ? "这是 Seam 为本项目与当前协作维护的持久 Codex 会话，延续本线程历史；不是用户其他桌面对话。先读取本项目 AGENTS.md、README 和相关实现，保护现有工作树。" : "这是一个独立 CLI 执行轮次，并非用户桌面对话的续写。先读取本项目 AGENTS.md、README 和与任务相关的实现，保护现有工作树。",
@@ -70,6 +62,22 @@ export function buildPrompt(input: AgentRunInput) {
     "实施回执应包含本轮 jobId（如有）、相对文件路径、修改摘要、实际测试命令与结果、仍缺的内容；不得发布源码全集、密钥或本机绝对路径。",
     input.context ? `协作上下文：${JSON.stringify(input.context)}` : `本轮任务：${input.prompt ?? ""}`,
   ].join("\n\n");
+}
+
+function cliOutputSchema(input: AgentRunInput) {
+  const schema = z.toJSONSchema(agentTurnResultSchema);
+  const phase = input.context?.lifecycle?.phase;
+  if (phase && isRecord(schema.properties) && isRecord(schema.properties.actions)) {
+    const allowed = new Set(lifecycleActions(input.context?.lifecycle?.paused ? "paused" : phase));
+    const actions = schema.properties.actions;
+    if (isRecord(actions.items)) {
+      for (const union of ["oneOf", "anyOf"]) {
+        if (Array.isArray(actions.items[union])) actions.items[union] = actions.items[union].filter((option) => isRecord(option) && isRecord(option.properties) && isRecord(option.properties.type) && allowed.has(String(option.properties.type.const)));
+      }
+      if (allowed.size === 0) { actions.maxItems = 0; actions.items = false; }
+    }
+  }
+  return schema;
 }
 
 export function parseAgentOutput(raw: string): AgentTurnResult {

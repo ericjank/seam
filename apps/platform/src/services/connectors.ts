@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { gt, and, asc, desc, eq, lte } from "drizzle-orm";
+import { gt, and, asc, desc, eq, lte, isNull } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
 import { agents, collaborations, connectorJobs, auditEvents } from "@/db/schema";
 import { hashToken, newId } from "@/lib/ids";
@@ -44,17 +44,17 @@ export async function heartbeat(agentId: string, capabilities?: {
       await db.insert(auditEvents).values({ id: newId(), actorType: "connector", actorId: agentId, action: "connector.capabilities", metadata: capabilities });
     }
   }
-  let jobState: { cancelRequested: boolean; leaseUntil?: string } | undefined;
+  let jobState: { cancelRequested: boolean; leaseUntil?: string; cancellationAcknowledged?: boolean; receiptRejected?: boolean } | undefined;
   if (activeJob) {
     const [job] = await db.select().from(connectorJobs).where(and(eq(connectorJobs.id, activeJob.id), eq(connectorJobs.agentId, agentId))).limit(1);
     const current = job && job.attempts === activeJob.attempts;
-    if (activeJob.cancelled && current && job.status === "cancelled") await db.update(connectorJobs).set({ cancellationAckAt: new Date(), updatedAt: new Date() }).where(eq(connectorJobs.id, job.id));
+    if (activeJob.cancelled && current && job.status === "cancelled" && !job.cancellationAckAt) await db.update(connectorJobs).set({ cancellationAckAt: new Date(), updatedAt: new Date() }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.attempts, activeJob.attempts), isNull(connectorJobs.cancellationAckAt)));
     const valid = current && job.status === "running" && job.leaseUntil && job.leaseUntil.getTime() > Date.now();
     if (valid) {
       const leaseUntil = new Date(Date.now() + 20 * 60 * 1000);
       const [renewal] = await db.update(connectorJobs).set({ leaseUntil, updatedAt: new Date() }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, activeJob.attempts), gt(connectorJobs.leaseUntil, new Date())));
       jobState = renewal.affectedRows === 1 ? { cancelRequested: false, leaseUntil: leaseUntil.toISOString() } : { cancelRequested: true };
-    } else jobState = { cancelRequested: true };
+    } else jobState = { cancelRequested: true, ...(activeJob.cancelled ? current && job.status === "cancelled" ? { cancellationAcknowledged: true } : { receiptRejected: true } : {}) };
   }
   await drainWorkflowWakeups({ agentId });
   return jobState;

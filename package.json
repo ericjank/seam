@@ -22,6 +22,7 @@
     "test:lifecycle": "pnpm --filter @seam/platform exec tsx tests/lifecycle-integration.ts",
     "test:simulation:fixtures": "node --test scripts/simulation/joint-fixture.test.mjs",
     "test:simulation:cancel": "pnpm --filter @seam/connector... build && node scripts/simulation/cancellation.mjs",
+    "test:simulation:recovery": "pnpm --filter @seam/connector... build && node scripts/simulation/recovery.mjs",
     "test:simulation:regression": "docker compose -f docker-compose.simulation.yml exec -T app node scripts/simulation/regression.mjs"
   },
   "devDependencies": {

@@ -9,6 +9,12 @@ export type JournalEntry = {
   jobId: string; attempts: number; state: "running" | "pending" | "acknowledged" | "rejected";
   result?: Record<string, unknown>; error?: string; rejection?: string; updatedAt: string;
 };
+export type ControlReceipt = { jobId: string; attempts: number; state: "pending" | "acknowledged" | "rejected"; reason?: string };
+export type ExecutionCheckpoint = {
+  revision: number; approvedHash: string; approvedBaseline: import("@seam/protocol").LifecycleContext["contributions"][number]["baseline"];
+  current: import("@seam/protocol").LifecycleContext["contributions"][number]["baseline"];
+  state: "running" | "recoverable" | "completed"; jobId: string;
+};
 
 export class ExecutionJournal {
   readonly directory: string;
@@ -39,4 +45,22 @@ export class ExecutionJournal {
     await this.save({ jobId: job.id, attempts: job.attempts, state: "running" });
     return null;
   }
+  private async write(name: string, value: unknown) {
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    const temporary = join(this.directory, `${name}.${randomUUID()}.tmp`);
+    await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+    await rename(temporary, join(this.directory, name));
+  }
+  async saveControl(receipt: ControlReceipt) { await this.write(`control-${receipt.jobId}-${receipt.attempts}.json`, receipt); }
+  async pendingControls(): Promise<ControlReceipt[]> {
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    const names = (await readdir(this.directory)).filter((name) => /^control-[a-f0-9-]{36}-\d+\.json$/i.test(name));
+    const rows = await Promise.all(names.map(async (name) => JSON.parse(await readFile(join(this.directory, name), "utf8")) as ControlReceipt));
+    return rows.filter((row) => row.state === "pending");
+  }
+  async checkpoint(collaborationId: string): Promise<ExecutionCheckpoint | null> {
+    try { return JSON.parse(await readFile(join(this.directory, `checkpoint-${collaborationId}.json`), "utf8")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+  }
+  async saveCheckpoint(collaborationId: string, value: ExecutionCheckpoint) { await this.write(`checkpoint-${collaborationId}.json`, value); }
 }

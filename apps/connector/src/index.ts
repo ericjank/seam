@@ -2,13 +2,14 @@ import { createAgentAdapter, describeExecutionPolicy } from "@seam/agent-adapter
 import { createHash } from "node:crypto";
 import { collaborationContextSchema } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
-import { ExecutionJournal, type JournalEntry } from "./journal.js";
+import { ExecutionJournal, type JournalEntry, type ExecutionCheckpoint, type ControlReceipt } from "./journal.js";
 import { withWorkspaceLock, workspaceBaseline } from "./workspace.js";
 import { PlatformError, PlatformClient } from "./client.js";
 import { createA2AHandler } from "./a2a.js";
 import { CredentialStore } from "./credential-store.js";
 import { assertOutboundPolicy } from "./outbound-policy.js";
 import { runLocalTest } from "./local-test.js";
+import { attachCommandEvidence, captureCommand, probeServices, ServiceReadinessError } from "./evidence.js";
 
 export async function runConnector(config: ConnectorConfig) {
   const adapter = createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox, appServerStateDir: config.appServerStateDir, codexNetworkAccess: config.codexNetworkAccess });
@@ -40,6 +41,11 @@ export async function runConnector(config: ConnectorConfig) {
     executionMode: config.adapter === "codex" || config.adapter === "codex-app-server" ? config.codexSandbox ?? "read-only" : "external" as const,
     testConfigured: Boolean(process.env.SEAM_TEST_COMMAND),
   };
+  const deliverControl = async (entry: ControlReceipt) => {
+    const response = await client.heartbeat(capabilities, AbortSignal.timeout(15_000), { id: entry.jobId, attempts: entry.attempts, cancelled: true });
+    if (response.jobState?.cancellationAcknowledged) await journal.saveControl({ ...entry, state: "acknowledged" });
+    else if (response.jobState?.receiptRejected) await journal.saveControl({ ...entry, state: "rejected", reason: "停止确认对应任务或领取轮次已失效" });
+  };
   await client.heartbeat(capabilities);
   let heartbeatPending = false;
   let heartbeatStopped = false;
@@ -65,6 +71,9 @@ export async function runConnector(config: ConnectorConfig) {
   do {
     let phase = "领取任务";
     try {
+      for (const entry of await journal.pendingControls()) {
+        try { await deliverControl(entry); } catch (error) { console.error("停止确认待重发", error instanceof Error ? error.message : "中心暂不可达"); }
+      }
       // Drain durable receipts before claiming any new local work.
       for (const entry of await journal.pending()) {
         try { await deliver(entry); } catch (error) {
@@ -84,6 +93,9 @@ export async function runConnector(config: ConnectorConfig) {
         if (cached) { result = cached.result; executionError = cached.error; }
         else await withWorkspaceLock(config.projectRoot, controller.signal, async () => {
           const before = await workspaceBaseline(config.projectRoot);
+          let checkpoint: ExecutionCheckpoint | undefined;
+          let finished = false;
+          try {
           const credentialIds = Array.isArray(job.payload.credentialIds) ? job.payload.credentialIds : [];
           for (const credentialId of credentialIds) {
             if (typeof credentialId !== "string" || await credentialStore.get(credentialId)) continue;
@@ -93,15 +105,36 @@ export async function runConnector(config: ConnectorConfig) {
           if (job.kind === "collaboration.turn") {
             const context = collaborationContextSchema.parse(job.payload.context);
             const planned = context.lifecycle?.contributions.find((item) => item.participantId === context.participant.id)?.baseline;
-            if (context.lifecycle?.phase === "executing" && planned && (!before || planned.head !== before.head || planned.treeHash !== before.treeHash)) {
+            const saved = context.lifecycle?.phase === "executing" ? await journal.checkpoint(context.collaborationId) : null;
+            const same = (a: typeof before | undefined, b: typeof before | undefined) => Boolean(a && b && a.head === b.head && a.treeHash === b.treeHash);
+            const resuming = Boolean(saved?.state === "recoverable" && saved.revision === context.lifecycle?.revision && saved.approvedHash === context.lifecycle?.approvedHash && same(saved.approvedBaseline, planned) && same(saved.current, before));
+            if (context.lifecycle?.phase === "executing" && planned && !same(planned, before) && !resuming) {
               result = { agentTurn: { message: "工作区基线已变化或无法核对，已停止实施，请核对基线并重新批准。", actions: [{ type: "execution.report", revision: context.lifecycle.revision, status: "failed", summary: before ? "批准文档对应的代码基线已变化，未执行代码修改。" : "当前工作区基线无法读取，不能核对已批准版本，未执行代码修改。", evidence: { planned, current: before } }] } };
               return;
             }
-            const input = { context, signal: controller.signal, projectRoot: config.projectRoot, jobPayloadHash: createHash("sha256").update(JSON.stringify(job.payload)).digest("hex") };
+            if (context.lifecycle?.phase === "executing" && context.lifecycle.approvedHash && before && planned) {
+              checkpoint = { revision: context.lifecycle.revision, approvedHash: context.lifecycle.approvedHash, approvedBaseline: planned, current: before, state: "running", jobId: job.id };
+              await journal.saveCheckpoint(context.collaborationId, checkpoint);
+            }
+            const runs: import("@seam/protocol").CommandEvidence[] = [];
+            const collect = (record: Parameters<typeof captureCommand>[0], source: import("@seam/protocol").CommandEvidence["source"]) => { const run = captureCommand(record, config.projectRoot, source); if (run) runs.push(run); };
+            if (context.lifecycle?.phase === "joint_verifying" && process.env.SEAM_TEST_COMMAND) {
+              await runLocalTest(config.projectRoot, controller.signal, { SEAM_SERVICE_URL: context.lifecycle.services[0]?.baseUrl ?? "", SEAM_REVISION: String(context.lifecycle.revision) }, (record) => collect(record, "local-test"));
+              context.lifecycle.evidenceRuns.push(...runs.map((run) => ({ ...run, participantId: context.participant.id })));
+            }
+            const input = { context, signal: controller.signal, projectRoot: config.projectRoot, resuming, onCommand: (record: Parameters<typeof captureCommand>[0]) => collect(record, "codex-app-server"), jobPayloadHash: createHash("sha256").update(JSON.stringify(job.payload)).digest("hex") };
             const agentTurn = assertOutboundPolicy(await adapter.run(input), config.projectRoot);
+            attachCommandEvidence(agentTurn, context, runs);
+            try { await probeServices(agentTurn, controller.signal); }
+            catch (error) {
+              if (!(error instanceof ServiceReadinessError) || !context.lifecycle) throw error;
+              agentTurn.actions = [{ type: "workflow.blocked", revision: context.lifecycle.revision, kind: "retryable", reason: error.message, dependencyParticipantIds: [], retryAfterSeconds: 5 }];
+              agentTurn.message = error.message;
+            }
             for (const action of agentTurn.actions) if (action.type === "plan.submit" && before) action.baseline = before;
             const conversation = await adapter.getConversation?.(input);
             result = { agentTurn, ...(conversation ? { conversation } : {}) };
+            finished = !agentTurn.needsHumanInput && agentTurn.actions.some((action) => action.type === "execution.report");
           } else if (job.kind === "a2a.message") {
             const response = await a2a.transport.handle(job.payload.request);
             if (Symbol.asyncIterator in Object(response)) throw new Error("Connector 不支持流式 A2A 请求");
@@ -118,7 +151,12 @@ export async function runConnector(config: ConnectorConfig) {
             const turn = result.agentTurn as { actions?: import("@seam/protocol").AgentAction[] } | undefined;
             for (const action of turn?.actions ?? []) {
               if (action.type === "execution.report") action.evidence = { ...action.evidence, workspace };
-              if (action.type === "integration.report") for (const check of action.checks) check.evidence = { ...check.evidence, workspace };
+            }
+          }
+          } finally {
+            if (checkpoint && job.collaborationId) {
+              const current = await workspaceBaseline(config.projectRoot);
+              await journal.saveCheckpoint(job.collaborationId, { ...checkpoint, current, state: current ? finished ? "completed" : "recoverable" : "running" });
             }
           }
         }, config.workspaceLockDir);
@@ -130,7 +168,9 @@ export async function runConnector(config: ConnectorConfig) {
       phase = `提交任务 ${job.id} 回执`;
       clearTimeout(active.leaseTimer);
       if (controller.signal.aborted) {
-        try { await client.heartbeat(capabilities, AbortSignal.timeout(15_000), { id: job.id, attempts: job.attempts, cancelled: true }); } catch {}
+        const control: ControlReceipt = { jobId: job.id, attempts: job.attempts, state: "pending" };
+        await journal.saveControl(control);
+        try { await deliverControl(control); } catch { /* Durable pending control is replayed independently of the old completion. */ }
       }
       active = undefined;
       const receipt: JournalEntry = { jobId: job.id, attempts: job.attempts, state: "pending", result, error: executionError, updatedAt: new Date().toISOString() };

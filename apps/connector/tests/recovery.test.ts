@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -8,6 +8,7 @@ import { readConfig } from "../src/config";
 import { ExecutionJournal } from "../src/journal";
 import { withWorkspaceLock, workspaceBaseline } from "../src/workspace";
 import { MockAgentAdapter } from "@seam/agent-adapters";
+import { collaborationContextSchema } from "@seam/protocol";
 
 let root: string;
 beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "seam-recovery-")); });
@@ -67,6 +68,56 @@ describe("本地执行与网络故障恢复", () => {
     expect((await journal.read(job.id))!.state).toBe("running");
   });
   it("非Git项目明确不提供Git基线，不伪造版本", async () => { expect(await workspaceBaseline(root)).toBeNull(); });
+  it("停止确认丢失时保留独立持久队列，重启仅重传确认并最终收敛", async () => {
+    const config = readConfig(["--once"], { SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "test-only", SEAM_PROJECT_ROOT: root });
+    config.stateDir = join(root, "state");
+    const journal = new ExecutionJournal(config), jobId = crypto.randomUUID();
+    await journal.saveControl({ jobId, attempts: 3, state: "pending" });
+    let lost = true; const controls: unknown[] = [];
+    vi.spyOn(console, "log").mockImplementation(() => {}); vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal("fetch", vi.fn(async (url: string, options: any) => {
+      const body = JSON.parse(options.body);
+      if (body.activeJob?.cancelled) { controls.push(body.activeJob); if (lost) throw new Error("stop ACK response lost"); return Response.json({ jobState: { cancelRequested: true, cancellationAcknowledged: true } }); }
+      return Response.json(url.endsWith("/poll") ? { job: null } : { ok: true });
+    }));
+    await runConnector(config); expect(await journal.pendingControls()).toHaveLength(1);
+    lost = false; await runConnector(config);
+    expect(await new ExecutionJournal(config).pendingControls()).toEqual([]);
+    expect(controls).toEqual([{ id: jobId, attempts: 3, cancelled: true }, { id: jobId, attempts: 3, cancelled: true }]);
+  });
+  it.each(["same", "external-change", "new-revision", "new-approval"])("部分合法修改的恢复检查点：%s", async (condition) => {
+    const project = join(root, "project"); await mkdir(project);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: project, stdio: "pipe" });
+    git("init", "--quiet"); await writeFile(join(project, "service.mjs"), "export const step=0;\n"); git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@seam.test", "commit", "--quiet", "-m", "fixture");
+    const baseline = await workspaceBaseline(project);
+    const config = readConfig(["--once"], { SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "test-only", SEAM_PROJECT_ROOT: project }); config.stateDir = join(root, "state"); config.workspaceLockDir = join(root, "locks");
+    const id = crypto.randomUUID(), collaborationId = crypto.randomUUID(), hash = "a".repeat(64);
+    const context = collaborationContextSchema.parse({ collaborationId, title: "resume", type: "custom", status: "in_progress", objective: "continue approved partial changes", participant: { id, projectId: crypto.randomUUID(), projectName: "fixture", agentId: config.agentId, agentName: "mock", role: "consumer", approvalRequired: true, status: "active" }, participants: [], messages: [], artifacts: [], workItems: [], lifecycle: { revision: 1, phase: "executing", requirements: "fixture", document: "approved document", documentHash: hash, approvedHash: hash, requiredParticipantIds: [id], contributions: [{ participantId: id, content: "analysis", baseline }], confirmations: [id], reports: [], report: null } });
+    const journal = new ExecutionJournal(config); const receipts: any[] = [];
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubGlobal("fetch", vi.fn(async (url: string, options: any) => { if (url.endsWith("/poll")) return Response.json({ job: { id: crypto.randomUUID(), agentId: config.agentId, collaborationId, kind: "collaboration.turn", attempts: 1, payload: { context } } }); if (url.endsWith("/complete")) receipts.push(JSON.parse(options.body)); return Response.json({ ok: true }); }));
+    const run = vi.spyOn(MockAgentAdapter.prototype, "run").mockImplementation(async () => {
+      await writeFile(join(project, "service.mjs"), "export const step=1;\n");
+      return { message: "合法部分修改后等待本地服务就绪", kind: "status", needsHumanInput: false, notifyParticipantIds: [], actions: [{ type: "workflow.blocked", revision: 1, kind: "retryable", reason: "服务进程尚未就绪，等待本地真实探测。", dependencyParticipantIds: [], retryAfterSeconds: 5 }] };
+    });
+    await runConnector(config); expect((await journal.checkpoint(collaborationId))!.state).toBe("recoverable");
+    if (condition === "external-change") await writeFile(join(project, "service.mjs"), "external unrelated modification\n");
+    if (condition === "new-revision") context.lifecycle!.revision = 2;
+    if (condition === "new-approval") context.lifecycle!.approvedHash = "b".repeat(64);
+    run.mockImplementation(async (input) => { expect(input.resuming).toBe(true); expect(await readFile(join(project, "service.mjs"), "utf8")).toContain("step=1"); await writeFile(join(project, "service.mjs"), "export const step=2;\n"); return { message: "续接完成", kind: "status", needsHumanInput: false, notifyParticipantIds: [], actions: [{ type: "execution.report", revision: 1, status: "passed", summary: "继续剩余步骤", evidence: {}, runs: [] }] }; });
+    await runConnector(config);
+    expect(run).toHaveBeenCalledTimes(condition === "same" ? 2 : 1);
+    expect(receipts[1].result.agentTurn.actions[0]).toMatchObject({ type: "execution.report", status: condition === "same" ? "passed" : "failed" });
+  });
+  it("文件名和内容边界、可执行位及符号链接都参与指纹，子目录视图一致", async () => {
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
+    git("init", "--quiet"); await writeFile(join(root, "tracked"), "base"); git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@seam.test", "commit", "--quiet", "-m", "fixture");
+    await writeFile(join(root, "a"), "bc"); const first = await workspaceBaseline(root); await rm(join(root, "a")); await writeFile(join(root, "ab"), "c");
+    const second = await workspaceBaseline(root); expect(first!.treeHash).not.toBe(second!.treeHash);
+    await chmod(join(root, "ab"), 0o755); const executable = await workspaceBaseline(root); expect(executable!.treeHash).not.toBe(second!.treeHash);
+    await symlink("missing-target-one", join(root, "link")); const linked = await workspaceBaseline(root); expect(linked).not.toBeNull(); await rm(join(root, "link")); await symlink("missing-target-two", join(root, "link")); expect((await workspaceBaseline(root))!.treeHash).not.toBe(linked!.treeHash);
+    await mkdir(join(root, "nested")); expect((await workspaceBaseline(join(root, "nested")))!.treeHash).toBe((await workspaceBaseline(root))!.treeHash);
+  });
   it.each(["changed", "unavailable"])("已批准基线%s时，在调用Agent前停止实施并提交失败证据", async (condition) => {
     const project = join(root, "project"); await mkdir(project);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: project, stdio: "pipe" });

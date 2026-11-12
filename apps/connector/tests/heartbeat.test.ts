@@ -7,7 +7,7 @@ import { readConfig } from "../src/config";
 import { runConnector } from "../src/index";
 
 vi.mock("../src/workspace.js", () => ({ withWorkspaceLock: vi.fn(async (_root, _signal, run) => run()), workspaceBaseline: vi.fn(async () => null) }));
-vi.mock("../src/journal.js", () => ({ ExecutionJournal: class { async pending() { return []; } async begin() { return null; } async save() {} } }));
+vi.mock("../src/journal.js", () => ({ ExecutionJournal: class { async pending() { return []; } async pendingControls() { return []; } async saveControl() {} async begin() { return null; } async save() {} } }));
 vi.mock("../src/local-test.js", () => ({ runLocalTest: vi.fn() }));
 let stateRoot: string;
 beforeEach(async () => { stateRoot = await mkdtemp(join(tmpdir(), "seam-connector-test-")); });

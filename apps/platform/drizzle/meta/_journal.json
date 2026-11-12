@@ -29,6 +29,13 @@
       "when": 1794479940454,
       "tag": "0003_quick_ultimates",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1794488378760,
+      "tag": "0004_overjoyed_firestar",
+      "breakpoints": true
     }
   ]
 }

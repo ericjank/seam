@@ -266,6 +266,9 @@ export const lifecycleContributions = mysqlTable("lifecycle_contributions", {
   reportSummary: longtext("report_summary"),
   reportEvidence: json("report_evidence").$type<Record<string, unknown>>(),
   integrationChecks: json("integration_checks").$type<import("@seam/protocol").LifecycleContext["integrationReports"][number]["checks"]>(),
+  block: json("block").$type<Omit<import("@seam/protocol").LifecycleContext["blocks"][number], "participantId"> | null>(),
+  services: json("services").$type<Omit<import("@seam/protocol").LifecycleContext["services"][number], "participantId">[]>(),
+  evidenceRuns: json("evidence_runs").$type<import("@seam/protocol").CommandEvidence[]>(),
   ...timestamps,
 }, (table) => [uniqueIndex("lifecycle_contributions_collab_revision_participant_unique").on(table.collaborationId, table.revision, table.participantId)]);
 

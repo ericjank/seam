@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, realpath } from "node:fs/promises";
+import { lstat, mkdir, readFile, readlink, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -20,13 +20,21 @@ export async function withWorkspaceLock<T>(root: string, signal: AbortSignal, ru
 }
 
 export async function workspaceBaseline(root: string): Promise<z.infer<typeof workspaceBaselineSchema> | null> {
-  const git = (args: string[]) => execFileAsync("git", args, { cwd: root, maxBuffer: 16 * 1024 * 1024, timeout: 15_000 });
   try {
+    const { stdout: top } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: root, timeout: 5000 });
+    const canonical = await realpath(top.trim());
+    const git = (args: string[]) => execFileAsync("git", args, { cwd: canonical, maxBuffer: 16 * 1024 * 1024, timeout: 15_000 });
     const [{ stdout: head }, { stdout: diff }, { stdout: untracked }] = await Promise.all([
-      git(["rev-parse", "HEAD"]), git(["diff", "--no-ext-diff", "--binary", "HEAD", "--"]), git(["ls-files", "--others", "--exclude-standard", "-z"]),
+      git(["rev-parse", "HEAD"]), git(["diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "--no-renames", "HEAD", "--"]), git(["ls-files", "--others", "--exclude-standard", "-z"]),
     ]);
-    const hash = createHash("sha256").update(diff);
-    for (const path of untracked.split("\0").filter(Boolean).sort()) hash.update(path).update(await readFile(join(root, path)));
+    const files: unknown[] = [];
+    for (const path of untracked.split("\0").filter(Boolean).sort()) {
+      const file = join(canonical, path), info = await lstat(file);
+      if (!info.isFile() && !info.isSymbolicLink()) throw new Error("无法核对未跟踪目录");
+      files.push([path, info.isSymbolicLink() ? "symlink" : "file", info.mode & 0o777,
+        createHash("sha256").update(info.isSymbolicLink() ? await readlink(file) : await readFile(file)).digest("hex")]);
+    }
+    const hash = createHash("sha256").update("seam-workspace-v2\0").update(JSON.stringify([diff, files]));
     return { head: head.trim(), treeHash: hash.digest("hex"), capturedAt: new Date().toISOString() };
   } catch { return null; }
 }

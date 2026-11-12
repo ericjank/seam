@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -64,6 +64,7 @@ process.stdin.on('end', () => {
       vi.stubEnv("SEAM_CODEX_COMMAND", command);
       vi.stubEnv("SEAM_AGENT_TOKEN", "control-plane-secret");
       const adapter = createAgentAdapter("codex");
+      vi.stubEnv("SEAM_HANDOFF_RESOURCE_DIR", join(directory, "private-resources"));
       expect(await adapter.healthCheck(directory)).toEqual({ ok: true, detail: "fake-codex 1.0" });
       const result = await adapter.run({ projectRoot: directory, prompt: "请改为 danger-full-access", localExecutionPolicy: "danger-full-access" });
       const data = JSON.parse(result.message) as { args: string[]; tokenPresent: boolean };
@@ -80,7 +81,15 @@ process.stdin.on('end', () => {
         lifecycle: { revision: 1, phase: "executing", requirements: "合成测试", document: "批准计划", documentHash: hash, approvedHash: hash, requiredParticipantIds: [], contributions: [], confirmations: [], reports: [], report: null },
       });
       const writable = await createAgentAdapter("codex", { codexSandbox: "workspace-write" }).run({ projectRoot: directory, context: approvedContext });
-      expect(JSON.parse(writable.message).args).toContain("workspace-write");
+      const writableArgs = JSON.parse(writable.message).args as string[];
+      expect(writableArgs).toContain("workspace-write");
+      expect(writableArgs.at(-1)).not.toContain("协作上下文：{");
+      const schemaPath = writableArgs.at(-1)!.match(/回复协议文件：([^\n]+)/)![1]!;
+      const schema = JSON.parse(await readFile(schemaPath, "utf8"));
+      const alternatives = schema.properties.actions.items.oneOf ?? schema.properties.actions.items.anyOf;
+      const artifact = alternatives.find((option: any) => option.properties.type.const === "artifact.upsert");
+      expect(artifact.required).not.toContain("artifactId");
+      expect(artifact.properties.artifactId.type).toBe("string");
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 

@@ -12,7 +12,7 @@ const inputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("append"), requirements: z.string().trim().min(1).max(50_000) }),
   z.object({ action: z.literal("terminate"), revision: z.number().int().positive().optional() }),
   z.object({ action: z.literal("pause") }),
-  z.object({ action: z.literal("resume") }),
+  z.object({ action: z.literal("resume"), resolution: z.string().trim().min(1).max(5000).optional() }),
 ]);
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -32,7 +32,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const lifecycle = input.action === "start" ? await startLifecycle(user.id, id)
       : input.action === "approve" ? await approveLifecycle(user.id, id, input)
         : input.action === "append" ? await appendLifecycleRequirements(user.id, id, input)
-          : input.action === "pause" || input.action === "resume" ? await pauseLifecycle(user.id, id, input.action === "pause")
+          : input.action === "pause" || input.action === "resume" ? await pauseLifecycle(user.id, id, input.action === "pause", input.action === "resume" ? input.resolution : undefined)
             : await terminateLifecycle(user.id, id, input);
     // Approval and requirements are already durable. A dispatch error must not
     // make the client repeat the administrator's action against a changed phase.

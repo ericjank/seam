@@ -56,9 +56,9 @@ async function claim(local: Local): Promise<Claimed> {
 function content(local: Local, extra = "") {
   return `# ${local.agentId} 的完整开发贡献\n\n${"读取合成项目，明确接口边界与实施步骤，审批前只读，审批后实际执行并提交测试证据。".repeat(4)}\n\n${extra}`;
 }
-async function complete(local: Local, job: Claimed, action: Record<string, unknown>, status = 200) {
+async function complete(local: Local, job: Claimed, action: Record<string, unknown> | Record<string, unknown>[], status = 200) {
   const body = { agentId: local.agentId, jobId: job.id, attempts: job.attempts, status: "completed", result: { agentTurn: {
-    message: "确定性 HTTP 负例测试回执；本回执不代表真实业务实施", kind: "status", actions: [action], notifyParticipantIds: [], needsHumanInput: false,
+    message: "确定性 HTTP 负例测试回执；本回执不代表真实业务实施", kind: "status", actions: Array.isArray(action) ? action : [action], notifyParticipantIds: [], needsHumanInput: false,
   } } };
   if (status === 200) return api("/api/connectors/complete", body, { token: local.token });
   await expected("/api/connectors/complete", body, status, { token: local.token });
@@ -159,12 +159,21 @@ async function main() {
   await expected(`${path}/lifecycle`, { action: "terminate", revision: 2 }, 409);
   checks.push("完成回执重复提交幂等，动作只应用一次；双方实施收齐后必须进入独立联合验收");
 
-  for (const [index, local] of [first, second].entries()) {
+  const jointAction = (job: Claimed, status: string) => ({ type: "integration.report", revision: 2, documentHash: verifying.documentHash,
+    checks: verifying.contract.acceptanceCases.filter((item: any) => item.runnerParticipantId === job.payload.context.participant.id).map((item: any) => ({ caseId: item.id, status, command: item.command, summary: "合成协议用例，明确记录未执行状态", evidence: { synthetic: true } })),
+  });
+  const waitingJob = await claim(first);
+  await complete(first, waitingJob, [jointAction(waitingJob, "not_run"), { type: "workflow.blocked", revision: 2, kind: "waiting_peer", reason: "合成故障复现：当前服务不可达，未执行并等待对端恢复。", dependencyParticipantIds: [verifying.requiredParticipantIds.find((id: string) => id !== waitingJob.payload.context.participant.id)], retryAfterSeconds: 5 }]);
+  const waiting = await detail();
+  assert.equal(waiting.lifecycle.phase, "joint_verifying"); assert.equal(waiting.lifecycle.report, null);
+  assert.equal(waiting.lifecycle.integrationReports.length, 0); assert.equal(waiting.lifecycle.blocks[0].kind, "waiting_peer");
+  const storedWait = waiting.jobs.find((job: any) => job.id === waitingJob.id);
+  assert.equal(storedWait.status, "completed"); // Public job summaries intentionally omit the original result body.
+  await lifecycle({ action: "resume", resolution: "合成协议测试补充服务恢复事实，仅验证阻塞续接，不代表真实HTTP就绪。" });
+  checks.push("未执行说明与等待并存时保留原始回执，只应用阻塞不提前出报告，补充事实后续接同一修订");
+  for (const [local, status] of [[second, "passed"], [first, "not_run"]] as const) {
     const job = await claim(local);
-    const peer = job.payload.context.participant.id;
-    await complete(local, job, { type: "integration.report", revision: 2, documentHash: verifying.documentHash,
-      checks: verifying.contract.acceptanceCases.filter((item: any) => item.runnerParticipantId === peer).map((item: any) => ({ caseId: item.id, status: index === 0 ? "not_run" : "passed", command: item.command, summary: "合成协议用例，明确记录未执行状态", evidence: { synthetic: true } })),
-    });
+    await complete(local, job, jointAction(job, status));
   }
   const reviewed = await detail();
   assert.equal(reviewed.lifecycle.phase, "awaiting_review"); assert.ok(reviewed.lifecycle.report.includes("未执行用例"));

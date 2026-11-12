@@ -60,7 +60,7 @@ vi.mock("@/services/collaborations", () => ({ addSystemMessage: vi.fn() }));
 vi.mock("@/services/workflow-outbox", () => ({ queueWorkflowWakeup: vi.fn(async () => {}), drainWorkflowWakeups: vi.fn(async () => {}) }));
 
 import { queueWorkflowWakeup, drainWorkflowWakeups } from "../src/services/workflow-outbox";
-import { completeConnectorJob, pollConnectorJob } from "../src/services/connectors";
+import { completeConnectorJob, pollConnectorJob, heartbeat } from "../src/services/connectors";
 import { advanceAgentWorkflow, completeAgentTurn, refreshAgentJobContext } from "../src/services/agent-engine";
 import { createWorkItem, updateWorkItem } from "../src/services/work-items";
 import { submitAcceptance } from "../src/services/acceptance";
@@ -82,6 +82,15 @@ beforeEach(() => {
 });
 
 describe("Connector 结果与任务领取", () => {
+  it("停止确认重复到达只确认原轮次，不重写已记录的停止时间；过期轮次明确拒绝", async () => {
+    const ackAt = new Date("2026-11-12T01:00:00Z");
+    state.queries.push([job({ status: "cancelled", cancellationAckAt: ackAt })]);
+    expect(await heartbeat("agent", undefined, { id: "job", attempts: 1, cancelled: true })).toMatchObject({ cancellationAcknowledged: true });
+    expect(state.updates.some((row) => row.cancellationAckAt)).toBe(false);
+    state.queries.push([job({ status: "cancelled", cancellationAckAt: ackAt })]);
+    expect(await heartbeat("agent", undefined, { id: "job", attempts: 2, cancelled: true })).toMatchObject({ receiptRejected: true });
+    expect(state.updates.some((row) => row.cancellationAckAt)).toBe(false);
+  });
   it("动作应用完成后才记录 completed，提交后才继续派发", async () => {
     state.queries.push([job()]);
     state.apply = async () => {
