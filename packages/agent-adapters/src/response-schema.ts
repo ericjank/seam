@@ -32,7 +32,7 @@ function nativeResponseSchema(input: AgentRunInput) {
     const submit = z.object({ type: z.literal("plan.submit"), revision: z.literal(lifecycle.revision), content: z.string().min(100).max(100_000) }).strict();
     switch (lifecycle.paused ? "paused" : lifecycle.phase) {
       case "planning": actions = [submit]; break;
-      case "plan_synthesis": actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: sharedContractSchema.required() }).strict()]; break;
+      case "plan_synthesis": actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: sharedContractSchema.extend({ acceptanceCases: z.array(sharedContractSchema.shape.acceptanceCases.element.required()).min(2).max(100) }).required() }).strict()]; break;
       case "plan_confirmation":
         actions = [submit];
         // A missing/invalid snapshot cannot be confirmed, even by a response

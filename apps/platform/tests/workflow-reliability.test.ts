@@ -82,6 +82,34 @@ beforeEach(() => {
 });
 
 describe("Connector 结果与任务领取", () => {
+  it("已断开的轮询不领取任务也不续租", async () => {
+    const controller = new AbortController(); controller.abort();
+    expect(await pollConnectorJob("agent", 20_000, controller.signal)).toBeNull();
+    expect(state.updates).toEqual([]);
+  });
+
+  it.each([false, true])("领取后断开连接只释放自己的轮次，不记作执行失败（刷新抛错=%s）", async (throws) => {
+    const controller = new AbortController();
+    state.queries.push([job({ status: "pending" })], [job({ attempts: 2 })]);
+    vi.mocked(refreshAgentJobContext).mockImplementationOnce(async () => { controller.abort(); if (throws) throw new Error("disconnected"); return {}; });
+    expect(await pollConnectorJob("agent", 0, controller.signal)).toBeNull();
+    expect(state.updates.at(-1)).toMatchObject({ status: "pending", leaseUntil: null });
+    expect(state.updates.some((row) => row.status === "failed")).toBe(false);
+    expect(completeAgentTurn).not.toHaveBeenCalled();
+  });
+
+  it("交付阶段只有一分钟租约，当前轮次确认后续为二十分钟", async () => {
+    const now = Date.now();
+    state.queries.push([job({ status: "pending", attempts: 0 })], [job()]);
+    await pollConnectorJob("agent", 0);
+    const delivery = state.updates.find((row) => row.status === "running")!;
+    expect(delivery.leaseUntil.getTime() - now).toBeGreaterThanOrEqual(60_000);
+    expect(delivery.leaseUntil.getTime() - now).toBeLessThan(61_000);
+    state.queries.push([job()]);
+    const acknowledged = await heartbeat("agent", undefined, { id: "job", attempts: 1 });
+    expect(acknowledged?.cancelRequested).toBe(false);
+    expect(Date.parse(acknowledged!.leaseUntil!) - now).toBeGreaterThanOrEqual(1_200_000);
+  });
   it("停止确认重复到达只确认原轮次，不重写已记录的停止时间；过期轮次明确拒绝", async () => {
     const ackAt = new Date("2026-11-12T01:00:00Z");
     state.queries.push([job({ status: "cancelled", cancellationAckAt: ackAt })]);

@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { agentTurnResultSchema, type AgentTurnResult } from "@seam/protocol";
+import { agentTurnResultSchema, tokenUsageBreakdownSchema, type AgentTurnResult, type AdapterTelemetry } from "@seam/protocol";
 import { checkCli } from "./cli.js";
 import { buildNativeHandoff, materializeHandoffResources, NATIVE_HANDOFF_VERSION, type HandoffCheckpoint } from "./handoff.js";
 import { parseNativeAgentOutput } from "./response-schema.js";
@@ -17,6 +17,7 @@ type Session = {
   lastTurnId?: string; lastJobId?: string; lastResult?: AgentTurnResult;
   lastInputHash?: string;
   lastHandoff?: HandoffCheckpoint;
+  title?: string; runLabel?: string; usageTotal?: NonNullable<AdapterTelemetry["tokenUsage"]>["threadTotal"]; lastTelemetry?: AdapterTelemetry;
 };
 const queues = new Map<string, Promise<void>>();
 const isRecord = (value: unknown): value is RecordValue => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -31,6 +32,8 @@ class AppServerConnection {
   private failed: Error | undefined;
   deniedRequests = 0;
   contextCompacted = false;
+  tokenUsage: NonNullable<AdapterTelemetry["tokenUsage"]> | null = null;
+  tokenUsageTurnId: string | undefined;
 
   constructor(projectRoot: string, private trackedThreadId?: string) {
     const env = { ...process.env };
@@ -70,6 +73,10 @@ class AppServerConnection {
       // A compaction may arrive after turn/completed in the same stdout chunk,
       // during resume/close, or before a failed/invalid final response.
       if (params.threadId === this.trackedThreadId) {
+        if (value.method === "thread/tokenUsage/updated" && isRecord(params.tokenUsage)) {
+          const total = tokenUsageBreakdownSchema.safeParse(params.tokenUsage.total), last = tokenUsageBreakdownSchema.safeParse(params.tokenUsage.last);
+          if (total.success && last.success && typeof params.turnId === "string") { this.tokenUsage = { threadTotal: total.data, lastModelCall: last.data, turnDelta: null }; this.tokenUsageTurnId = params.turnId; }
+        }
         const items = isRecord(params.turn) && Array.isArray(params.turn.items) ? params.turn.items : [];
         if (value.method === "thread/compacted"
           || (value.method === "item/completed" && isRecord(params.item) && params.item.type === "contextCompaction")
@@ -245,7 +252,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     try {
       const value: unknown = JSON.parse(await readFile(join(directory, `${key}.json`), "utf8"));
       if (!isRecord(value) || value.projectRoot !== projectRoot || value.collaborationId !== identity.collaborationId || value.participantId !== identity.participantId || typeof value.threadId !== "string") throw new Error("Codex 会话映射无效");
-      return { threadId: value.threadId, transport: "codex-app-server" as const };
+      return { threadId: value.threadId, transport: "codex-app-server" as const, ...(typeof value.title === "string" ? { title: value.title } : {}), ...(typeof value.runLabel === "string" ? { runLabel: value.runLabel } : {}) };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -272,6 +279,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           session = value as Session;
           if (input.context?.jobId && session.lastJobId === input.context.jobId && session.lastInputHash === inputHash && session.lastResult) {
             const cached = agentTurnResultSchema.parse(session.lastResult);
+            if (session.lastTelemetry) input.onTelemetry?.(session.lastTelemetry);
             await unlock();
             return cached;
           }
@@ -280,12 +288,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
         }
       }
       const connection = new AppServerConnection(projectRoot, session?.threadId);
+      let attemptedTurn = false, acceptedTurn = false;
       const save = async () => {
         const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
         try { await writeFile(temporary, JSON.stringify(session), { mode: 0o600, flag: "wx" }); await rename(temporary, path); }
         finally { await rm(temporary, { force: true }); }
       };
       try {
+        const startedAt = Date.now();
         await connection.initialize();
         const sandbox = codexSandboxForTurn(input, this.options);
         const base = { cwd: projectRoot, approvalPolicy: "never", sandbox };
@@ -296,13 +306,18 @@ export class CodexAppServerAdapter implements AgentAdapter {
         if (session && response.thread.id !== session.threadId) throw new Error("Codex 恢复的会话与本地映射不符");
         if (isRecord(response.thread.status) && response.thread.status.type === "active") throw new Error("Codex 会话已有进行中轮次；本次任务不会并发追加");
         if (identity && !session) {
-          session = { version: 1, threadId: response.thread.id, ...identity }; await save();
-          // A native title makes the opened chat recognizable in Codex. Naming
-          // is cosmetic and must not replace or derail a created conversation.
-          await connection.request("thread/name/set", { threadId: session.threadId, name: `Seam · ${input.context!.title} · ${input.context!.participant.projectName}`.slice(0, 200) }, 10_000).catch(() => {});
+          session = { version: 1, threadId: response.thread.id, ...identity, usageTotal: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, cacheWriteInputTokens: 0 } }; await save();
         }
-        const prepared = await materializeHandoffResources(input, join(directory, "resources"));
+        if (session) {
+          const runLabel = (process.env.SEAM_RUN_LABEL ?? "").replace(/[\r\n]/g, " ").slice(0, 40);
+          const short = (value: string) => value.replace(/\s+/g, " ").slice(0, 28);
+          const title = `Seam${runLabel ? ` [${runLabel}]` : ""} · ${short(input.context!.title)} · ${short(input.context!.participant.projectName)} · r${input.context!.lifecycle?.revision ?? 1}`;
+          if (session.title !== title) await connection.request("thread/name/set", { threadId: session.threadId, name: title }, 10_000).then(async () => { session!.title = title; session!.runLabel = runLabel; await save(); }).catch(() => {});
+        }
+        const prepared = await materializeHandoffResources(input, join(directory, "resources"), undefined, false);
         const handoff = buildNativeHandoff({ ...prepared, conversationMode: "persistent", localExecutionPolicy: `Codex App Server sandbox=${sandbox}，approval=never。当前策略由本地能力与平台批准的阶段交集决定；不得提升权限。` }, session?.lastHandoff);
+        let commandOutputBytes = 0, resourceCommandOutputBytes = 0, resourceReadCommands = 0;
+        attemptedTurn = true;
         const finished = await connection.turn(response.thread.id, {
           cwd: projectRoot, approvalPolicy: "never",
           sandboxPolicy: sandbox === "workspace-write"
@@ -310,21 +325,46 @@ export class CodexAppServerAdapter implements AgentAdapter {
             : { type: "readOnly", networkAccess: false },
           input: [{ type: "text", text: handoff.prompt }],
           outputSchema: handoff.outputSchema,
-        }, input.signal, input.onCommand);
+        }, input.signal, (record) => {
+          const bytes = Buffer.byteLength(record.output); commandOutputBytes += bytes;
+          if (record.command.includes(join(directory, "resources"))) { resourceReadCommands++; resourceCommandOutputBytes += bytes; }
+          input.onCommand?.(record);
+        });
         const result = parseNativeAgentOutput(finished.text, input);
+        const usage = connection.tokenUsageTurnId === finished.turnId ? connection.tokenUsage : null;
+        if (usage && session?.usageTotal) {
+          const before = session.usageTotal, delta = Object.fromEntries(Object.entries(usage.threadTotal).map(([key, value]) => [key, value - before[key as keyof typeof before]]));
+          const parsed = tokenUsageBreakdownSchema.safeParse(delta); if (parsed.success && parsed.data.totalTokens > 0) usage.turnDelta = parsed.data;
+        }
+        const telemetry: AdapterTelemetry = { version: 1, threadId: String(response.thread.id), turnId: finished.turnId,
+          jobId: input.context?.jobId, revision: input.context?.lifecycle?.revision, phase: input.context?.lifecycle?.phase,
+          promptBytes: Buffer.byteLength(handoff.prompt), schemaBytes: Buffer.byteLength(JSON.stringify(handoff.outputSchema)),
+          commandOutputBytes, resourceCommandOutputBytes, resourceReadCommands, durationMs: Date.now() - startedAt,
+          resourceStats: prepared.resourceStats ?? { createdBytes: 0, availableBytes: 0, files: 0, prunedFiles: 0 }, contextCompacted: connection.contextCompacted,
+          ...(typeof response.model === "string" ? { model: response.model } : {}), tokenUsage: usage };
+        // Telemetry is transport-observed metadata, outside the model's reply.
+        const telemetryDir = join(directory, "telemetry", key); await mkdir(telemetryDir, { recursive: true, mode: 0o700 });
+        await writeFile(join(telemetryDir, `${finished.turnId}.json`), JSON.stringify(telemetry), { mode: 0o600 });
+        input.onTelemetry?.(telemetry);
         if (session) {
           session.lastTurnId = finished.turnId; session.lastJobId = input.context?.jobId; session.lastInputHash = inputHash; session.lastResult = result;
+          session.lastTelemetry = telemetry;
+          if (usage) session.usageTotal = usage.threadTotal; else delete session.usageTotal;
           // Compaction can replace exact shared facts with a summary. A later
           // turn must receive a full handoff, even though this result is valid.
           if (connection.contextCompacted) delete session.lastHandoff;
           else session.lastHandoff = handoff.checkpoint;
           await save();
         }
+        acceptedTurn = true;
         return result;
       } finally {
         try { await connection.close(); }
         finally {
           try {
+            // A failed/interrupted turn can consume tokens without a final
+            // usage event. Never attribute that unknown cost to the next turn.
+            if (session && attemptedTurn && !acceptedTurn) { delete session.usageTotal; await save(); }
             if (session?.lastHandoff && connection.contextCompacted) {
               delete session.lastHandoff;
               await save();

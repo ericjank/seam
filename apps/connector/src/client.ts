@@ -21,7 +21,7 @@ export class PlatformClient {
   }
 
   async poll(): Promise<ConnectorJob | null> {
-    const response = await this.request("/api/connectors/poll", { agentId: this.config.agentId, waitMs: 20000 });
+    const response = await this.request("/api/connectors/poll", { agentId: this.config.agentId, waitMs: 0 }, AbortSignal.timeout(15_000));
     const job = response.job ? connectorJobSchema.parse(response.job) : null;
     if (job) this.attempts.set(job.id, job.attempts);
     return job;

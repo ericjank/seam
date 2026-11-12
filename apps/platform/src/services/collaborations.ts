@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { adapterTelemetrySchema } from "@seam/protocol";
 import { db } from "@/db";
 import {
   acceptanceRuns,
@@ -199,9 +200,10 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     auditEvents: auditRows,
     availableProjects,
     jobs: jobRows.map(({ result, ...job }) => {
-      const conversation = (result as { conversation?: { threadId?: unknown; transport?: unknown } } | null)?.conversation;
-      return { ...job, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)
-        ? { threadId: conversation.threadId, transport: "codex-app-server" as const } : null };
+      const record = result as { conversation?: { threadId?: unknown; transport?: unknown; title?: unknown; runLabel?: unknown }; telemetry?: unknown } | null;
+      const conversation = record?.conversation, telemetry = adapterTelemetrySchema.safeParse(record?.telemetry);
+      return { ...job, telemetry: telemetry.success ? telemetry.data : null, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)
+        ? { threadId: conversation.threadId, transport: "codex-app-server" as const, title: typeof conversation.title === "string" ? conversation.title.slice(0, 200) : "本机 Codex 对话", runLabel: typeof conversation.runLabel === "string" ? conversation.runLabel.slice(0, 40) : "" } : null };
     }),
     connectorCapabilities: agentIds.flatMap((agentId) => {
       const report = capabilityRows.find((row) => row.actorId === agentId);

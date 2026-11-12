@@ -82,13 +82,18 @@ export async function runConnector(config: ConnectorConfig) {
         }
       }
       const job = await client.poll();
-      if (!job) continue;
+      if (!job) { if (!config.once) await new Promise((resolve) => setTimeout(resolve, config.pollMs)); continue; }
       const controller = new AbortController();
-      active = { id: job.id, attempts: job.attempts, controller, leaseTimer: setTimeout(() => controller.abort(), 20 * 60 * 1000) };
-      renewLocalLease(job.leaseUntil ?? new Date(Date.now() + 20 * 60 * 1000).toISOString());
+      active = { id: job.id, attempts: job.attempts, controller, leaseTimer: setTimeout(() => controller.abort(), 60_000) };
+      renewLocalLease(job.leaseUntil ?? new Date(Date.now() + 60_000).toISOString());
       let result: Record<string, unknown> | undefined;
       let executionError: string | undefined;
       try {
+        const receipt = await client.heartbeat(capabilities, AbortSignal.timeout(15_000), { id: job.id, attempts: job.attempts });
+        if (receipt.jobState?.cancelRequested) controller.abort(new Error("领取轮次已失效或任务已取消"));
+        const expiresAt = Date.parse(receipt.jobState?.leaseUntil ?? "");
+        if (controller.signal.aborted || receipt.jobState?.cancelRequested || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error("任务领取未获当前轮次执行确认，未运行本机Agent");
+        renewLocalLease(receipt.jobState.leaseUntil);
         const cached = await journal.begin(job);
         if (cached) { result = cached.result; executionError = cached.error; }
         else await withWorkspaceLock(config.projectRoot, controller.signal, async () => {
@@ -122,10 +127,12 @@ export async function runConnector(config: ConnectorConfig) {
               await runLocalTest(config.projectRoot, controller.signal, { SEAM_SERVICE_URL: context.lifecycle.services[0]?.baseUrl ?? "", SEAM_REVISION: String(context.lifecycle.revision) }, (record) => collect(record, "local-test"));
               context.lifecycle.evidenceRuns.push(...runs.map((run) => ({ ...run, participantId: context.participant.id })));
             }
-            const input = { context, signal: controller.signal, projectRoot: config.projectRoot, resuming, onCommand: (record: Parameters<typeof captureCommand>[0]) => collect(record, "codex-app-server"), jobPayloadHash: createHash("sha256").update(JSON.stringify(job.payload)).digest("hex") };
+            let telemetry: import("@seam/protocol").AdapterTelemetry | undefined;
+            const input = { context, signal: controller.signal, projectRoot: config.projectRoot, resuming, onCommand: (record: Parameters<typeof captureCommand>[0]) => collect(record, "codex-app-server"),
+              onTelemetry: (record: import("@seam/protocol").AdapterTelemetry) => { telemetry = record; }, jobPayloadHash: createHash("sha256").update(JSON.stringify(job.payload)).digest("hex") };
             const agentTurn = assertOutboundPolicy(await adapter.run(input), config.projectRoot);
             attachCommandEvidence(agentTurn, context, runs);
-            try { await probeServices(agentTurn, controller.signal); }
+            try { await probeServices(agentTurn, controller.signal, context); }
             catch (error) {
               if (!(error instanceof ServiceReadinessError) || !context.lifecycle) throw error;
               agentTurn.actions = [{ type: "workflow.blocked", revision: context.lifecycle.revision, kind: "retryable", reason: error.message, dependencyParticipantIds: [], retryAfterSeconds: 5 }];
@@ -133,7 +140,7 @@ export async function runConnector(config: ConnectorConfig) {
             }
             for (const action of agentTurn.actions) if (action.type === "plan.submit" && before) action.baseline = before;
             const conversation = await adapter.getConversation?.(input);
-            result = { agentTurn, ...(conversation ? { conversation } : {}) };
+            result = { agentTurn, ...(conversation ? { conversation } : {}), ...(telemetry ? { telemetry } : {}) };
             finished = !agentTurn.needsHumanInput && agentTurn.actions.some((action) => action.type === "execution.report");
           } else if (job.kind === "a2a.message") {
             const response = await a2a.transport.handle(job.payload.request);

@@ -6,13 +6,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { jointFixture } from "./joint-fixture.mjs";
+import { jointFixture, providerReadinessApproved } from "./joint-fixture.mjs";
 import { providerServerSource } from "./provider-server.mjs";
 
 const exec = promisify(execFile);
+test("structured readiness review accepts complete contract without duplicate interface keywords", () => {
+  const expected = { name: "quote", publisherParticipantId: "provider", healthPath: "/health", status: 200, bodyChecks: [{ path: "ready", equals: true }, { path: "revision", equals: 4 }] };
+  const contract = service => ({ interfaces: [{ definition: "POST /quote uses JSON" }], serviceExpectations: [service] });
+  assert.equal(providerReadinessApproved(contract(expected), "provider", 4), true);
+  for (const patch of [{ publisherParticipantId: "other" }, { healthPath: "/wrong" }, { status: 201 }, { bodyChecks: [{ path: "ready", equals: true }, { path: "revision", equals: 3 }] }, { bodyChecks: [{ path: "ready", equals: false }, { path: "revision", equals: 4 }] }, { bodyChecks: [] }]) {
+    assert.equal(providerReadinessApproved(contract({ ...expected, ...patch }), "provider", 4), false);
+  }
+});
 for (const scenario of [
   { name: "revision 1 full HTTP contract", revision: 1, passed: true },
   { name: "revision 2 full HTTP contract", revision: 2, passed: true },
+  { name: "revision 3 replaces quantity limit", revision: 3, passed: true },
+  { name: "revision 4 restores previous quantity limit", revision: 4, passed: true },
+  { name: "revision 5 retires discount support", revision: 5, passed: true },
   { name: "wrong SKU-002 amount is detected", revision: 1, wrongSku: true, passed: false },
   { name: "client ignoring HTTP errors is detected", revision: 1, ignoreError: true, passed: false },
   { name: "revision 2 missing discount fields is detected", revision: 2, missingDiscount: true, passed: false },
@@ -30,10 +41,11 @@ for (const scenario of [
       received++;
       const input = JSON.parse(raw);
       const prices = { "SKU-001": 12000, "SKU-002": scenario.wrongSku ? 4400 : 4500 };
-      if (!Object.hasOwn(prices, input.sku) || !Number.isInteger(input.quantity) || input.quantity < 1 || input.quantity > 100) throw new Error("invalid input");
+      if (!Object.hasOwn(prices, input.sku) || !Number.isInteger(input.quantity) || input.quantity < 1 || input.quantity > (scenario.revision===3?50:100)) throw new Error("invalid input");
+      if(scenario.revision===5 && Object.hasOwn(input,"discountPercent"))throw new Error("retired discount");
       const subtotal = prices[input.sku] * input.quantity;
       const result = { sku: input.sku, quantity: input.quantity, subtotal, currency: "CNY" };
-      if (scenario.revision === 2 && !scenario.missingDiscount) {
+      if (scenario.revision >= 2 && scenario.revision <= 4 && !scenario.missingDiscount) {
         const percent = input.discountPercent === undefined ? 0 : input.discountPercent;
         if (!Number.isInteger(percent) || percent < 0 || percent > 100) throw new Error("invalid discount");
         result.discount = Math.floor(subtotal * percent / 100); result.total = subtotal - result.discount;
@@ -53,7 +65,7 @@ for (const scenario of [
     assert.equal(succeeded, scenario.passed, output.stdout);
     if (scenario.ready === false || scenario.healthRevision) assert.equal(received, 0, "unready/old services must not receive quote requests");
     else assert.ok(received >= 4, "the oracle must call the actual peer over HTTP");
-    if (scenario.passed) assert.match(output.stdout, new RegExp(`# pass ${scenario.revision === 1 ? 10 : 14}\\b`));
+    if (scenario.passed) assert.match(output.stdout, new RegExp(`# pass ${scenario.revision === 1 ? 10 : scenario.revision===5 ? 11 : 14}\\b`));
   } finally {
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     await rm(root, { recursive: true, force: true });

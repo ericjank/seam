@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { SimulationApi } from "./http.mjs";
-import { agentInstructions, contract, revisionOne, revisionTwo } from "./contract.mjs";
+import { agentInstructions, contract, revisionOne, revisions } from "./contract.mjs";
 import { publishJointEvidence } from "./publish-joint-evidence.mjs";
 
 const exec = promisify(execFile);
@@ -49,14 +49,14 @@ async function assertNoUnapprovedWrites(baseline) {
   }
 }
 
-async function startConnectors() {
-  for (const local of locals) {
+async function startConnectors(selected = locals) {
+  for (const local of selected) {
     const env = { ...process.env, SEAM_PLATFORM_URL: api.base, SEAM_AGENT_ID: local.agent.id, SEAM_AGENT_TOKEN: local.agent.token,
       SEAM_PROJECT_ROOT: local.root, SEAM_ADAPTER: local.role === "consumer" ? "codex-app-server" : "generic-cli",
       SEAM_CODEX_SANDBOX: "workspace-write", SEAM_CODEX_NETWORK_ACCESS: "true",
       SEAM_CONNECTOR_STATE_DIR: join(runRoot, "connector-state"), SEAM_WORKSPACE_LOCK_DIR: join(runRoot, "workspace-locks"),
       SEAM_APP_SERVER_STATE_DIR: join(runRoot, "codex-state"), SEAM_MOCK_STATE_DIR: join(runRoot, "mock-state"),
-      SEAM_POLL_INTERVAL_MS: "200" };
+      SEAM_POLL_INTERVAL_MS: "200", SEAM_RUN_LABEL: `验收-${runRoot.split("-").at(-1)}` };
     if (local.role === "provider") {
       env.SEAM_GENERIC_AGENT_COMMAND = process.execPath;
       env.SEAM_GENERIC_AGENT_ARGS = JSON.stringify([join(here, "virtual-agent.mjs")]);
@@ -72,6 +72,28 @@ async function startConnectors() {
   progress("independent-connectors-started", { pids: workers.map(({child}) => child.pid) });
 }
 
+async function writeRunIndex(status, detail) {
+  if(!runRoot)return;
+  detail ??= collaborationId ? await api.detail(collaborationId) : null;
+  const sessions=[...new Map((detail?.jobs??[]).filter(job=>job.conversation).toReversed().map(job=>[job.conversation.threadId,job.conversation])).values()];
+  await writeFile(join(runRoot,"run-index.json"),JSON.stringify({at:new Date().toISOString(),runLabel:`验收-${runRoot.split("-").at(-1)}`,status,collaborationId,revision:detail?.lifecycle?.revision,phase:detail?.lifecycle?.phase,sessions:sessions.map(session=>({...session,url:`codex://threads/${session.threadId}`}))},null,2));
+}
+async function restartConsumerWithLostCheckpoint(){
+  const index=workers.findIndex(worker=>worker.local.role==="consumer"),worker=workers[index];
+  assert.ok(worker);
+  const closed=new Promise(resolve=>worker.child.once("exit",resolve));
+  process.kill(-worker.child.pid,"SIGTERM");await closed;
+  await writeFile(join(runRoot,"consumer-connector-before-restart.log"),worker.logs.join(""));
+  workers.splice(index,1);delete worker.local.exit;
+  const directory=join(runRoot,"codex-state");
+  const file=(await readdir(directory)).find(name=>name.endsWith(".json"));assert.ok(file);
+  const path=join(directory,file),session=JSON.parse(await readFile(path,"utf8"));
+  delete session.lastHandoff;await writeFile(path,JSON.stringify(session),{mode:0o600});
+  await startConnectors([worker.local]);
+  progress("connector-restarted",{threadId:session.threadId,checkpointReset:true,scope:"owned idle Connector; checkpoint loss, not claimed actual model compaction"});
+  checks.push("修订3后重启本方Connector并模拟交接检查点丢失；保留同一thread，重新同步当前资料");
+}
+
 async function runUntilPhase(expected) {
   const deadline = Date.now() + 25 * 60_000;
   let previous;
@@ -82,6 +104,7 @@ async function runUntilPhase(expected) {
       progress("lifecycle", { revision: current.revision, phase: current.phase, jobs: detail.jobs.map((job) => ({id:job.id,status:job.status})), blocks: current.blocks });
       await writeFile(join(runRoot, `state-${Date.now()}.json`), JSON.stringify(detail, null, 2));
       previous = state;
+      await writeRunIndex("running", detail);
     }
     if (current.phase === expected) return detail;
     assert.notEqual(current.phase, "terminated");
@@ -138,7 +161,7 @@ async function jointHttpCheck(revision) {
       assert.equal(rejected.status, 400);
     }
     const additionalInvalidDiscounts = [null, false, true, "10", 1.5, 101];
-    if (revision >= 2) {
+    if (revision >= 2 && revision <= 4) {
       const zeroDiscount = await consumer.getQuote(address, { sku: "SKU-001", quantity: 2, discountPercent: 0 });
       assert.equal(zeroDiscount.discount, 0);
       assert.equal(zeroDiscount.total, 24000);
@@ -156,10 +179,24 @@ async function jointHttpCheck(revision) {
         assert.equal(invalid.status, 400, `discountPercent=${JSON.stringify(discountPercent)} must fail at the provider`);
       }
     }
+    for (const quantity of [50,51,100]) {
+      const input={sku:"SKU-001",quantity};
+      const response=await fetch(`${address}/quote`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(input)});
+      if(revision===3 && quantity>50){assert.equal(response.status,400);await assert.rejects(()=>consumer.getQuote(address,input));}
+      else {assert.equal(response.status,200);assert.equal((await consumer.getQuote(address,input)).subtotal,12000*quantity);}
+    }
+    if(revision===5){
+      assert.deepEqual(Object.keys(normal).sort(),["currency","quantity","sku","subtotal"]);
+      for(const discountPercent of [0,10,100,null,false]){
+        const input={sku:"SKU-001",quantity:2,discountPercent};
+        assert.equal((await fetch(`${address}/quote`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(input)})).status,400);
+        await assert.rejects(()=>consumer.getQuote(address,input));
+      }
+    }
     // Consumer-side validation may avoid some calls. Each added invalid case
     // still has a direct provider HTTP check. Historical 6/10 counts belong
     // to their original reports; new executions record their actual counts.
-    assert.ok(received >= (revision >= 2 ? 8 + additionalInvalidDiscounts.length : 4), "joint checks must reach the provider through real HTTP");
+    assert.ok(received >= (revision >= 2 && revision <= 4 ? 8 + additionalInvalidDiscounts.length : 4), "joint checks must reach the provider through real HTTP");
     return { revision, status: "passed", transport: "real localhost HTTP", receivedRequests: received };
   } finally {
     server.closeAllConnections();
@@ -225,8 +262,9 @@ async function main() {
   // that a worker is connected and never chooses the order of project turns.
   await new Promise((resolve) => setTimeout(resolve, 3000));
   const initial = await Promise.all(locals.map((local) => snapshot(local.root)));
+  assert.ok(!contract.includes("discountPercent") && !contract.includes("修订2"), "future business requirements must not be preannounced");
   const created = await api.call("/api/collaborations", {
-    objective: revisionOne, projectId: locals[1].project.id, agentId: locals[1].agent.id,
+    title: "合成报价接口联调", objective: revisionOne, projectId: locals[1].project.id, agentId: locals[1].agent.id,
     targetProjectId: locals[0].project.id, targetAgentId: locals[0].agent.id,
   });
   collaborationId = created.id;
@@ -252,27 +290,32 @@ async function main() {
   await noSession.expect(`/api/collaborations/${collaborationId}/lifecycle`, { action: "terminate" }, 401, { token: locals[0].agent.token });
   checks.push("只读用户与Connector Token不能批准或终止协作");
 
-  const readyOne = await runUntilPhase("awaiting_approval");
-  const approvedOne = lifecycle(readyOne);
-  await approveAndExecute(readyOne, initial);
-  const beforeRevision = await Promise.all(locals.map((local) => snapshot(local.root)));
-  await api.lifecycle(collaborationId, { action: "append", requirements: revisionTwo });
-  const appended = lifecycle(await api.detail(collaborationId));
-  assert.equal(appended.revision, 2);
-  assert.equal(appended.phase, "planning");
-  await api.expect(`/api/collaborations/${collaborationId}/lifecycle`, { action: "approve", revision: approvedOne.revision, documentHash: approvedOne.documentHash }, 409);
-  await assertNoUnapprovedWrites(beforeRevision);
-  checks.push("补充目标创建修订2，旧revision/hash不能再次授权执行");
-  const readyTwo = await runUntilPhase("awaiting_approval");
-  await approveAndExecute(readyTwo, beforeRevision);
-
+  const revisionCount=Number(process.env.SEAM_SIMULATION_REVISIONS ?? 5);
+  assert.ok(Number.isInteger(revisionCount) && revisionCount>=2 && revisionCount<=5);
+  let baseline=initial, ready;
+  for(let index=0;index<revisionCount;index++){
+    if(index>0){
+      if(index===3) await restartConsumerWithLostCheckpoint();
+      const old=lifecycle(ready);
+      await api.lifecycle(collaborationId,{action:"append",requirements:revisions[index]});
+      const appended=lifecycle(await api.detail(collaborationId));
+      assert.equal(appended.revision,index+1);assert.equal(appended.phase,"planning");
+      assert.equal(appended.requirements,revisions[index],"new revision must store its delta, not append all old requirements");
+      await api.expect(`/api/collaborations/${collaborationId}/lifecycle`,{action:"approve",revision:old.revision,documentHash:old.documentHash},409);
+      await assertNoUnapprovedWrites(baseline);
+      checks.push(`修订${index+1}：仅在追加时引入新目标，旧revision/hash不能授权，批准前无写入`);
+    }
+    ready=await runUntilPhase("awaiting_approval");
+    await approveAndExecute(ready,baseline);
+    baseline=await Promise.all(locals.map(local=>snapshot(local.root)));
+  }
   const beforeTermination = await Promise.all(locals.map((local) => snapshot(local.root)));
   await api.lifecycle(collaborationId, { action: "terminate" });
   const terminated = await api.detail(collaborationId);
   assert.equal(lifecycle(terminated).phase, "terminated");
   assert.ok(!terminated.jobs.some((job) => ["pending", "running"].includes(job.status)));
   await api.expect(`/api/collaborations/${collaborationId}/dispatch`, { autoAdvance: true }, 409);
-  await api.expect(`/api/collaborations/${collaborationId}/lifecycle`, { action: "approve", revision: 2, documentHash: lifecycle(readyTwo).documentHash }, 409);
+  await api.expect(`/api/collaborations/${collaborationId}/lifecycle`, { action: "approve", revision: revisionCount, documentHash: lifecycle(ready).documentHash }, 409);
   const oldJob = terminated.jobs.find((job) => job.agentId === locals[0].agent.id && job.status === "completed");
   assert.ok(oldJob);
   await noSession.expect("/api/connectors/complete", {
@@ -282,17 +325,20 @@ async function main() {
   await assertNoUnapprovedWrites(beforeTermination);
   checks.push("管理员终止后无运行任务，禁止继续派发/批准，拒绝旧回执，项目文件保持不变");
 
-  const result = { ok: true, collaborationId, base: api.base, runRoot, checks,
+  const result = { ok: true, collaborationId, base: api.base, runRoot, checks, revisions: revisionCount, runLabel: `验收-${runRoot.split("-").at(-1)}`,
     concurrency: "two independent continuously polling Connector processes; no provider-first scheduler",
     realAI: "local Codex app-server", virtualPeer: "deterministic provider implemented and tested locally",
     scope: "本地Docker中心及MySQL、两个隔离合成项目、真实HTTP报价接口；不代表实际业务项目联调或生产部署" };
   await writeFile(join(runRoot, "result.json"), JSON.stringify(result, null, 2));
+  await writeRunIndex("passed");
   progress("simulation-completed", result);
 }
 
 main().catch(async (error) => {
+  if (collaborationId) await api.lifecycle(collaborationId, { action: "pause" }).catch(() => {});
   const result = { ok: false, collaborationId, base: api.base, runRoot, checks, error: error instanceof Error ? error.message : String(error) };
   if (runRoot) await writeFile(join(runRoot, "failure.json"), JSON.stringify(result, null, 2)).catch(() => undefined);
+  await writeRunIndex("failed").catch(()=>{});
   console.error(JSON.stringify(result, null, 2));
   process.exitCode = 1;
 }).finally(async () => {

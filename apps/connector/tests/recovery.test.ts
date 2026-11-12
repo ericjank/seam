@@ -29,6 +29,7 @@ describe("本地执行与网络故障恢复", () => {
         completions++; bodies.push(JSON.parse(options.body));
         if (completions === 1) throw new Error("connection lost after server commit");
       }
+      if (JSON.parse(options.body).activeJob) return Response.json({ ok: true, jobState: { cancelRequested: false, leaseUntil: new Date(Date.now() + 1_200_000).toISOString() } });
       return new Response(JSON.stringify({ ok: true }));
     }));
     vi.spyOn(console, "log").mockImplementation(() => {}); vi.spyOn(console, "error").mockImplementation(() => {});
@@ -95,7 +96,7 @@ describe("本地执行与网络故障恢复", () => {
     const context = collaborationContextSchema.parse({ collaborationId, title: "resume", type: "custom", status: "in_progress", objective: "continue approved partial changes", participant: { id, projectId: crypto.randomUUID(), projectName: "fixture", agentId: config.agentId, agentName: "mock", role: "consumer", approvalRequired: true, status: "active" }, participants: [], messages: [], artifacts: [], workItems: [], lifecycle: { revision: 1, phase: "executing", requirements: "fixture", document: "approved document", documentHash: hash, approvedHash: hash, requiredParticipantIds: [id], contributions: [{ participantId: id, content: "analysis", baseline }], confirmations: [id], reports: [], report: null } });
     const journal = new ExecutionJournal(config); const receipts: any[] = [];
     vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.stubGlobal("fetch", vi.fn(async (url: string, options: any) => { if (url.endsWith("/poll")) return Response.json({ job: { id: crypto.randomUUID(), agentId: config.agentId, collaborationId, kind: "collaboration.turn", attempts: 1, payload: { context } } }); if (url.endsWith("/complete")) receipts.push(JSON.parse(options.body)); return Response.json({ ok: true }); }));
+    vi.stubGlobal("fetch", vi.fn(async (url: string, options: any) => { if (url.endsWith("/poll")) return Response.json({ job: { id: crypto.randomUUID(), agentId: config.agentId, collaborationId, kind: "collaboration.turn", attempts: 1, payload: { context } } }); if (url.endsWith("/complete")) receipts.push(JSON.parse(options.body)); if (JSON.parse(options.body).activeJob) return Response.json({ ok: true, jobState: { cancelRequested: false, leaseUntil: new Date(Date.now() + 1_200_000).toISOString() } }); return Response.json({ ok: true }); }));
     const run = vi.spyOn(MockAgentAdapter.prototype, "run").mockImplementation(async () => {
       await writeFile(join(project, "service.mjs"), "export const step=1;\n");
       return { message: "合法部分修改后等待本地服务就绪", kind: "status", needsHumanInput: false, notifyParticipantIds: [], actions: [{ type: "workflow.blocked", revision: 1, kind: "retryable", reason: "服务进程尚未就绪，等待本地真实探测。", dependencyParticipantIds: [], retryAfterSeconds: 5 }] };
@@ -139,6 +140,7 @@ describe("本地执行与网络故障恢复", () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string, options: any) => {
       if (url.endsWith("/poll")) return new Response(JSON.stringify({ job: { id: crypto.randomUUID(), agentId: config.agentId, collaborationId, kind: "collaboration.turn", payload: { context }, attempts: 1 } }));
       if (url.endsWith("/complete")) receipts.push(JSON.parse(options.body));
+      if (JSON.parse(options.body).activeJob) return Response.json({ ok: true, jobState: { cancelRequested: false, leaseUntil: new Date(Date.now() + 1_200_000).toISOString() } });
       return new Response(JSON.stringify({ ok: true }));
     }));
     await runConnector(config);

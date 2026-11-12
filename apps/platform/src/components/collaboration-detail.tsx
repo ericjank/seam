@@ -38,10 +38,21 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
   const projectChoices = Array.from(new Map(data.availableProjects.filter((row) =>
     !data.participants.some((p) => p.project.id === row.project.id)).map((row) => [row.project.id, row.project])).values());
   const inviteAgents = data.availableProjects.filter((row) => row.project.id === inviteProjectId && row.agent);
+  const conversations = data.jobs.filter((job, index, all) => job.conversation && all.findIndex((other) => other.conversation?.threadId === job.conversation!.threadId) === index);
+  const telemetry = data.jobs.flatMap((job) => job.telemetry ? [job.telemetry] : []).filter((item, index, all) => all.findIndex((other) => other.turnId === item.turnId) === index);
   return <div className="stack">
     <div className="page-header"><div><div className="row"><span className="badge badge-blue">{data.collaboration.type}</span><span className="badge">{data.collaboration.status}</span></div><h1 style={{ marginTop: 12 }}>{data.collaboration.title}</h1><p className="muted">{data.collaboration.objective}</p></div>{(!data.lifecycle || ["planning", "plan_confirmation", "executing"].includes(data.lifecycle.phase)) && <button className="btn btn-secondary" disabled={busy} onClick={() => void run(`/api/collaborations/${id}/dispatch`, { autoAdvance: true }).catch(() => undefined)}>{data.lifecycle ? "重试自动流程" : "继续推进"}</button>}</div>
     {error && <div className="notice error">{error}</div>}
     <LifecyclePanel data={data} run={run} busy={busy} />
+    {(conversations.length > 0 || telemetry.length > 0) && <details className="card" aria-label="本机AI对话与用量"><summary>本机 AI 对话与用量 · {conversations.length} 个会话</summary>
+      <p className="small muted">根据最近 {data.jobs.length} 条执行记录汇总；其中 {data.jobs.length - telemetry.length} 条未取得原生用量记录（可能未执行、非原生端或中断），不计为零成本。同一会话可包含多个修订，批次用于区分独立测试。字节量不等同于模型 token 或费用；未上报用量显示为未知。</p>
+      {conversations.map((job) => <p key={job.conversation!.threadId}><a href={`codex://threads/${job.conversation!.threadId}`}>{job.conversation!.title}</a> · {job.conversation!.runLabel || "正式任务"} · 最近任务 {job.status}</p>)}
+      {telemetry.map((item) => <details key={item.turnId}><summary>第 {item.revision} 版 · {item.phase} · 输入正文 {item.promptBytes} 字节 · token {item.tokenUsage?.turnDelta?.totalTokens ?? "未知"}</summary>
+        <p>输出协议 {item.schemaBytes} 字节；命令输出 {item.commandOutputBytes} 字节；含资源读取的命令 {item.resourceReadCommands} 次、输出 {item.resourceCommandOutputBytes} 字节；上下文压缩 {item.contextCompacted ? "发生" : "未观察到"}。</p>
+        <p>本轮新增缓存 {item.resourceStats.createdBytes} 字节；当前资源 {item.resourceStats.files} 份、{item.resourceStats.availableBytes} 字节；清理过期资源 {item.resourceStats.prunedFiles} 份。</p>
+        {item.tokenUsage && <p>模型上报本会话累计 token {item.tokenUsage.threadTotal.totalTokens}；本轮差值输入 {item.tokenUsage.turnDelta?.inputTokens ?? "未知"}、缓存命中 {item.tokenUsage.turnDelta?.cachedInputTokens ?? "未知"}、输出 {item.tokenUsage.turnDelta?.outputTokens ?? "未知"}。累计值不重复相加。</p>}
+      </details>)}
+    </details>}
     <section className="card"><div className="card-header"><h2>参与项目</h2><span className="small muted">累计派发 {data.collaboration.negotiationRound} 批 · 每次最多 {data.collaboration.maxNegotiationRounds} 批</span></div>
       <div className="grid grid-3">{data.participants.map((row) => <div className="list-item" key={row.participant.id}>
         <div className="row-between"><strong>{row.project.name}</strong><span className={`badge ${row.participant.status === "active" ? "badge-green" : "badge-amber"}`}>{row.participant.status}</span></div>

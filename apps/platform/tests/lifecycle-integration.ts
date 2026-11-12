@@ -1,4 +1,4 @@
-import { fixtureContract } from "./fixtures/shared-contract";
+import { fixtureContract, fixtureRuns } from "./fixtures/shared-contract";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
@@ -84,13 +84,25 @@ async function main() {
   const path = `/api/collaborations/${created.id}`;
   const detail = () => api(path, undefined, { method: "GET" });
   const lifecycle = (body: unknown) => api(`${path}/lifecycle`, body);
+  let strictContractChecked = false;
   const compose = async (extra = "") => {
     const current = await detail();
     assert.equal(current.lifecycle.phase, "plan_synthesis");
     assert.equal(current.jobs.filter((j: any) => ["pending", "running"].includes(j.status)).length, 1);
     const participant = current.participants.find((row: any) => row.participant.id === current.lifecycle.coordinatorParticipantId).participant;
     const coordinator = [first, second].find((local) => local.agentId === participant.agentId)!;
-    const job = await claim(coordinator);
+    let job = await claim(coordinator);
+    if (!strictContractChecked) {
+      const contract = fixtureContract(current.lifecycle.requiredParticipantIds, current.lifecycle.revision, extra);
+      const missingService = { ...contract }; delete missingService.serviceExpectations;
+      await complete(coordinator, job, { type: "plan.compose", revision: current.lifecycle.revision, baseDocumentHash: current.lifecycle.documentHash, contract: missingService }, 422);
+      await api(`${path}/dispatch`, { autoAdvance: true });
+      job = await claim(coordinator);
+      await complete(coordinator, job, { type: "plan.compose", revision: current.lifecycle.revision, baseDocumentHash: current.lifecycle.documentHash, contract: { ...contract, acceptanceCases: contract.acceptanceCases.map(item => ({ ...item, requiredAssertions: [] })) } }, 422);
+      await api(`${path}/dispatch`, { autoAdvance: true });
+      job = await claim(coordinator); strictContractChecked = true;
+      checks.push("新契约不得省略就绪声明或必需断言；拒绝后显式重试同阶段，错误内容不生效");
+    }
     await complete(coordinator, job, { type: "plan.compose", revision: current.lifecycle.revision, baseDocumentHash: current.lifecycle.documentHash, contract: fixtureContract(current.lifecycle.requiredParticipantIds, current.lifecycle.revision, extra) });
   };
   const duplicate = await api(`${path}/dispatch`, { autoAdvance: true });
@@ -159,8 +171,8 @@ async function main() {
   await expected(`${path}/lifecycle`, { action: "terminate", revision: 2 }, 409);
   checks.push("完成回执重复提交幂等，动作只应用一次；双方实施收齐后必须进入独立联合验收");
 
-  const jointAction = (job: Claimed, status: string) => ({ type: "integration.report", revision: 2, documentHash: verifying.documentHash,
-    checks: verifying.contract.acceptanceCases.filter((item: any) => item.runnerParticipantId === job.payload.context.participant.id).map((item: any) => ({ caseId: item.id, status, command: item.command, summary: "合成协议用例，明确记录未执行状态", evidence: { synthetic: true } })),
+  const jointAction = (job: Claimed, status: string) => ({ type: "integration.report", revision: 2, documentHash: verifying.documentHash, runs: status === "passed" ? fixtureRuns(job.id) : [],
+    checks: verifying.contract.acceptanceCases.filter((item: any) => item.runnerParticipantId === job.payload.context.participant.id).map((item: any) => ({ caseId: item.id, status, command: item.command, summary: "合成协议用例，明确记录未执行状态", evidence: { synthetic: true }, assertionNames: status === "passed" ? ["fixture HTTP contract"] : [], runIds: status === "passed" ? [`fixture-${job.id}`] : [] })),
   });
   const waitingJob = await claim(first);
   await complete(first, waitingJob, [jointAction(waitingJob, "not_run"), { type: "workflow.blocked", revision: 2, kind: "waiting_peer", reason: "合成故障复现：当前服务不可达，未执行并等待对端恢复。", dependencyParticipantIds: [verifying.requiredParticipantIds.find((id: string) => id !== waitingJob.payload.context.participant.id)], retryAfterSeconds: 5 }]);

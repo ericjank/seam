@@ -159,13 +159,24 @@ export const acceptanceSubmitActionSchema = z.object({
 export const workspaceBaselineSchema = z.object({
   head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(),
 });
+export const requirementSchema = z.object({ id: z.string().min(1).max(100), text: z.string().min(1).max(10_000) });
+export const serviceExpectationSchema = z.object({
+  name: z.string().min(1).max(100), publisherParticipantId: idSchema,
+  healthPath: z.string().min(1).max(1000), status: z.number().int().min(200).max(299),
+  bodyChecks: z.array(z.object({ path: z.string().min(1).max(200), equals: z.union([z.string().max(2000), z.number(), z.boolean(), z.null()]) })).max(30),
+});
 export const sharedContractSchema = z.object({
+  // Optional only for reading documents approved by older versions.
+  effectiveRequirements: z.array(requirementSchema).min(1).max(200).optional(),
+  retiredRequirements: z.array(z.object({ id: z.string().min(1).max(100), reason: z.string().min(1).max(5000) })).max(200).optional(),
+  serviceExpectations: z.array(serviceExpectationSchema).max(30).optional(),
   scope: z.string().min(20).max(20_000),
   interfaces: z.array(z.object({ id: z.string().min(1).max(100), definition: z.string().min(20).max(20_000) })).min(1).max(30),
   responsibilities: z.array(z.object({ participantId: idSchema, changes: z.string().min(20).max(20_000) })).min(2).max(50),
   acceptanceCases: z.array(z.object({
     id: z.string().min(1).max(100), runnerParticipantId: idSchema,
     description: z.string().min(10).max(5000), command: z.string().min(1).max(2000), expectedResult: z.string().min(1).max(5000),
+    requiredAssertions: z.array(z.string().min(1).max(500)).min(1).max(100).optional(),
   })).min(2).max(100),
   risks: z.string().min(1).max(10_000),
   changeSummary: z.string().min(10).max(10_000),
@@ -186,7 +197,9 @@ export const workflowBlockSchema = z.object({
 export const servicePublicationSchema = z.object({
   name: z.string().min(1).max(100), baseUrl: z.string().url().max(2000), healthPath: z.string().max(1000),
   ttlSeconds: z.number().int().min(30).max(3600).default(300),
-  probe: z.object({ ok: z.boolean(), status: z.number().int().nullable(), checkedAt: z.string() }).optional(),
+  probe: z.object({ ok: z.boolean(), status: z.number().int().nullable(), checkedAt: z.string(),
+    expectationHash: z.string().length(64).optional(), documentHash: z.string().length(64).optional(), revision: z.number().int().positive().optional(),
+  }).optional(),
 });
 export const integrationCheckSchema = z.object({
   caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]),
@@ -252,6 +265,21 @@ export const agentTurnResultSchema = z.object({
 });
 export type AgentTurnResult = z.infer<typeof agentTurnResultSchema>;
 
+export const tokenUsageBreakdownSchema = z.object({
+  inputTokens: z.number().int().nonnegative(), cachedInputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(), reasoningOutputTokens: z.number().int().nonnegative(), totalTokens: z.number().int().nonnegative(),
+  cacheWriteInputTokens: z.number().int().nonnegative().default(0),
+});
+export const adapterTelemetrySchema = z.object({
+  version: z.literal(1), threadId: z.string(), turnId: z.string(), jobId: z.string().optional(), revision: z.number().optional(), phase: z.string().optional(),
+  promptBytes: z.number().nonnegative(), schemaBytes: z.number().nonnegative(), commandOutputBytes: z.number().nonnegative(),
+  resourceCommandOutputBytes: z.number().nonnegative(), resourceReadCommands: z.number().nonnegative(), durationMs: z.number().nonnegative(),
+  resourceStats: z.object({ createdBytes: z.number(), availableBytes: z.number(), files: z.number(), prunedFiles: z.number() }),
+  contextCompacted: z.boolean(), model: z.string().optional(),
+  tokenUsage: z.object({ threadTotal: tokenUsageBreakdownSchema, lastModelCall: tokenUsageBreakdownSchema, turnDelta: tokenUsageBreakdownSchema.nullable() }).nullable(),
+});
+export type AdapterTelemetry = z.infer<typeof adapterTelemetrySchema>;
+
 export const collaborationContextSchema = z.object({
   lifecycle: lifecycleContextSchema.nullish(),
   jobId: idSchema.optional(),
@@ -286,6 +314,13 @@ export const collaborationContextSchema = z.object({
   })).default([]),
 });
 export type CollaborationContext = z.infer<typeof collaborationContextSchema>;
+
+/** Stable across JSON database key ordering and independently parsed clients. */
+export function canonicalJson(value: unknown): string {
+  const normalize = (item: unknown): unknown => Array.isArray(item) ? item.map(normalize)
+    : item !== null && typeof item === "object" ? Object.fromEntries(Object.entries(item).filter(([, value]) => value !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, normalize(value)])) : item;
+  return JSON.stringify(normalize(value));
+}
 
 export const connectorJobSchema = z.object({
   id: idSchema,

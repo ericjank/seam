@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { and, asc, eq, inArray } from "drizzle-orm";
-import { integrationCheckSchema, lifecycleAgentActionSchema, type LifecycleContext } from "@seam/protocol";
+import { canonicalJson, integrationCheckSchema, lifecycleAgentActionSchema, type LifecycleContext } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
 import {
   agents, collaborations, collaborationLifecycles, connectorJobs, lifecycleContributions,
@@ -64,7 +64,7 @@ function contextFrom(control: Lifecycle, revision: Revision, contributions: Cont
     document: revision.document, documentHash: control.documentHash, approvedHash: control.approvedHash,
     requiredParticipantIds: control.requiredParticipantIds, coordinatorParticipantId: control.requiredParticipantIds[0], paused: Boolean(control.pausedAt),
     changeRequest: revision.changeRequest, contract: revision.sharedContract, objections: revision.objections ?? [],
-    baseline: previous ? { revision: previous.revision, documentHash: previous.documentHash, document: previous.sharedContract ? null : previous.document, contract: previous.sharedContract, report: previous.report } : null,
+    baseline: previous ? { revision: previous.revision, documentHash: previous.documentHash, document: previous.sharedContract?.effectiveRequirements ? null : previous.document, contract: previous.sharedContract, report: previous.report } : null,
     contributions: relevant.flatMap((row) => row.content ? [{ participantId: row.participantId, content: row.content, baseline: row.workspaceBaseline ?? null }] : []),
     confirmations: relevant.filter((row) => control.documentHash && row.confirmedHash === control.documentHash).map((row) => row.participantId),
     reports: relevant.flatMap((row) => row.reportStatus && row.reportSummary ? [{
@@ -183,6 +183,10 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
       if (!["executing", "joint_verifying"].includes(control.phase) || control.approvedHash !== control.documentHash || !control.approvedHash) throw new HttpError(409, "服务端点只能在本版获批后发布");
       const url = new URL(action.baseUrl);
       if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || !action.probe?.ok) throw new HttpError(422, "服务端点必须经本机实际健康探测，地址不得包含凭据");
+      const expectations = revision.sharedContract?.serviceExpectations;
+      const expected = expectations?.find((item) => item.name === action.name && item.publisherParticipantId === participantId);
+      if (expectations && (!expected || expected.healthPath !== action.healthPath || action.probe.status !== expected.status
+        || action.probe.revision !== control.revision || action.probe.documentHash !== control.approvedHash || action.probe.expectationHash !== hash(canonicalJson(expected)))) throw new HttpError(422, "服务缺少与本版批准就绪契约匹配的本机探测证据");
       const service = { name: action.name, baseUrl: action.baseUrl, healthPath: action.healthPath, ttlSeconds: action.ttlSeconds, probe: action.probe, expiresAt: new Date(Date.now() + action.ttlSeconds * 1000).toISOString() };
       const services = [...(existing?.services ?? []).filter((item) => item.name !== action.name), service];
       await db.insert(lifecycleContributions).values({ id: newId(), collaborationId, revision: control.revision, participantId, services }).onDuplicateKeyUpdate({ set: { services, updatedAt: new Date() } });
@@ -206,8 +210,8 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     }
     if (action.type === "plan.compose") {
       if (control.phase !== "plan_synthesis" || participantId !== control.requiredParticipantIds[0] || action.baseDocumentHash !== control.documentHash) throw new HttpError(409, "仅协调方可基于当前版本汇总统一契约");
-      validateSharedContract(action.contract, control.requiredParticipantIds);
       const context = (await getLifecycleContext(collaborationId))!;
+      validateSharedContract(action.contract, control.requiredParticipantIds, context.baseline?.contract);
       const rows = await requiredProjects(control);
       const document = renderSharedContract({ title: collaboration.title, revision: control.revision, requirements: revision.requirements,
         changeRequest: revision.changeRequest, contract: action.contract, previous: context.baseline?.contract,
@@ -248,10 +252,14 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
       if (action.checks.length !== expected.length || new Set(action.checks.map((item) => item.caseId)).size !== action.checks.length || expected.some((item) => !action.checks.some((check) => check.caseId === item.id))) throw new HttpError(422, "必须完整报告本方所有已批准的联合验收用例，不得跨方或遗漏");
       if (action.checks.some((check) => check.status !== "not_run" && (!check.command.trim() || !Object.keys(check.evidence).length))) throw new HttpError(422, "已执行用例必须提供真实命令和证据");
       for (const check of action.checks) {
-        if (!check.runIds.length) continue; // Historical clients remain explicitly identified as Agent-only reports.
+        const expectedCase = expected.find((item) => item.id === check.caseId)!;
+        const required = expectedCase.requiredAssertions ?? [];
+        if (check.status === "passed" && required.length && (!check.runIds.length || required.some((name) => !check.assertionNames.includes(name)))) throw new HttpError(422, "通过报告必须覆盖全部已批准的必需断言并关联实际命令");
+        if (!check.runIds.length) continue; // Previously approved legacy documents remain identifiable.
         const runs = action.runs.filter((run) => check.runIds.includes(run.id));
         const approvedCommand = expected.find((item) => item.id === check.caseId)!.command.trim();
         if (new Set(action.runs.map((run) => run.id)).size !== action.runs.length || runs.length !== check.runIds.length || check.command.trim() !== approvedCommand || runs.some((run) => run.command.trim() !== approvedCommand) || !check.assertionNames.length || check.assertionNames.some((name) => !runs.some((run) => run.assertions.includes(name))) || (check.status === "passed" && runs.some((run) => run.exitCode !== 0))) throw new HttpError(422, "用例引用的批准命令、实际断言或退出码不匹配");
+        if (check.status === "passed" && required.some((name) => !runs.some((run) => run.assertions.includes(name)))) throw new HttpError(422, "必需业务断言未全部实际通过");
       }
       const evidenceRuns = [...new Map([...(existing?.evidenceRuns ?? []), ...action.runs].map((run) => [run.id, run])).values()];
       await db.update(lifecycleContributions).set({ integrationChecks: action.checks, evidenceRuns, updatedAt: new Date() }).where(and(currentContribution(collaborationId, control.revision), eq(lifecycleContributions.participantId, participantId)));
@@ -320,11 +328,10 @@ export async function appendLifecycleRequirements(userId: string, collaborationI
   return locked(collaborationId, async (control) => {
     await requireAdministrator(userId, collaborationId);
     if (!control || !["awaiting_review", "awaiting_approval"].includes(control.phase)) throw new HttpError(409, "请在完整报告收齐或开发文档待确认时追加要求；当前执行阶段不能切换修订");
-    const previous = await getRevision(control);
     const revision = control.revision + 1;
     await requiredProjects(control);
     await db.insert(lifecycleRevisions).values({ id: newId(), collaborationId, revision,
-      requirements: `${previous.requirements}\n\n## 第 ${revision} 版追加要求\n\n${requirements}`, changeRequest: requirements, createdById: userId,
+        requirements, changeRequest: requirements, createdById: userId,
     });
     await db.update(collaborationLifecycles).set({ revision, phase: "planning", documentHash: null, approvedHash: null, approvedById: null, approvedAt: null, updatedAt: new Date() })
       .where(eq(collaborationLifecycles.collaborationId, collaborationId));

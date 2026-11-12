@@ -24,9 +24,11 @@ describe("Connector 长任务心跳", () => {
     }));
     const config = readConfig(["--once"], { SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "test-only" });
     const acknowledgements: unknown[] = [];
+    let executionAcknowledged = false;
     vi.stubGlobal("fetch", vi.fn(async (url: string, options: any) => {
       const body = JSON.parse(options.body);
       if (url.endsWith("/poll")) return new Response(JSON.stringify({ job: { id: jobId, agentId: config.agentId, collaborationId: null, kind: "local.test", payload: {}, attempts: 1 } }));
+      if (body.activeJob && !executionAcknowledged) { executionAcknowledged = true; return Response.json({ok:true,jobState:{cancelRequested:false,leaseUntil:new Date(Date.now()+1200000).toISOString()}}); }
       if (body.activeJob?.cancelled) { expect(stopped).toBe(true); acknowledgements.push(body.activeJob); }
       return new Response(JSON.stringify({ ok: true, ...(body.activeJob ? { jobState: { cancelRequested: true } } : {}) }));
     }));
@@ -46,11 +48,11 @@ describe("Connector 长任务心跳", () => {
     const config = readConfig(["--once"], { SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "private-token" });
     config.stateDir = join(stateRoot, "journal"); config.workspaceLockDir = join(stateRoot, "locks");
     let heartbeatCount = 0;
-    const request = vi.fn(async (url: string) => {
+    const request = vi.fn(async (url: string, options: any) => {
       if (url.endsWith("/heartbeat")) {
         heartbeatCount += 1;
-        if (heartbeatCount === 2) throw new Error("temporary heartbeat outage");
-        return new Response(JSON.stringify({ ok: true }));
+        if (heartbeatCount === 3) throw new Error("temporary heartbeat outage");
+        return Response.json({ok:true,...(JSON.parse(options.body).activeJob?{jobState:{cancelRequested:false,leaseUntil:new Date(Date.now()+1200000).toISOString()}}:{})});
       }
       if (url.endsWith("/poll")) return new Response(JSON.stringify({ job: { id: crypto.randomUUID(), agentId: config.agentId, collaborationId: null, kind: "local.test", payload: {}, attempts: 1 } }));
       return new Response(JSON.stringify({ ok: true }));
@@ -62,12 +64,12 @@ describe("Connector 长任务心跳", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(runLocalTest).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(100_000);
-    expect(heartbeatCount).toBe(6);
+    expect(heartbeatCount).toBe(7);
     expect(errors).toHaveBeenCalledWith("Connector 心跳失败", "temporary heartbeat outage");
     finish({ status: "passed", summary: "真实本地测试通过", evidence: {} });
     await pending;
     expect(request.mock.calls.filter(([url]) => url.endsWith("/complete"))).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(40_000);
-    expect(heartbeatCount).toBe(6);
+    expect(heartbeatCount).toBe(7);
   });
 });

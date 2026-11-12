@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { canonicalJson, type SharedContract } from "@seam/protocol";
+import { createHash } from "node:crypto";
 
 const state = vi.hoisted(() => ({ rows: {} as Record<string, Record<string, any>[]>, role: "owner" }));
 
@@ -95,32 +97,36 @@ const actor = (id: string) => ({ kind: "participant" as const, id });
 const plan = (side: string) => `## ${side} 实施方案\n\n${"检查仓库现状，确认接口责任、开发步骤、测试与实际证据；未经管理员确认不得执行修改。".repeat(4)}`;
 const submit = (id: string, revision = 1, content = plan(id)) => applyLifecycleAction(actor(id), "collab", { type: "plan.submit", revision, content });
 const report = (id: string, revision = 1, status: "passed" | "failed" = "passed") => applyLifecycleAction(actor(id), "collab", { type: "execution.report", revision, status, summary: `${id} 完成代码和测试；${status}`, evidence: { tests: status, commands: ["pnpm test"] } });
-async function compose(revision = 1, extra = "") {
+async function compose(revision = 1, extra = "", overrides: Partial<SharedContract> = {}) {
   const context = (await getLifecycleContext("collab"))!;
   const ids = context.requiredParticipantIds;
   return applyLifecycleAction(actor(ids[0]!), "collab", { type: "plan.compose", revision, baseDocumentHash: context.documentHash, contract: {
+    effectiveRequirements: [{ id: "quote", text: "实现报价接口和真实错误边界" }], retiredRequirements: [],
+    serviceExpectations: [],
     scope: "双方实现同一份报价 HTTP 契约并运行真实联合验证，不访问实际业务数据。" + extra,
     interfaces: [{ id: "quote", definition: "POST /quote 接收 sku 和 quantity，返回整数分 subtotal，错误返回 400。" }],
     responsibilities: ids.map((participantId) => ({ participantId, changes: "按共同约定实现本项目报价接口职责，保留已有工作并运行本地测试。" })),
-    acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index}`, runnerParticipantId, description: "真实调用双方报价 HTTP 接口并检查正常与异常边界", command: "node --test joint.test.mjs", expectedResult: "全部通过" })),
+    acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index}`, runnerParticipantId, description: "真实调用双方报价 HTTP 接口并检查正常与异常边界", command: "node --test joint.test.mjs", expectedResult: "全部通过", requiredAssertions: ["real HTTP error"] })),
     risks: "仅合成环境，服务未就绪时如实报告未执行。", changeSummary: "本轮统一明确接口字段、双方实施职责与真实联合验收用例。" + extra,
     impactedParticipantIds: ids, retainedDecisions: revision > 1 ? ["保留已确认的基础报价接口行为"] : [],
+    ...overrides,
   } });
 }
 async function joint(revision = 1, status: "passed" | "failed" | "not_run" = "passed") {
   const context = (await getLifecycleContext("collab"))!;
   for (const id of context.requiredParticipantIds) await applyLifecycleAction(actor(id), "collab", { type: "integration.report", revision, documentHash: context.documentHash!,
-    checks: context.contract!.acceptanceCases.filter((item) => item.runnerParticipantId === id).map((item) => ({ caseId: item.id, status, command: item.command, summary: `合成联测回执 ${status}`, evidence: { fixture: true } })),
+    runs: [{ id: `fixture-${id}-${revision}`, command: "node --test joint.test.mjs", exitCode: 0, output: "Synthetic unit fixture, no real execution", assertions: ["real HTTP error"], source: "local-test", capturedAt: new Date().toISOString() }],
+    checks: context.contract!.acceptanceCases.filter((item) => item.runnerParticipantId === id).map((item) => ({ caseId: item.id, status, command: item.command, summary: `合成联测回执 ${status}`, evidence: { fixture: true }, assertionNames: ["real HTTP error"], runIds: [`fixture-${id}-${revision}`] })),
   });
 }
-async function agreed(revision = 1) {
-  await submit("00000000-0000-4000-8000-000000000001", revision); await submit("00000000-0000-4000-8000-000000000002", revision); await compose(revision);
+async function agreed(revision = 1, overrides: Partial<SharedContract> = {}) {
+  await submit("00000000-0000-4000-8000-000000000001", revision); await submit("00000000-0000-4000-8000-000000000002", revision); await compose(revision, "", overrides);
   const context = (await getLifecycleContext("collab"))!;
   for (const id of ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"]) await applyLifecycleAction(actor(id), "collab", { type: "plan.confirm", revision, documentHash: context.documentHash! });
   return (await getLifecycleContext("collab"))!;
 }
-async function approved(revision = 1) {
-  const context = await agreed(revision);
+async function approved(revision = 1, overrides: Partial<SharedContract> = {}) {
+  const context = await agreed(revision, overrides);
   return approveLifecycle("admin", "collab", { revision, documentHash: context.documentHash! });
 }
 
@@ -137,6 +143,36 @@ beforeEach(() => {
 });
 
 describe("管理员控制的共同开发生命周期", () => {
+  it("旧文档没有有效要求清单时，增量升级仍提供完整上版原文，不能丢掉历史要求来源", async () => {
+    await startLifecycle("admin", "collab"); await agreed();
+    const legacy=state.rows.lifecycle_revisions![0]!; delete legacy.sharedContract.effectiveRequirements;
+    const next=await appendLifecycleRequirements("admin","collab",{requirements:"只追加新错误边界，保留旧约束"});
+    expect(next.requirements).toBe("只追加新错误边界，保留旧约束");
+    expect(next.baseline!.document).toBe(legacy.document);
+    expect(next.baseline!.document).toContain("实施范围");
+  });
+  it("新文档服务必须关联本版语义探测，验收不能只通过健康检查而遗漏业务断言", async () => {
+    await startLifecycle("admin", "collab");
+    const [a,b] = (await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string];
+    await submit(a); await submit(b);
+    const serviceExpectation = { name: "quote", publisherParticipantId: a, healthPath: "/health", status: 200, bodyChecks: [{ path: "ready", equals: true }, { path: "revision", equals: 1 }] };
+    await compose(1, "严格语义验证", { serviceExpectations: [serviceExpectation], acceptanceCases: [a,b].map((runnerParticipantId,index) => ({ id: `strict-${index}`, runnerParticipantId, command: "node --test joint.test.mjs", description: "健康及业务金额断言都必须真实通过", expectedResult: "全部通过", requiredAssertions: ["health", "business amount"] })) });
+    const documentHash=(await getLifecycleContext("collab"))!.documentHash!;
+    for(const id of [a,b])await applyLifecycleAction(actor(id),"collab",{type:"plan.confirm",revision:1,documentHash});
+    await approveLifecycle("admin","collab",{revision:1,documentHash});
+    const service = { type:"service.publish" as const,revision:1,name:"quote",baseUrl:"http://127.0.0.1:12345",healthPath:"/health",ttlSeconds:300,
+      probe:{ok:true,status:200,checkedAt:new Date().toISOString(),revision:1,documentHash,expectationHash:createHash("sha256").update(canonicalJson(serviceExpectation)).digest("hex")} };
+    await expect(applyLifecycleAction(actor(a),"collab",{...service,probe:{...service.probe,revision:2}})).rejects.toMatchObject({status:422});
+    await expect(applyLifecycleAction(actor(a),"collab",{...service,probe:{...service.probe,expectationHash:"0".repeat(64)}})).rejects.toMatchObject({status:422});
+    await applyLifecycleAction(actor(a),"collab",service);
+    await report(a);await report(b);
+    const action={type:"integration.report" as const,revision:1,documentHash,runs:[{id:"strict-run",command:"node --test joint.test.mjs",exitCode:0,output:"synthetic state-machine fixture",assertions:["health"],source:"local-test" as const,capturedAt:new Date().toISOString()}],checks:[{caseId:"strict-0",status:"passed" as const,command:"node --test joint.test.mjs",summary:"仅健康",evidence:{fixture:true},assertionNames:["health"],runIds:["strict-run"]}]};
+    await expect(applyLifecycleAction(actor(a),"collab",action)).rejects.toMatchObject({status:422});
+    action.checks[0]!.assertionNames.push("business amount");
+    await expect(applyLifecycleAction(actor(a),"collab",action)).rejects.toMatchObject({status:422});
+    action.runs[0]!.assertions.push("business amount");await applyLifecycleAction(actor(a),"collab",action);
+    expect((await getLifecycleContext("collab"))!.phase).toBe("joint_verifying");
+  });
   it("完整闭环：同版双确认、人工批准、双端报告、追加新版本、人工终止", async () => {
     expect((await startLifecycle("admin", "collab")).phase).toBe("planning");
     const approval = await approved();
@@ -294,9 +330,11 @@ describe("管理员控制的共同开发生命周期", () => {
   it("服务只能获批后发布且必须有健康探测，过期端点从交接上下文移除", async () => {
     await startLifecycle("admin", "collab"); const id = "00000000-0000-4000-8000-000000000001";
     const service = { type: "service.publish" as const, revision: 1, name: "quote", baseUrl: "http://127.0.0.1:19001", healthPath: "/health", ttlSeconds: 30 };
-    await expect(applyLifecycleAction(actor(id), "collab", service)).rejects.toMatchObject({ status: 409 }); await approved();
+    await expect(applyLifecycleAction(actor(id), "collab", service)).rejects.toMatchObject({ status: 409 });
+    const expectation = {name:"quote",publisherParticipantId:id,healthPath:"/health",status:200,bodyChecks:[{path:"ready",equals:true}]};
+    const ready = await approved(1,{serviceExpectations:[expectation]});
     await expect(applyLifecycleAction(actor(id), "collab", service)).rejects.toMatchObject({ status: 422 });
-    await applyLifecycleAction(actor(id), "collab", { ...service, probe: { ok: true, status: 200, checkedAt: new Date().toISOString() } });
+    await applyLifecycleAction(actor(id), "collab", { ...service, probe: { ok: true, status: 200, checkedAt: new Date().toISOString(), revision:1, documentHash:ready.documentHash!, expectationHash:createHash("sha256").update(canonicalJson(expectation)).digest("hex") } });
     expect((await getLifecycleContext("collab"))!.services).toHaveLength(1);
     state.rows.lifecycle_contributions!.find((row) => row.participantId === id)!.services[0].expiresAt = new Date(0).toISOString();
     expect((await getLifecycleContext("collab"))!.services).toEqual([]);
@@ -319,6 +357,7 @@ describe("管理员控制的共同开发生命周期", () => {
     await startLifecycle("admin", "collab"); await approved();
     const [a,b] = (await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string]; await report(a); await report(b); await joint();
     for (const row of state.rows.lifecycle_contributions!) for (const check of row.integrationChecks ?? []) { delete check.assertionNames; delete check.runIds; }
+    for (const row of state.rows.lifecycle_contributions!) row.evidenceRuns = []; // Import an explicitly legacy fixture.
     const context = (await getLifecycleContext("collab"))!;
     expect(context.integrationReports.every((entry) => entry.checks.every((check) => check.runIds.length === 0 && check.assertionNames.length === 0))).toBe(true);
     expect(context.evidenceRuns).toEqual([]); expect(context.phase).toBe("awaiting_review");

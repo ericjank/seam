@@ -3,7 +3,7 @@
 // the approved long command and its interruption run through the real Connector.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -23,6 +23,7 @@ const waitFor = async (check, timeout) => {
 };
 
 const root = await mkdtemp(join(tmpdir(), "seam-real-recovery-"));
+process.env.SEAM_RUN_LABEL ??= `恢复-${root.split("-").at(-1)}`;
 const projectRoot = join(root, "project");
 await mkdir(projectRoot);
 await writeFile(join(projectRoot, "long-job.mjs"), `import { writeFileSync } from "node:fs";
@@ -59,6 +60,7 @@ try {
     await api.call("/api/connectors/heartbeat", { agentId: peer.agent.id }, { token: peer.agent.token });
   }
   const created = await api.call("/api/collaborations", {
+    title: "中断与恢复专项",
     objective: "真实恢复测试：批准后由Codex前台执行node long-job.mjs，管理员在started.marker出现后暂停，执行端须中断并确认停止。人工恢复同一批准版本后，不重复长命令，继续既有node resume-job.mjs并报告实际结果。",
     projectId: peers[0].project.id, agentId: peers[0].agent.id, targetProjectId: peers[1].project.id, targetAgentId: peers[1].agent.id,
   });
@@ -71,10 +73,11 @@ try {
   };
   for (const peer of peers) await completeFixture(peer, () => ({ type: "plan.submit", revision: 1, ...(peer === peers[1] ? {baseline:plannedBaseline} : {}), content: "# 暂停测试方案\n" + "这是隔离测试夹具。管理员批准后，仅消费端在前台执行既有node long-job.mjs。程序立即写started.marker并等待90秒；平台暂停后Connector应中断本轮命令，finished.marker不得出现。平台记录停止请求和执行端确认，不能把暂停当作执行通过。同版管理员恢复后，已有started.marker则不重复长命令，继续运行既有node resume-job.mjs，验证starts.counter为1及resumed.marker生成，再提交真实实施报告。" }));
   await completeFixture(peers[0], context => ({ type: "plan.compose", revision: 1, baseDocumentHash: null, contract: {
+    effectiveRequirements: [{id:"stop",text:"按批准步骤验证真实中断和剩余工作恢复"}], retiredRequirements: [], serviceExpectations: [],
     scope: "验证真实Codex长命令经平台暂停后中断及部分合法修改同版恢复，使用既有long-job.mjs，不修改程序或等待时长；同版恢复后执行既有resume-job.mjs完成剩余步骤，不重复长命令。",
     interfaces: [{ id: "cancellation-markers", definition: "node long-job.mjs在前台执行，立即创建started.marker，90秒后才会写finished.marker。管理员看到启动后暂停；中断成功时不应出现finished.marker。" }],
     responsibilities: context.lifecycle.requiredParticipantIds.map((participantId, index) => ({ participantId, changes: index === 0 ? "控制端仅由测试运行器发出管理员暂停，不实施业务改动；协商动作明确为合成测试回执。" : "本机真实Codex读取现有脚本后，严格前台运行node long-job.mjs一次，保持原90秒时长，不修改脚本、不后台运行。恢复同一批准版本后，检查started.marker并执行node resume-job.mjs完成剩余步骤，不重跑长命令，验证starts.counter=1。" })),
-    acceptanceCases: context.lifecycle.requiredParticipantIds.map((runnerParticipantId, index) => ({ id: `stop-${index}`, runnerParticipantId, description: "真实停止后的证据核对，暂停不计为实施通过。", command: "node long-job.mjs", expectedResult: "本轮暂停且执行端确认停止，90秒后finished.marker仍不存在。" })),
+    acceptanceCases: context.lifecycle.requiredParticipantIds.map((runnerParticipantId, index) => ({ id: `stop-${index}`, runnerParticipantId, description: "真实停止后的证据核对，暂停不计为实施通过。", command: "node long-job.mjs", expectedResult: "本轮暂停且执行端确认停止，90秒后finished.marker仍不存在。", requiredAssertions: ["stop evidence"] })),
     risks: "本测试只验证本次独立Node命令和真实Codex中断，不代表所有外部副作用均可撤销。先验证暂停，再由管理员恢复本版执行剩余步骤并报告；本测试不冒充业务联合验收。",
     changeSummary: "首次形成真实暂停验收夹具，协商回执由运行器显式合成，只有实施命令及停止链路使用真实Codex。",
     impactedParticipantIds: context.lifecycle.requiredParticipantIds, retainedDecisions: [],
@@ -126,7 +129,11 @@ try {
   assert.equal(pausedDetail.jobs.some(job => ["pending", "running"].includes(job.status)), false);
   assert.equal(detail.lifecycle.reports.length, 1);
   await writeFile(join(root, "detail.json"), JSON.stringify(detail, null, 2));
-  const result = { ok: true, root, projectRoot, collaborationId, events, starts:1, resumedMarkerExists:true, lostStopAckReplayed:true, finishedMarkerExists: false, waitedBeyondOriginalDeadline: true, scope: "real local Codex App Server cancellation; planning receipts were synthetic; partial writes resumed with same approval, lost stop ACK replayed; task intentionally paused after the single real endpoint report" };
+  const [mapping] = (await readdir(config.appServerStateDir)).filter(name=>name.endsWith(".json"));
+  const session = JSON.parse(await readFile(join(config.appServerStateDir,mapping),"utf8"));
+  assert.equal(session.lastTelemetry?.tokenUsage?.turnDelta ?? null,null,"unknown interrupted cost must not be attributed to resumed turn");
+  await writeFile(join(root,"run-index.json"),JSON.stringify({status:"passed",runLabel:process.env.SEAM_RUN_LABEL,collaborationId,phase:"paused",sessions:[{threadId:session.threadId,title:session.title,url:`codex://threads/${session.threadId}`}]},null,2));
+  const result = { ok: true, root, projectRoot, collaborationId, events, starts:1, resumedMarkerExists:true, lostStopAckReplayed:true, finishedMarkerExists: false, waitedBeyondOriginalDeadline: true, resumedTurnTokenDeltaKnown:false, scope: "real local Codex App Server cancellation; planning receipts were synthetic; partial writes resumed with same approval, lost stop ACK replayed; task intentionally paused after the single real endpoint report" };
   await writeFile(join(root, "result.json"), JSON.stringify(result, null, 2));
   record("real-cancellation-passed", { root, collaborationId, finishedMarkerExists: false, waitedBeyondOriginalDeadline: true });
 } catch (error) {

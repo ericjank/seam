@@ -1,4 +1,4 @@
-import type { AgentTurnResult, CollaborationContext } from "@seam/protocol";
+import type { AgentTurnResult, CollaborationContext, AdapterTelemetry } from "@seam/protocol";
 
 export type AdapterType = "claude-code" | "codex" | "codex-app-server" | "generic-cli" | "mock";
 export type CodexSandbox = "read-only" | "workspace-write";
@@ -22,7 +22,9 @@ export interface AgentRunInput {
   /** A locally verified checkpoint from this approved revision, never model supplied. */
   resuming?: boolean;
   resources?: Array<{ key: string; path: string; hash: string; bytes: number }>;
+  resourceStats?: { createdBytes: number; availableBytes: number; files: number; prunedFiles: number };
   onCommand?: (record: { id: string; command: string; exitCode: number | null; output: string }) => void;
+  onTelemetry?: (record: AdapterTelemetry) => void;
 }
 
 export interface AgentAdapter {
@@ -30,5 +32,5 @@ export interface AgentAdapter {
   run(input: AgentRunInput): Promise<AgentTurnResult>;
   healthCheck(projectRoot: string): Promise<{ ok: boolean; detail: string }>;
   /** Actual local transport metadata, never supplied by model-generated text. */
-  getConversation?(input: AgentRunInput): Promise<{ threadId: string; transport: "codex-app-server" } | null>;
+  getConversation?(input: AgentRunInput): Promise<{ threadId: string; transport: "codex-app-server"; title?: string; runLabel?: string } | null>;
 }

@@ -37,6 +37,25 @@ describe("实际命令证据和就绪发布", () => {
     expect(() => attachCommandEvidence(turn(), context, [{ ...observed(), assertions: ["different assertion"] }])).toThrow("实际断言");
     expect(() => attachCommandEvidence(turn(), context, [{ ...observed(), exitCode: 1 }])).toThrow("成功记录");
     expect(() => attachCommandEvidence(turn(), context, [{ ...observed(), command: "node --test other.test.mjs" }])).toThrow("批准命令");
+    context.lifecycle!.contract!.acceptanceCases[0]!.requiredAssertions = ["HTTP rejects null", "quote amount"];
+    expect(() => attachCommandEvidence(turn(), context, [observed()])).toThrow("完整报告");
+    const complete = turn(); if (complete.actions[0]?.type !== "integration.report") throw new Error("unexpected");
+    complete.actions[0].checks[0]!.assertionNames = ["HTTP rejects null", "quote amount"];
+    expect(() => attachCommandEvidence(complete, context, [{ ...observed(), assertions: ["HTTP rejects null"] }])).toThrow();
+    expect(() => attachCommandEvidence(complete, context, [observed()])).not.toThrow();
+  });
+  it("HTTP200但未就绪、旧修订、缺字段、错误类型、非JSON及超大响应不能发布", async () => {
+    const id = crypto.randomUUID();
+    const context = collaborationContextSchema.parse({ collaborationId: crypto.randomUUID(), title: "health", objective: "就绪", type: "custom", status: "in_progress", participant: { id, projectId: crypto.randomUUID(), projectName: "本方", agentId: null, agentName: null, role: "provider", approvalRequired: true, status: "active" }, participants: [], messages: [], artifacts: [], workItems: [] });
+    context.lifecycle = { revision: 2, phase: "executing", documentHash: "a".repeat(64), approvedHash: "a".repeat(64), contract: { serviceExpectations: [{ name: "quote", publisherParticipantId: id, healthPath: "/health", status: 200, bodyChecks: [{ path: "ready", equals: true }, { path: "revision", equals: 2 }] }] } } as unknown as typeof context.lifecycle;
+    const turn = () => agentTurnResultSchema.parse({ message: "服务", actions: [{ type: "service.publish", revision: 2, name: "quote", baseUrl: "http://127.0.0.1:12345", healthPath: "/health", ttlSeconds: 300 }] });
+    for (const body of ['{"ready":false,"revision":2}', '{"ready":true,"revision":1}', '{"ready":true}', '{"ready":"true","revision":2}', 'not json', "x".repeat(70_000)]) {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 200 })));
+      await expect(probeServices(turn(), undefined, context)).rejects.toBeInstanceOf(ServiceReadinessError);
+    }
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ ready: true, revision: 2 })));
+    const valid = turn(); await probeServices(valid, undefined, context);
+    expect(valid.actions[0]).toMatchObject({ probe: { ok: true, revision: 2, documentHash: "a".repeat(64) } });
   });
   it("发布前从Connector真实探测健康地址，失败不形成就绪记录", async () => {
     let ready = false;

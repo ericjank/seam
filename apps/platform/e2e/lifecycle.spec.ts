@@ -1,4 +1,4 @@
-import { fixtureContract } from "../tests/fixtures/shared-contract";
+import { fixtureContract, fixtureRuns } from "../tests/fixtures/shared-contract";
 import { randomUUID } from "node:crypto";
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 
@@ -74,7 +74,7 @@ async function completePhase(request: APIRequestContext, collaborationId: string
     } : phase === "plan_confirmation" ? {
       type: "plan.confirm", revision, documentHash: lifecycle.documentHash,
     } : phase === "joint_verifying" ? {
-      type: "integration.report", revision, documentHash: lifecycle.documentHash, checks: lifecycle.contract.acceptanceCases.filter((item: any) => item.runnerParticipantId === job.payload.context.participant.id).map((item: any) => ({ caseId: item.id, status: "passed", command: item.command, summary: "浏览器流程合成回执，不代表真实模型或业务验收", evidence: { fixture: true } })),
+      type: "integration.report", revision, documentHash: lifecycle.documentHash, runs: fixtureRuns(job.id), checks: lifecycle.contract.acceptanceCases.filter((item: any) => item.runnerParticipantId === job.payload.context.participant.id).map((item: any) => ({ caseId: item.id, status: "passed", command: item.command, summary: "浏览器流程合成回执，不代表真实模型或业务验收", evidence: { fixture: true }, assertionNames: ["fixture HTTP contract"], runIds: [`fixture-${job.id}`] })),
     } : {
       type: "execution.report", revision, status: "passed",
       summary: `${peer.project.name} 修订${revision}浏览器流程合成回执，仅验证报告展示；不代表真实模型或业务验收。`,

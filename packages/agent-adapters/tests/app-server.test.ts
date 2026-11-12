@@ -71,6 +71,12 @@ createInterface({input: process.stdin}).on('line', line => {
    if(!process.env.SEAM_FAKE_COMMAND_FINAL_ONLY)send({method:'item/completed',params:{threadId,turnId,item:command}});
    send({method:'item/completed',params:{threadId,turnId,item}});
    const completed={method:'turn/completed',params:{threadId,turn:{id:turnId,status:process.env.SEAM_FAKE_FAIL?'failed':'completed',items:[command,item]}}};
+   if(process.env.SEAM_FAKE_USAGE){
+    const n=process.env.SEAM_FAKE_USAGE_RESET?1:current.turns;
+    const usage=n=>({inputTokens:n*100,cachedInputTokens:n*40,outputTokens:n*10,reasoningOutputTokens:n*2,totalTokens:n*110});
+    const update={method:'thread/tokenUsage/updated',params:{threadId,turnId,tokenUsage:{total:usage(n),last:usage(1)}}};
+    send(update);send(update);send({...update,params:{...update.params,threadId:'foreign-thread'}});
+   }
    if (process.env.SEAM_FAKE_COMPACT==='after-completed') {
     // Emit both notifications in one write, with compaction after completion.
     const compacted={method:'thread/compacted',params:{threadId,turnId}};
@@ -99,6 +105,36 @@ createInterface({input: process.stdin}).on('line', line => {
 }
 
 describe("Codex App Server 持久会话", () => {
+  it("失败或未上报用量会使累计基线失效，后续轮次不背负未知前序消耗", async () => {
+    const f=await fixture(), value=context(), records:any[]=[];
+    const run=()=>f.adapter().run({projectRoot:f.directory,context:{...value,jobId:crypto.randomUUID()},onTelemetry:record=>records.push(record)});
+    vi.stubEnv("SEAM_FAKE_USAGE","1");await run();
+    vi.stubEnv("SEAM_FAKE_FAIL","1");await expect(run()).rejects.toThrow("未完成");
+    vi.stubEnv("SEAM_FAKE_FAIL","");await run();expect(records.at(-1).tokenUsage.turnDelta).toBeNull();
+    vi.stubEnv("SEAM_FAKE_USAGE","");await run();expect(records.at(-1).tokenUsage).toBeNull();
+    vi.stubEnv("SEAM_FAKE_USAGE","1");await run();expect(records.at(-1).tokenUsage.turnDelta).toBeNull();
+    await run();expect(records.at(-1).tokenUsage.turnDelta.totalTokens).toBe(110);
+  });
+  it("用量来自原生事件，跨实例按累计差值去重，计数重置或未上报显示未知；同一会话标题随修订更新", async () => {
+    const f = await fixture(), value = context(), observed: any[] = [];
+    vi.stubEnv("SEAM_FAKE_USAGE", "1"); vi.stubEnv("SEAM_RUN_LABEL", "验收-test");
+    await f.adapter().run({ projectRoot: f.directory, context: value, onTelemetry: record => observed.push(record) });
+    await f.adapter().run({ projectRoot: f.directory, context: { ...value, jobId: crypto.randomUUID(), lifecycle: { ...value.lifecycle!, revision: 2 } }, onTelemetry: record => observed.push(record) });
+    expect(observed.map(item => item.tokenUsage.turnDelta.totalTokens)).toEqual([110,110]);
+    expect(observed[1].tokenUsage.threadTotal.totalTokens).toBe(220);
+    expect(observed[0].resourceStats.files).toBe(0); // No unused full-context/schema copies.
+    const titles=(await f.calls()).filter(call=>call.method==="thread/name/set").map(call=>call.params.name);
+    expect(titles).toHaveLength(2); expect(titles[0]).toContain("验收-test"); expect(titles[1]).toContain("r2"); expect(titles.every(title=>title.length<140)).toBe(true);
+    vi.stubEnv("SEAM_FAKE_USAGE_RESET", "1");
+    await f.adapter().run({ projectRoot: f.directory, context: { ...value, jobId: crypto.randomUUID() }, onTelemetry: record => observed.push(record) });
+    expect(observed[2].tokenUsage.turnDelta).toBeNull();
+    vi.stubEnv("SEAM_FAKE_USAGE", "");
+    await f.adapter().run({ projectRoot: f.directory, context: { ...value, jobId: crypto.randomUUID() }, onTelemetry: record => observed.push(record) });
+    expect(observed[3].tokenUsage).toBeNull();
+    const telemetryRoot=join(f.stateDir,"telemetry"), [scope]=await readdir(telemetryRoot);
+    const files=await readdir(join(telemetryRoot,scope!));expect(files).toHaveLength(4);
+    expect((await stat(join(telemetryRoot,scope!,files[0]!))).mode & 0o777).toBe(0o600);
+  });
   it.each([false, true])("实际命令事件只交付一次，完成轮次单独携带记录时也采集（%s）", async (finalOnly) => {
     const f = await fixture(); vi.stubEnv("SEAM_FAKE_TEST_COMMAND", "1");
     if (finalOnly) vi.stubEnv("SEAM_FAKE_COMMAND_FINAL_ONLY", "1");
@@ -128,7 +164,7 @@ describe("Codex App Server 持久会话", () => {
     expect(files).toHaveLength(1);
     expect((await stat(join(f.stateDir, files[0]!))).mode & 0o777).toBe(0o600);
     expect(JSON.stringify(cached)).not.toContain("private source");
-    expect(await f.adapter().getConversation?.({ projectRoot: f.directory, context: value })).toEqual({ threadId: first.threadId, transport: "codex-app-server" });
+    expect(await f.adapter().getConversation?.({ projectRoot: f.directory, context: value })).toMatchObject({ threadId: first.threadId, transport: "codex-app-server" });
   });
 
   it("同一协作参与方并发调用串行，其他参与方使用独立线程", async () => {
@@ -163,7 +199,7 @@ describe("Codex App Server 持久会话", () => {
     expect(nextPrompt).toContain(next.jobId);
     const [file] = await readdir(f.stateDir);
     const stored = JSON.parse(await readFile(join(f.stateDir, file!), "utf8"));
-    expect(stored.lastHandoff).toMatchObject({ version: 3, scope: `${value.collaborationId}:${value.participant.id}` });
+    expect(stored.lastHandoff).toMatchObject({ version: 4, scope: `${value.collaborationId}:${value.participant.id}` });
     expect(Object.values(stored.lastHandoff.sections).every((hash) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))).toBe(true);
     expect(JSON.stringify(stored.lastHandoff)).not.toContain(value.lifecycle.document);
   });
@@ -188,10 +224,10 @@ describe("Codex App Server 持久会话", () => {
     const changed = { ...value, jobId: crypto.randomUUID(), lifecycle: { ...value.lifecycle!, requirements: "新的需求不能在失败时被记为已交接。" } };
     vi.stubEnv("SEAM_FAKE_RAW_REPLY", "纯文本不是原生结构化回执");
     await expect(f.adapter().run({ projectRoot: f.directory, context: changed })).rejects.toThrow("未返回有效结构化 JSON");
-    expect(await readFile(path, "utf8")).toBe(saved);
+    expect(JSON.parse(await readFile(path, "utf8")).lastHandoff).toEqual(JSON.parse(saved).lastHandoff);
     vi.stubEnv("SEAM_FAKE_RAW_REPLY", JSON.stringify({ message: "错误版本", kind: "status", actions: [{ type: "plan.submit", revision: 99, content: "错误版本的方案".repeat(30) }], notifyParticipantIds: [], needsHumanInput: false }));
     await expect(f.adapter().run({ projectRoot: f.directory, context: changed })).rejects.toThrow("revision/documentHash");
-    expect(await readFile(path, "utf8")).toBe(saved);
+    expect(JSON.parse(await readFile(path, "utf8")).lastHandoff).toEqual(JSON.parse(saved).lastHandoff);
     vi.unstubAllEnvs();
     const priorLength = turns[1].params.input[0].text.length;
     vi.stubEnv("SEAM_CODEX_COMMAND", join(f.directory, "fake-codex.mjs"));
@@ -377,6 +413,6 @@ describe("Codex App Server 持久会话", () => {
     expect(schema).not.toContain('"execution.report"');
     expect(schema).not.toContain('"credential.request"');
     const confirmation = buildPrompt({ ...input, context: { ...value, lifecycle: { ...value.lifecycle!, phase: "plan_confirmation", documentHash: hash } } });
-    expect(confirmation).toContain("不能盲目确认");
+    expect(confirmation).toContain("完整文档");
   });
 });

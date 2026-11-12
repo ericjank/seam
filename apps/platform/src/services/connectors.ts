@@ -60,31 +60,40 @@ export async function heartbeat(agentId: string, capabilities?: {
   return jobState;
 }
 
-export async function pollConnectorJob(agentId: string, waitMs: number) {
+export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal) {
+  if (signal?.aborted) return null;
   await heartbeat(agentId);
   await db.update(connectorJobs).set({ status: "pending", leaseUntil: null, updatedAt: new Date() })
     .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "running"), lte(connectorJobs.leaseUntil, new Date())));
   const deadline = Date.now() + Math.min(Math.max(waitMs, 0), 20000);
   do {
+    if (signal?.aborted) return null;
     const [job] = await db.select().from(connectorJobs)
       .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, new Date())))
       .orderBy(asc(connectorJobs.sequence)).limit(1);
     if (job) {
+      if (signal?.aborted) return null;
       const [claim] = await db.update(connectorJobs).set({
-        status: "running", attempts: job.attempts + 1, leaseUntil: new Date(Date.now() + 20 * 60 * 1000), updatedAt: new Date(),
+        // Delivery is not execution. A disconnected receiver must not hold a
+        // 20-minute execution lease without acknowledging the claimed attempt.
+        status: "running", attempts: job.attempts + 1, leaseUntil: new Date(Date.now() + 60_000), updatedAt: new Date(),
       }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "pending"), eq(connectorJobs.attempts, job.attempts)));
       // Only the worker whose compare-and-set won may execute the task.
       if (claim.affectedRows === 1) {
         const [claimed] = await db.select().from(connectorJobs)
           .where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, job.attempts + 1))).limit(1);
         if (claimed) {
+          const release = () => db.update(connectorJobs).set({ status: "pending", leaseUntil: null, updatedAt: new Date() }).where(and(eq(connectorJobs.id, claimed.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, claimed.attempts)));
           try {
+            if (signal?.aborted) { await release(); return null; }
             const payload = await refreshAgentJobContext(claimed);
+            if (signal?.aborted) { await release(); return null; }
             await db.update(connectorJobs).set({ payload, updatedAt: new Date() }).where(and(
               eq(connectorJobs.id, claimed.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, claimed.attempts),
             ));
             return { ...claimed, payload };
           } catch (error) {
+            if (signal?.aborted) { await release(); return null; }
             const message = error instanceof HttpError ? error.message : "任务上下文准备失败，请检查项目参与方与协作状态";
             await db.update(connectorJobs).set({ status: "failed", error: message, leaseUntil: null, updatedAt: new Date() })
               .where(and(eq(connectorJobs.id, claimed.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, claimed.attempts)));
@@ -96,7 +105,10 @@ export async function pollConnectorJob(agentId: string, waitMs: number) {
         }
       }
     }
-    if (Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 500));
+    if (Date.now() < deadline) await new Promise<void>((resolve) => {
+      const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+      const timer = setTimeout(done, 500); signal?.addEventListener("abort", done, { once: true }); if (signal?.aborted) done();
+    });
   } while (Date.now() < deadline);
   return null;
 }

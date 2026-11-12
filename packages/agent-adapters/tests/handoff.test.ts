@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile, utimes, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { collaborationContextSchema, type CollaborationContext, type CollaborationMessage } from "@seam/protocol";
-import { buildNativeHandoff, materializeHandoffResources, type HandoffCheckpoint } from "../src/handoff";
+import { buildNativeHandoff, materializeHandoffResources, pruneHandoffResources, type HandoffCheckpoint } from "../src/handoff";
 import { buildPrompt } from "../src/cli";
 import type { AgentRunInput } from "../src/types";
 
@@ -30,6 +30,30 @@ function input(value = context()): AgentRunInput {
 }
 
 describe("Native human-readable handoff", () => {
+  it("累计要求不重复初始目标或当前delta，未变轮次只保留当前授权控制", () => {
+    const value = context(), delta = "DELTA_SENTINEL：本次撤销折扣";
+    value.lifecycle = { ...value.lifecycle!, revision: 5, requirements: `${value.objective}\n\n## 第5版\n${delta}`, changeRequest: delta };
+    const first = buildNativeHandoff(input(value));
+    expect(occurrences(first.prompt, value.objective)).toBe(1); expect(occurrences(first.prompt, delta)).toBe(1);
+    const next = buildNativeHandoff(input({ ...value, jobId: id(9) }), first.checkpoint);
+    expect(next.prompt).not.toContain(value.objective); expect(next.prompt).not.toContain(delta);
+    expect(next.prompt).toContain("修订：5"); expect(next.prompt).toContain("approvedHash"); expect(next.prompt).toContain("read-only");
+  });
+  it("原生仅物化按需长资源，清理过期缓存保留当前引用及未知文件", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "seam-resource-retention-"));
+    try {
+      const value = context(); value.lifecycle!.document = "必须保留的完整文档".repeat(300);
+      const prepared = await materializeHandoffResources(input(value), directory, undefined, false);
+      expect(prepared.resources!.some((item) => ["context", "schema", "goal"].includes(item.key))).toBe(false);
+      const document = prepared.resources!.find((item) => item.key === "document")!;
+      const scope = document.path.slice(0, document.path.lastIndexOf("/")), expired = join(scope, `${"e".repeat(64)}.txt`), unknown = join(scope, "audit.json");
+      await writeFile(expired, "expired"); await writeFile(unknown, "audit");
+      for (const path of [document.path, expired, unknown]) await utimes(path, new Date(0), new Date(0));
+      expect(await pruneHandoffResources(scope, [document.path], 30)).toBe(1);
+      expect(await readFile(document.path, "utf8")).toBe(value.lifecycle!.document);
+      expect(await readdir(scope)).toContain("audit.json");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it("长资料变为可校验的私有资源，原文完整保留；重连恢复引用，篡改则拒绝调用", async () => {
     const directory = await mkdtemp(join(tmpdir(), "seam-handoff-resource-test-"));
     try {
@@ -60,9 +84,9 @@ describe("Native human-readable handoff", () => {
     const added = message(12, "NEW_INSTRUCTION_SENTINEL：新增错误边界测试。");
     const next = buildNativeHandoff(input({ ...value, jobId: id(5), instructions: [...value.instructions, added], messages: [added] }), first.checkpoint);
     expect(occurrences(next.prompt, added.body)).toBe(1);
-    expect(next.prompt).toContain(oldInstruction.body);
-    expect(next.prompt).toContain(value.objective);
-    expect(next.prompt).toContain(value.lifecycle!.requirements);
+    expect(next.prompt).not.toContain(oldInstruction.body);
+    expect(next.prompt).not.toContain(value.objective);
+    expect(next.prompt).not.toContain(value.lifecycle!.requirements);
     expect(next.prompt).toContain(id(5));
     expect(first.outputSchema).toBeTypeOf("object");
     expect(first.prompt).not.toContain('"properties"');
@@ -153,7 +177,7 @@ describe("Native human-readable handoff", () => {
     expect(next.prompt).toMatch(/approvedHash[^\n]*(?:未批准|无|null|none)/iu);
     expect(next.prompt).toMatch(/当前为空|不再适用|no longer|now empty/iu);
     expect(next.prompt).not.toContain(document);
-    expect(next.prompt).toContain(value.instructions[0]!.body);
+    expect(next.prompt).not.toContain(value.instructions[0]!.body);
   });
 
   it("更换协作或参与方、无效版本或校验点恢复完整交接，旧指令不依赖另一线程", () => {
