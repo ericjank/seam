@@ -1,4 +1,4 @@
-import { agentTurnResultSchema, sharedContractSchema, ARTIFACT_TYPES, CREDENTIAL_TYPES, WORK_STATUSES, type AgentTurnResult } from "@seam/protocol";
+import { agentTurnResultSchema, sharedContractSchema, informationSourceSchema, ARTIFACT_TYPES, CREDENTIAL_TYPES, WORK_STATUSES, type AgentTurnResult } from "@seam/protocol";
 import { z } from "zod";
 import type { AgentRunInput } from "./types.js";
 
@@ -26,8 +26,12 @@ function nativeResponseSchema(input: AgentRunInput) {
   const lifecycle = input.context?.lifecycle;
   let actions: z.ZodType[];
   if (!lifecycle) actions = Object.values(auxiliaryActions);
+  else if (input.context?.informationTask && !lifecycle.paused) {
+    actions = [z.object({ type: z.literal("information.respond"), revision: z.literal(lifecycle.revision), requestId: z.literal(input.context.informationTask.requestId),
+      status: z.enum(["found", "unavailable"]), answer: z.string().min(1).max(10_000), sources: z.array(informationSourceSchema).min(1).max(20) }).strict()];
+  }
   else {
-    const blocked = z.object({ type: z.literal("workflow.blocked"), revision: z.literal(lifecycle.revision), kind: z.enum(["waiting_peer", "retryable", "needs_admin"]), reason: z.string().min(10).max(5000), dependencyParticipantIds: z.array(id).max(50), retryAfterSeconds: z.number().int().min(1).max(300) }).strict();
+    const blocked = z.object({ type: z.literal("workflow.blocked"), revision: z.literal(lifecycle.revision), kind: z.enum(["waiting_peer", "retryable", "needs_admin"]), reason: z.string().min(10).max(5000), dependencyParticipantIds: z.array(id).max(50), retryAfterSeconds: z.number().int().min(1).max(300), requiresAuthorization: z.boolean() }).strict();
     const publish = z.object({ type: z.literal("service.publish"), revision: z.literal(lifecycle.revision), name: z.string().min(1).max(100), baseUrl: z.string().url().max(2000), healthPath: z.string().max(1000), ttlSeconds: z.number().int().min(30).max(3600) }).strict();
     const submit = z.object({ type: z.literal("plan.submit"), revision: z.literal(lifecycle.revision), content: z.string().min(100).max(100_000) }).strict();
     switch (lifecycle.paused ? "paused" : lifecycle.phase) {
@@ -52,7 +56,7 @@ function nativeResponseSchema(input: AgentRunInput) {
       }).strict()).min(1).max(100) }).strict(), publish]; break;
       default: actions = [];
     }
-    if (actions.length) actions.push(blocked);
+    if (actions.length) actions.push(blocked, z.object({ type: z.literal("information.request"), revision: z.literal(lifecycle.revision), question: z.string().min(10).max(5000), searched: z.array(informationSourceSchema).min(2).max(20) }).strict());
   }
   const item = actions.length === 0 ? z.object({}).strict()
     : actions.length === 1 ? actions[0]!

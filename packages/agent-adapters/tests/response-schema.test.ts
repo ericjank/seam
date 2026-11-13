@@ -29,6 +29,16 @@ function inspectStrictObjects(value: unknown) {
 }
 
 describe("Native response schema", () => {
+  it("信息任务只有绑定requestId的答复动作，即使当前实施已获批准也不得提交实施或服务发布", () => {
+    const value=input("executing"),requestId=crypto.randomUUID();
+    value.context!.lifecycle!.approvedHash=value.context!.lifecycle!.documentHash;
+    value.context!.informationTask={requestId,mode:"peer"};
+    const response={type:"information.respond",revision:4,requestId,status:"found",answer:"从本方协议查到所需事实",sources:[{scope:"local_project",reference:"docs/api.md",finding:"明确规定接口字段"}]};
+    expect(parse([response],value).actions).toEqual([response]);
+    expect(()=>parse([{...response,requestId:crypto.randomUUID()}],value)).toThrow("当前阶段");
+    const schema=buildNativeOutputSchema(value);inspectStrictObjects(schema);
+    expect(JSON.stringify(schema)).not.toContain("execution.report");expect(JSON.stringify(schema)).not.toContain("service.publish");
+  });
   it("每阶段生成全required、closed object的结构，避免default与开放record", () => {
     for (const phase of ["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying", "awaiting_approval", "awaiting_review", "terminated"]) {
       const schema = buildNativeOutputSchema(input(phase));

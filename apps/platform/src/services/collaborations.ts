@@ -208,7 +208,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     connectorCapabilities: agentIds.flatMap((agentId) => {
       const report = capabilityRows.find((row) => row.actorId === agentId);
       if (!report) return [];
-      const metadata = report.metadata as { adapter: string; executionMode: string; testConfigured: boolean };
+      const metadata = report.metadata as { adapter: string; executionMode: string; testConfigured: boolean; supportsInformationLookup?: boolean };
       return [{ agentId, ...metadata, reportedAt: report.createdAt.toISOString() }];
     }),
   };

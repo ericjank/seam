@@ -33,6 +33,7 @@ export async function heartbeat(agentId: string, capabilities?: {
   adapter: "codex" | "codex-app-server" | "claude-code" | "generic-cli" | "mock";
   executionMode: "read-only" | "workspace-write" | "external";
   testConfigured: boolean;
+  supportsInformationLookup?: boolean;
 }, activeJob?: { id: string; attempts: number; cancelled?: boolean }) {
   await db.update(agents).set({ status: "online", lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(agents.id, agentId));
   if (capabilities) {
@@ -40,7 +41,7 @@ export async function heartbeat(agentId: string, capabilities?: {
       eq(auditEvents.actorId, agentId), eq(auditEvents.action, "connector.capabilities"),
     )).orderBy(desc(auditEvents.sequence)).limit(1);
     const previous = latest?.metadata as typeof capabilities | undefined;
-    if (!previous || previous.adapter !== capabilities.adapter || previous.executionMode !== capabilities.executionMode || previous.testConfigured !== capabilities.testConfigured) {
+    if (!previous || previous.adapter !== capabilities.adapter || previous.executionMode !== capabilities.executionMode || previous.testConfigured !== capabilities.testConfigured || previous.supportsInformationLookup !== capabilities.supportsInformationLookup) {
       await db.insert(auditEvents).values({ id: newId(), actorType: "connector", actorId: agentId, action: "connector.capabilities", metadata: capabilities });
     }
   }
@@ -60,7 +61,8 @@ export async function heartbeat(agentId: string, capabilities?: {
   return jobState;
 }
 
-export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal) {
+export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false) {
+  const informationOnly = (payload: unknown) => Boolean((payload as { context?: { informationTask?: unknown } } | null)?.context?.informationTask);
   if (signal?.aborted) return null;
   await heartbeat(agentId);
   await db.update(connectorJobs).set({ status: "pending", leaseUntil: null, updatedAt: new Date() })
@@ -71,7 +73,7 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
     const [job] = await db.select().from(connectorJobs)
       .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, new Date())))
       .orderBy(asc(connectorJobs.sequence)).limit(1);
-    if (job) {
+    if (job && (supportsInformationLookup || !informationOnly(job.payload))) {
       if (signal?.aborted) return null;
       const [claim] = await db.update(connectorJobs).set({
         // Delivery is not execution. A disconnected receiver must not hold a
@@ -91,6 +93,9 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
             await db.update(connectorJobs).set({ payload, updatedAt: new Date() }).where(and(
               eq(connectorJobs.id, claimed.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, claimed.attempts),
             ));
+            // Old Connectors strip unknown context fields and could otherwise
+            // execute normal approved work while assigned a read-only lookup.
+            if (!supportsInformationLookup && informationOnly(payload)) { await release(); return null; }
             return { ...claimed, payload };
           } catch (error) {
             if (signal?.aborted) { await release(); return null; }

@@ -11,6 +11,7 @@ export async function POST(request: Request) {
       capabilities: z.object({
         adapter: z.enum(["codex", "codex-app-server", "claude-code", "generic-cli", "mock"]),
         executionMode: z.enum(["read-only", "workspace-write", "external"]), testConfigured: z.boolean(),
+        supportsInformationLookup: z.boolean().optional(),
       }).optional(),
     }).parse(await request.json());
     await authenticateConnector(request, agentId);

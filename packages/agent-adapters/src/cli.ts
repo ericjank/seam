@@ -68,7 +68,7 @@ function cliOutputSchema(input: AgentRunInput) {
   const schema = z.toJSONSchema(agentTurnResultSchema);
   const phase = input.context?.lifecycle?.phase;
   if (phase && isRecord(schema.properties) && isRecord(schema.properties.actions)) {
-    const allowed = new Set(lifecycleActions(input.context?.lifecycle?.paused ? "paused" : phase));
+    const allowed = new Set(lifecycleActions(input.context?.lifecycle?.paused ? "paused" : phase, Boolean(input.context?.informationTask) && !input.context?.lifecycle?.paused));
     const actions = schema.properties.actions;
     if (isRecord(actions.items)) {
       for (const union of ["oneOf", "anyOf"]) {

@@ -188,13 +188,14 @@ async function main() {
     await complete(local, job, jointAction(job, status));
   }
   const reviewed = await detail();
-  assert.equal(reviewed.lifecycle.phase, "awaiting_review"); assert.ok(reviewed.lifecycle.report.includes("未执行用例"));
-  assert.equal(reviewed.collaboration.status, "validating");
-  await expected(`${path}/lifecycle`, { action: "terminate", revision: 2 }, 403, { session: memberCookie });
-  await lifecycle({ action: "terminate", revision: 2 });
+  assert.equal(reviewed.lifecycle.phase, "planning"); assert.equal(reviewed.lifecycle.revision, 3);
+  assert.ok(reviewed.lifecycle.baseline.report.includes("未执行用例"));assert.equal(reviewed.lifecycle.repair.sourceRevision,2);assert.equal(reviewed.lifecycle.approvedHash,null);
+  assert.equal(reviewed.collaboration.status, "negotiating");
+  await expected(`${path}/lifecycle`, { action: "terminate", revision: 3 }, 403, { session: memberCookie });
+  await lifecycle({ action: "terminate", revision: 3 });
   await expected(`${path}/dispatch`, { autoAdvance: true }, 409);
   assert.equal((await detail()).collaboration.status, "completed");
-  checks.push("联测未执行如实汇总，不冒充通过；报告不自动接受；仅管理员手动终止，终止后不再派发");
+  checks.push("联测未执行保留原失败报告并自动起草修复版；不继承批准；管理员可终止未执行修复草案，终止后不再派发");
   console.log(JSON.stringify({ status: "passed", collaborationId: created.id, scope: "真实HTTP协议与权限验证，Agent结果为明确标注的合成回执", checks }, null, 2));
 }
 

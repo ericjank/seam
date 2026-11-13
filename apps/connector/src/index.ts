@@ -10,6 +10,7 @@ import { CredentialStore } from "./credential-store.js";
 import { assertOutboundPolicy } from "./outbound-policy.js";
 import { runLocalTest } from "./local-test.js";
 import { attachCommandEvidence, captureCommand, probeServices, ServiceReadinessError } from "./evidence.js";
+import { discoverProject } from "./discovery.js";
 
 export async function runConnector(config: ConnectorConfig) {
   const adapter = createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox, appServerStateDir: config.appServerStateDir, codexNetworkAccess: config.codexNetworkAccess });
@@ -40,6 +41,7 @@ export async function runConnector(config: ConnectorConfig) {
     adapter: config.adapter,
     executionMode: config.adapter === "codex" || config.adapter === "codex-app-server" ? config.codexSandbox ?? "read-only" : "external" as const,
     testConfigured: Boolean(process.env.SEAM_TEST_COMMAND),
+    supportsInformationLookup: true,
   };
   const deliverControl = async (entry: ControlReceipt) => {
     const response = await client.heartbeat(capabilities, AbortSignal.timeout(15_000), { id: entry.jobId, attempts: entry.attempts, cancelled: true });
@@ -101,7 +103,8 @@ export async function runConnector(config: ConnectorConfig) {
           let checkpoint: ExecutionCheckpoint | undefined;
           let finished = false;
           try {
-          const credentialIds = Array.isArray(job.payload.credentialIds) ? job.payload.credentialIds : [];
+          const informationOnly = Boolean((job.payload.context as { informationTask?: unknown } | undefined)?.informationTask);
+          const credentialIds = !informationOnly && Array.isArray(job.payload.credentialIds) ? job.payload.credentialIds : [];
           for (const credentialId of credentialIds) {
             if (typeof credentialId !== "string" || await credentialStore.get(credentialId)) continue;
             const credential = await client.claimCredential(credentialId);
@@ -109,21 +112,22 @@ export async function runConnector(config: ConnectorConfig) {
           }
           if (job.kind === "collaboration.turn") {
             const context = collaborationContextSchema.parse(job.payload.context);
+            if (context.informationTask) context.localDiscovery = await discoverProject(config.projectRoot);
             const planned = context.lifecycle?.contributions.find((item) => item.participantId === context.participant.id)?.baseline;
             const saved = context.lifecycle?.phase === "executing" ? await journal.checkpoint(context.collaborationId) : null;
             const same = (a: typeof before | undefined, b: typeof before | undefined) => Boolean(a && b && a.head === b.head && a.treeHash === b.treeHash);
             const resuming = Boolean(saved?.state === "recoverable" && saved.revision === context.lifecycle?.revision && saved.approvedHash === context.lifecycle?.approvedHash && same(saved.approvedBaseline, planned) && same(saved.current, before));
-            if (context.lifecycle?.phase === "executing" && planned && !same(planned, before) && !resuming) {
+            if (!context.informationTask && context.lifecycle?.phase === "executing" && planned && !same(planned, before) && !resuming) {
               result = { agentTurn: { message: "工作区基线已变化或无法核对，已停止实施，请核对基线并重新批准。", actions: [{ type: "execution.report", revision: context.lifecycle.revision, status: "failed", summary: before ? "批准文档对应的代码基线已变化，未执行代码修改。" : "当前工作区基线无法读取，不能核对已批准版本，未执行代码修改。", evidence: { planned, current: before } }] } };
               return;
             }
-            if (context.lifecycle?.phase === "executing" && context.lifecycle.approvedHash && before && planned) {
+            if (!context.informationTask && context.lifecycle?.phase === "executing" && context.lifecycle.approvedHash && before && planned) {
               checkpoint = { revision: context.lifecycle.revision, approvedHash: context.lifecycle.approvedHash, approvedBaseline: planned, current: before, state: "running", jobId: job.id };
               await journal.saveCheckpoint(context.collaborationId, checkpoint);
             }
             const runs: import("@seam/protocol").CommandEvidence[] = [];
             const collect = (record: Parameters<typeof captureCommand>[0], source: import("@seam/protocol").CommandEvidence["source"]) => { const run = captureCommand(record, config.projectRoot, source); if (run) runs.push(run); };
-            if (context.lifecycle?.phase === "joint_verifying" && process.env.SEAM_TEST_COMMAND) {
+            if (!context.informationTask && context.lifecycle?.phase === "joint_verifying" && process.env.SEAM_TEST_COMMAND) {
               await runLocalTest(config.projectRoot, controller.signal, { SEAM_SERVICE_URL: context.lifecycle.services[0]?.baseUrl ?? "", SEAM_REVISION: String(context.lifecycle.revision) }, (record) => collect(record, "local-test"));
               context.lifecycle.evidenceRuns.push(...runs.map((run) => ({ ...run, participantId: context.participant.id })));
             }

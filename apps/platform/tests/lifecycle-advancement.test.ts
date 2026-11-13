@@ -50,6 +50,18 @@ beforeEach(() => {
 });
 
 describe("生命周期自动推进的迟到回调隔离", () => {
+  it("本方主任务已完成的对端仍被调度为只读事实答复；信息进展不耗尽旧推进预算", async () => {
+    const now=new Date().toISOString(),requestId=crypto.randomUUID();
+    const l=state.detail.lifecycle;l.phase="executing";l.blocks=[{participantId:"a",kind:"gathering_info"}];l.reports=[{participantId:"b",status:"passed"}];
+    l.informationRequests=[{id:requestId,revision:1,phase:"executing",requestedByParticipantId:"a",targetParticipantIds:["b"],stage:"peer",status:"pending",question:"对端接口金额规则是什么？",answer:null,createdAt:now,responses:[]}];
+    state.job.payload.lifecycleSnapshot.phase="executing";
+    await advanceAgentWorkflow("job");expect(newJobs()).toHaveLength(1);
+    expect(newJobs()[0]!.values).toMatchObject({agentId:"agent-b",payload:{context:{informationTask:{requestId,mode:"peer"}}}});
+    state.inserted=[];l.informationRequests[0].status="answered";l.blocks=[];
+    state.job.payload.workflow.round=12;state.job.result={agentTurn:{actions:[{type:"information.respond"}]}};
+    await advanceAgentWorkflow("job");expect(newJobs()).toHaveLength(1);expect(newJobs()[0]!.values.agentId).toBe("agent-a");
+    expect(newJobs()[0]!.values.payload.workflow).toMatchObject({round:1,maxRounds:12});
+  });
   it("需要管理员事实时停止派发，等待对端服务时不按轮询反复唤起模型", async () => {
     state.detail.lifecycle.phase = "executing"; state.job.payload.lifecycleSnapshot.phase = "executing";
     state.detail.lifecycle.blocks = [{ participantId: "a", kind: "needs_admin" }];

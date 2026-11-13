@@ -2,6 +2,7 @@ import type { AdapterOptions, AgentRunInput, CodexSandbox } from "./types.js";
 
 /** Authorization comes from typed lifecycle state, never from free-form text. */
 export function codexSandboxForTurn(input: AgentRunInput, options: AdapterOptions = {}): CodexSandbox {
+  if (input.context?.informationTask) return "read-only";
   const lifecycle = input.context && "lifecycle" in input.context ? input.context.lifecycle : null;
   if (options.codexSandbox !== "workspace-write" || !lifecycle || typeof lifecycle !== "object") return "read-only";
   const state = lifecycle as Record<string, unknown>;

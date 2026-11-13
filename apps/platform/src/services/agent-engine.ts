@@ -1,7 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
 import { collaborations, connectorJobs, messages, participants } from "@/db/schema";
-import { agentTurnResultSchema, lifecycleActions, type CollaborationContext, type Participant } from "@seam/protocol";
+import { agentTurnResultSchema, informationTaskFor, lifecycleActions, type CollaborationContext, type Participant } from "@seam/protocol";
 import { newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
 import { normalizeLifecycleOutcome } from "@/lib/lifecycle-outcome";
@@ -81,6 +81,7 @@ export function buildContext(detail: Awaited<ReturnType<typeof getCollaborationD
   const referencedVersions = new Set(detail.proposals.map((p) => p.artifactVersionId));
   return {
     lifecycle: detail.lifecycle,
+    informationTask: detail.lifecycle ? informationTaskFor(detail.lifecycle, participantId) : null,
     jobId, collaborationId: detail.collaboration.id, title: detail.collaboration.title,
     type: detail.collaboration.type, status: detail.collaboration.status, objective: detail.collaboration.objective,
     participant, participants: participantRows,
@@ -132,10 +133,12 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
   const lifecycle = await assertLifecycleJobCurrent(collaboration.id, (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot);
   if (lifecycle) {
-    turn = normalizeLifecycleOutcome(turn, lifecycle.revision);
-    const allowed = lifecycleActions(lifecycle.phase);
+    const informationTask = (job.payload as { context?: CollaborationContext }).context?.informationTask;
+    if (!informationTask) turn = normalizeLifecycleOutcome(turn, lifecycle.revision);
+    const allowed = lifecycleActions(lifecycle.phase, Boolean(informationTask));
     if (turn.actions.some((action) => !allowed.includes(action.type))) throw new HttpError(409, "动作不符合当前生命周期阶段");
-    if (turn.actions.filter((action) => ["plan.submit", "plan.compose", "plan.confirm", "plan.reject", "execution.report", "integration.report", "workflow.blocked"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交一项当前阶段成果或明确阻塞");
+    if (informationTask && turn.actions.some(action => action.type !== "information.respond" || action.requestId !== informationTask.requestId)) throw new HttpError(409, "只读信息任务只能答复本次分配的问题");
+    if (turn.actions.filter((action) => ["plan.submit", "plan.compose", "plan.confirm", "plan.reject", "execution.report", "integration.report", "workflow.blocked", "information.request", "information.respond"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交一项当前阶段成果或明确阻塞");
   }
   // Validate the entire batch before applying any action. An Agent can participate in
   // multiple collaborations, but IDs from one run must never affect another.
@@ -148,7 +151,7 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const actor = { kind: "participant" as const, id: participant.id };
   let changed = false;
   for (const action of turn.actions) {
-    if (action.type === "plan.submit" || action.type === "plan.compose" || action.type === "plan.reject" || action.type === "plan.confirm" || action.type === "execution.report" || action.type === "integration.report" || action.type === "workflow.blocked" || action.type === "service.publish") {
+    if (action.type === "plan.submit" || action.type === "plan.compose" || action.type === "plan.reject" || action.type === "plan.confirm" || action.type === "execution.report" || action.type === "integration.report" || action.type === "workflow.blocked" || action.type === "service.publish" || action.type === "information.request" || action.type === "information.respond") {
       if (!lifecycle) throw new HttpError(409, "当前协作尚未启用管理员审批流程");
       const outcome = await applyLifecycleAction(actor, job.collaborationId, action);
       changed ||= outcome.changed;
@@ -217,8 +220,9 @@ export async function advanceAgentWorkflow(jobId: string) {
       // message heuristic. Both approval and final closure remain human gates.
       if (detail.lifecycle.paused || ["awaiting_approval", "awaiting_review", "terminated"].includes(detail.lifecycle.phase)) return;
       const targets = lifecycleTargets(detail.lifecycle);
-      if (targets.length && workflow.round < workflow.maxRounds) {
-        await enqueueTurns(detail, { ...workflow, round: workflow.round + 1 }, targets);
+      const informationProgress = batch.some(row => row.status === "completed" && (row.result as { agentTurn?: { actions?: Array<{ type: string }> } } | null)?.agentTurn?.actions?.some(action => action.type === "information.respond"));
+      if (targets.length && (workflow.round < workflow.maxRounds || informationProgress)) {
+        await enqueueTurns(detail, { ...workflow, id: informationProgress ? newId() : workflow.id, round: informationProgress ? 1 : workflow.round + 1 }, targets);
       } else if (targets.length) {
         await db.insert(messages).values({ id: newId(), collaborationId: collaboration.id, authorType: "system", authorName: "Seam", kind: "system", body: "自动协作连续重试已达上限，请查看失败原因后重试。", metadata: { workflowStopped: workflow.id } });
       }
@@ -262,7 +266,10 @@ export async function advanceAgentWorkflow(jobId: string) {
 }
 
 function lifecycleTargets(lifecycle: NonNullable<Awaited<ReturnType<typeof getLifecycleContext>>>) {
-  if (lifecycle.paused || lifecycle.blocks?.some((block) => block.kind === "needs_admin")) return [];
+  if (lifecycle.paused) return [];
+  const informationTargets = lifecycle.requiredParticipantIds.filter(id => informationTaskFor(lifecycle, id));
+  if (informationTargets.length) return informationTargets;
+  if (lifecycle.blocks?.some((block) => block.kind === "needs_admin")) return [];
   const eligible = lifecycle.phase === "plan_synthesis" ? [lifecycle.coordinatorParticipantId ?? lifecycle.requiredParticipantIds[0]!] : lifecycle.requiredParticipantIds.filter((id) => lifecycle.phase === "planning"
     ? !lifecycle.contributions.some((entry) => entry.participantId === id)
     : lifecycle.phase === "plan_confirmation" ? !lifecycle.confirmations.includes(id)
@@ -271,6 +278,7 @@ function lifecycleTargets(lifecycle: NonNullable<Awaited<ReturnType<typeof getLi
   return eligible.filter((id) => {
     const block = lifecycle.blocks?.find((item) => item.participantId === id);
     if (!block) return true;
+    if (block.kind === "gathering_info") return false;
     if (block.kind === "waiting_peer" && block.dependencyParticipantIds.length) return block.dependencyParticipantIds.every((dependency) => lifecycle.phase === "planning"
       ? lifecycle.contributions.some((item) => item.participantId === dependency)
       : lifecycle.services?.some((item) => item.participantId === dependency && Date.parse(item.expiresAt) > Date.now()));

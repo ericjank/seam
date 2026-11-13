@@ -13,8 +13,8 @@ export function providerAssertions(revision) {
     ...(revision === 5 ? ["real peer HTTP retired discount is rejected"] : [])];
 }
 /** Only the current approved revision is written to each generated script. */
-export function jointFixture({ liveURL, role, revision }) {
-  if (![1, 2, 3, 4, 5].includes(revision)) throw new Error("explicit approved fixture revision required");
+export function jointFixture({ liveURL, role, revision, businessRevision = revision, readinessFields = {} }) {
+  if (!Number.isInteger(revision) || revision < 1 || ![1, 2, 3, 4, 5].includes(businessRevision)) throw new Error("explicit approved fixture revision required");
   return `import assert from "node:assert/strict";
 import { test } from "node:test";
 ${role === "consumer" ? 'import { getQuote } from "./client.mjs";' : ''}
@@ -23,12 +23,12 @@ const revision = ${revision};
 const configuration = await fetch(base + "/health");
 assert.equal(configuration.status,200);
 assert.match(configuration.headers.get("content-type")??"",/^application\\/json\\b/);
-assert.deepEqual(await configuration.json(),{ready:true,revision});
+assert.deepEqual(await configuration.json(),{ready:true,revision,...${JSON.stringify(readinessFields)}});
 test("real peer HTTP health ready and approved revision",()=>{});
 const post = input => fetch(base + "/quote", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(input)});
 const quote = ${role === "consumer" ? "input => getQuote(base, input)" : "async input => { const response = await post(input); if (!response.ok) throw new Error(\"HTTP \" + response.status); return response.json(); }"};
-const max = ${revision === 3 ? 50 : 100};
-const expected = (sku, quantity, subtotal, percent = 0) => ({ sku, quantity, subtotal, currency:"CNY", ...(${revision >= 2 && revision <= 4} ? {discount:Math.floor(subtotal * percent / 100),total:subtotal - Math.floor(subtotal * percent / 100)} : {}) });
+const max = ${businessRevision === 3 ? 50 : 100};
+const expected = (sku, quantity, subtotal, percent = 0) => ({ sku, quantity, subtotal, currency:"CNY", ...(${businessRevision >= 2 && businessRevision <= 4} ? {discount:Math.floor(subtotal * percent / 100),total:subtotal - Math.floor(subtotal * percent / 100)} : {}) });
 for (const [sku, quantity, subtotal] of [["SKU-001",2,24000],["SKU-002",3,13500],["SKU-001",1,12000],["SKU-001",max,12000*max],["SKU-002",1,4500],["SKU-002",max,4500*max]]) {
   test("real peer HTTP quote " + sku + " quantity=" + quantity, async () => {
     assert.deepEqual(await quote({sku,quantity}), expected(sku,quantity,subtotal));
@@ -57,7 +57,7 @@ test("real peer HTTP malformed JSON and nonobjects return errors",async()=>{
     const body=await response.json(); assert.equal(typeof body.error,"string"); assert.ok(body.error.trim());
   }
 });
-if (${revision >= 2 && revision <= 4}) {
+if (${businessRevision >= 2 && businessRevision <= 4}) {
   for (const discountPercent of [0,10,100]) test("real peer HTTP discount " + discountPercent, async () => {
     const input = {sku:"SKU-001",quantity:2,discountPercent};
     assert.deepEqual(await quote(input), expected(input.sku,input.quantity,24000,discountPercent));
@@ -70,6 +70,6 @@ if (${revision >= 2 && revision <= 4}) {
     }
   });
 }
-${revision === 5 ? `test("real peer HTTP retired discount is rejected",async()=>{for(const discountPercent of [0,10,100,null,false]){const input={sku:"SKU-001",quantity:2,discountPercent};assert.equal((await post(input)).status,400);await assert.rejects(()=>quote(input),/400/);}});` : ""}
+${businessRevision === 5 ? `test("real peer HTTP retired discount is rejected",async()=>{for(const discountPercent of [0,10,100,null,false]){const input={sku:"SKU-001",quantity:2,discountPercent};assert.equal((await post(input)).status,400);await assert.rejects(()=>quote(input),/400/);}});` : ""}
 `;
 }

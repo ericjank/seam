@@ -15,6 +15,8 @@ import { publishJointEvidence } from "./publish-joint-evidence.mjs";
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const api = new SimulationApi();
+const repairInformation = process.env.SEAM_SIMULATION_SCENARIO === "repair-information";
+let contractVersion;
 const checks = [];
 let runRoot;
 let collaborationId;
@@ -118,6 +120,7 @@ async function runUntilPhase(expected) {
 }
 
 async function jointHttpCheck(revision) {
+  const businessRevision = repairInformation ? 1 : revision;
   const provider = await import(`${pathToFileURL(join(locals[0].root, "service.mjs"))}?revision=${revision}`);
   const consumer = await import(`${pathToFileURL(join(locals[1].root, "client.mjs"))}?revision=${revision}`);
   assert.equal(typeof provider.quote, "function", "provider must implement the approved quote export");
@@ -161,7 +164,7 @@ async function jointHttpCheck(revision) {
       assert.equal(rejected.status, 400);
     }
     const additionalInvalidDiscounts = [null, false, true, "10", 1.5, 101];
-    if (revision >= 2 && revision <= 4) {
+    if (businessRevision >= 2 && businessRevision <= 4) {
       const zeroDiscount = await consumer.getQuote(address, { sku: "SKU-001", quantity: 2, discountPercent: 0 });
       assert.equal(zeroDiscount.discount, 0);
       assert.equal(zeroDiscount.total, 24000);
@@ -182,10 +185,10 @@ async function jointHttpCheck(revision) {
     for (const quantity of [50,51,100]) {
       const input={sku:"SKU-001",quantity};
       const response=await fetch(`${address}/quote`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(input)});
-      if(revision===3 && quantity>50){assert.equal(response.status,400);await assert.rejects(()=>consumer.getQuote(address,input));}
+      if(businessRevision===3 && quantity>50){assert.equal(response.status,400);await assert.rejects(()=>consumer.getQuote(address,input));}
       else {assert.equal(response.status,200);assert.equal((await consumer.getQuote(address,input)).subtotal,12000*quantity);}
     }
-    if(revision===5){
+    if(businessRevision===5){
       assert.deepEqual(Object.keys(normal).sort(),["currency","quantity","sku","subtotal"]);
       for(const discountPercent of [0,10,100,null,false]){
         const input={sku:"SKU-001",quantity:2,discountPercent};
@@ -196,7 +199,7 @@ async function jointHttpCheck(revision) {
     // Consumer-side validation may avoid some calls. Each added invalid case
     // still has a direct provider HTTP check. Historical 6/10 counts belong
     // to their original reports; new executions record their actual counts.
-    assert.ok(received >= (revision >= 2 && revision <= 4 ? 8 + additionalInvalidDiscounts.length : 4), "joint checks must reach the provider through real HTTP");
+    assert.ok(received >= (businessRevision >= 2 && businessRevision <= 4 ? 8 + additionalInvalidDiscounts.length : 4), "joint checks must reach the provider through real HTTP");
     return { revision, status: "passed", transport: "real localhost HTTP", receivedRequests: received };
   } finally {
     server.closeAllConnections();
@@ -243,17 +246,23 @@ async function main() {
   await api.call("/api/health", undefined, { method: "GET" });
   await api.loginOwner();
   const suffix = randomUUID().slice(0, 8);
+  if (repairInformation) contractVersion = `public-quote-${randomUUID().slice(0, 8)}`;
   for (const [role, adapter] of [["provider", "generic-cli"], ["consumer", "codex-app-server"]]) {
     const registered = await api.register(`simulation-${role}-${suffix}`, adapter);
     const root = join(runRoot, role);
     await mkdir(root);
     await writeFile(join(root, "README.md"), `${contract}\n\n本项目职责：${role === "provider" ? "提供方" : "消费方"}。\n`);
     await writeFile(join(root, "AGENTS.md"), agentInstructions);
+    if (repairInformation) {
+      await writeFile(join(root, "README.md"), `${contract}\n\n本项目职责：${role}。服务的额外公开就绪字段contractVersion必须符合提供方现有项目文档；缺少时先查本地和共享资料，再自动询证，不由管理员填写。\n`);
+      await writeFile(join(root, "AGENTS.md"), `${agentInstructions}\n本次只实现基础报价，不增加折扣功能。修复版保持原业务和原必需断言，健康响应检查当前lifecycle.revision。测试名应是稳定标识，不把修订号写入测试名。joint_verifying只运行既有脚本并真实报告，不修改代码、测试或业务目标。失败用integration.report failed，平台只读起草修复方案，管理员批准前不再实施验证。\n${role === "consumer" ? "本项目没有提供方公开contractVersion的值。提交本方plan.submit前须先查本地和共享资料，缺失时使用information.request询证提供方；不能猜测值或要求管理员填。收到答复后复用并把contractVersion及当前revision一起列入就绪契约和实际HTTP联合测试。" : "本方公开协议事实保存在docs/integration-facts.json。"}`);
+      if (role === "provider") { await mkdir(join(root,"docs")); await writeFile(join(root,"docs/integration-facts.json"),JSON.stringify({contractVersion})); }
+    }
     await exec("git", ["init", "--quiet", root]);
     locals.push({ ...registered, root, role });
   }
   for (const local of locals) {
-    await exec("git", ["-C", local.root, "add", "README.md", "AGENTS.md"]);
+    await exec("git", ["-C", local.root, "add", "."]);
     await exec("git", ["-C", local.root, "-c", "user.name=Seam Simulation", "-c", "user.email=simulation@seam.test", "commit", "--quiet", "-m", "Initialize isolated acceptance fixture without implementations or tests"]);
   }
   await mkdir(join(runRoot, "mock-state"));
@@ -264,7 +273,7 @@ async function main() {
   const initial = await Promise.all(locals.map((local) => snapshot(local.root)));
   assert.ok(!contract.includes("discountPercent") && !contract.includes("修订2"), "future business requirements must not be preannounced");
   const created = await api.call("/api/collaborations", {
-    title: "合成报价接口联调", objective: revisionOne, projectId: locals[1].project.id, agentId: locals[1].agent.id,
+    title: repairInformation ? "资料获取与审批修复验收" : "合成报价接口联调", objective: repairInformation ? "按双方现有报价协议完成对接，自动查清缺失事实；失败后起草修复方案，经管理员批准后再实施验证。" : revisionOne, projectId: locals[1].project.id, agentId: locals[1].agent.id,
     targetProjectId: locals[0].project.id, targetAgentId: locals[0].agent.id,
   });
   collaborationId = created.id;
@@ -290,10 +299,36 @@ async function main() {
   await noSession.expect(`/api/collaborations/${collaborationId}/lifecycle`, { action: "terminate" }, 401, { token: locals[0].agent.token });
   checks.push("只读用户与Connector Token不能批准或终止协作");
 
-  const revisionCount=Number(process.env.SEAM_SIMULATION_REVISIONS ?? 5);
+  const revisionCount=repairInformation ? 2 : Number(process.env.SEAM_SIMULATION_REVISIONS ?? 5);
   assert.ok(Number.isInteger(revisionCount) && revisionCount>=2 && revisionCount<=5);
   let baseline=initial, ready;
-  for(let index=0;index<revisionCount;index++){
+  if (repairInformation) {
+    const first = await runUntilPhase("awaiting_approval"), firstState=lifecycle(first);
+    const lookup=firstState.informationRequests.find(row=>row.status==="answered"&&row.responses.some(reply=>reply.mode==="peer"&&reply.status==="found"&&reply.answer.includes(contractVersion)));
+    assert.ok(lookup,"the missing fact must come from a persisted peer information response, not the administrator");
+    await assertNoUnapprovedWrites(initial);
+    await writeFile(join(runRoot,"information-evidence.json"),JSON.stringify({request:lookup,expectedPublicContractVersion:contractVersion},null,2));
+    await writeFile(join(runRoot,"revision-1-approved-plan.md"),firstState.document);
+    await api.lifecycle(collaborationId,{action:"approve",revision:1,documentHash:firstState.documentHash});
+    const verifying=await runUntilPhase("joint_verifying"),oldService=lifecycle(verifying).services.find(row=>row.name==="quote");assert.ok(oldService);
+    const implementationBaseline=await Promise.all(locals.map(local=>snapshot(local.root)));
+    ready=await runUntilPhase("awaiting_approval");const repair=lifecycle(ready);
+    assert.equal(repair.revision,2);assert.equal(repair.repair.sourceRevision,1);assert.equal(repair.approvedHash,null);assert.ok(repair.baseline.report.includes("失败"));
+    await assertNoUnapprovedWrites(implementationBaseline);
+    await new Promise(resolve=>setTimeout(resolve,2000));await assertNoUnapprovedWrites(implementationBaseline);
+    await api.expect(`/api/collaborations/${collaborationId}/lifecycle`,{action:"approve",revision:1,documentHash:firstState.documentHash},409);
+    await api.expect(`/api/collaborations/${collaborationId}/test-runs`,{participantId:created.participantId},409);
+    const wrongResponse=await fetch(oldService.baseUrl+"/quote",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sku:"SKU-001",quantity:2})});
+    const wrong=await wrongResponse.json();assert.equal(wrong.subtotal,24001,"the failed HTTP implementation remains unchanged before repair approval");
+    await writeFile(join(runRoot,"revision-1-report.json"),JSON.stringify({status:"failed",revision:1,documentHash:firstState.documentHash,report:repair.baseline.report,failures:repair.repair.failures,actualFailedHTTPResponse:wrong},null,2));
+    await writeFile(join(runRoot,"repair-approval-evidence.json"),JSON.stringify({repair:repair.repair,approvedHashBeforeAdministrator:null,before:implementationBaseline,after:await Promise.all(locals.map(local=>snapshot(local.root))),noRepairWritesBeforeApproval:true},null,2));
+    checks.push("本地与共享查找后自动向对端取得公开contractVersion；管理员未填写任何接口资料");
+    checks.push("真实HTTP金额故障产生失败证据，平台自动起草修复版；原报告保留、旧批准失效、批准前双方文件保持不变且故障仍存在");
+    await approveAndExecute(ready,implementationBaseline);
+    const repaired=await api.detail(collaborationId);assert.equal(lifecycle(repaired).repair.sourceRevision,1);
+    assert.ok(lifecycle(repaired).integrationReports.every(entry=>entry.checks.every(check=>check.status==="passed")));
+    checks.push("管理员确认新修复文档后，两端重新实施并真实验证通过；没有人工追加修复目标或自动批准");
+  } else for(let index=0;index<revisionCount;index++){
     if(index>0){
       if(index===3) await restartConsumerWithLostCheckpoint();
       const old=lifecycle(ready);
@@ -325,7 +360,7 @@ async function main() {
   await assertNoUnapprovedWrites(beforeTermination);
   checks.push("管理员终止后无运行任务，禁止继续派发/批准，拒绝旧回执，项目文件保持不变");
 
-  const result = { ok: true, collaborationId, base: api.base, runRoot, checks, revisions: revisionCount, runLabel: `验收-${runRoot.split("-").at(-1)}`,
+  const result = { ok: true, collaborationId, base: api.base, runRoot, checks, revisions: revisionCount, scenario:repairInformation ? "repair-information" : "five-revision", runLabel: `验收-${runRoot.split("-").at(-1)}`,
     concurrency: "two independent continuously polling Connector processes; no provider-first scheduler",
     realAI: "local Codex app-server", virtualPeer: "deterministic provider implemented and tested locally",
     scope: "本地Docker中心及MySQL、两个隔离合成项目、真实HTTP报价接口；不代表实际业务项目联调或生产部署" };

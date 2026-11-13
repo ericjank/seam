@@ -246,6 +246,8 @@ export const lifecycleRevisions = mysqlTable("lifecycle_revisions", {
   requirements: longtext("requirements").notNull(),
   changeRequest: longtext("change_request"),
   sharedContract: json("shared_contract").$type<import("@seam/protocol").SharedContract>(),
+  repair: json("repair_context").$type<import("@seam/protocol").LifecycleContext["repair"]>(),
+  informationRequests: json("information_requests").$type<import("@seam/protocol").InformationRequest[]>(),
   objections: json("objections").$type<{ participantId: string; documentHash: string; reason: string }[]>(),
   document: longtext("document"),
   documentHash: varchar("document_hash", { length: 64 }),

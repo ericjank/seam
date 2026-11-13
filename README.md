@@ -170,13 +170,15 @@ export SEAM_TEST_COMMAND='pnpm test:contract'
 1. Connect both project Agents locally, select the two projects, enter the goal and submit once.
 2. Both Agents inspect their projects read-only. A project Agent composes one shared interface contract, responsibilities and joint acceptance cases. Each party reviews the exact document; objections return it for revision and invalidate confirmations.
 3. An administrator reviews the complete document and explicitly approves that revision for execution.
-4. Both Agents implement and test locally. Seam then schedules actual joint verification, collecting passed, failed or not-run outcomes separately from local tests and administrator acceptance.
+4. Both Agents implement and test locally. Seam then schedules actual joint verification, collecting passed, failed or not-run outcomes separately from local tests and administrator acceptance. A failed round retains its original report and starts a read-only repair plan; both Agents confirm it, and an administrator approves the new document before implementation or verification resumes.
 5. Add requirements to start an incremental revision using the previous contract and report. Review changes and approve the complete new plan; previous approval cannot authorize it.
 6. After reviewing the final report, the administrator explicitly terminates the collaboration. Reports never automatically close it.
 
 Use `--adapter codex-app-server` with a local `SEAM_CODEX_SANDBOX=workspace-write` capability. For test endpoints or dependencies, a local maintainer can also set `SEAM_CODEX_NETWORK_ACCESS=true`; network access remains disabled during planning. Planning and unapproved turns remain read-only; writing requires the approved executing or joint_verifying phase and matching document hash. The adapter persists native threads, resumes after restarts, serializes turns and rejects interactive approvals on the unattended channel. Legacy invitations and collaboration APIs remain available.
 
 Durable local receipts and database scheduling records recover after delivery or dispatch failures. Project workspaces serialize competing tasks; administrators can pause and resume execution. See [the execution architecture upgrade](docs/协作执行架构升级.md).
+
+Missing facts are searched locally and in shared materials before a peer is asked automatically. Sources and replies remain visible, and a resolved lookup resumes the original stage. Lookup turns stay read-only and do not run implementation or verification commands. Only exhausted lookups or actual authorization gaps require administrator input. Upgrade both Connectors; see [repair approvals and automatic fact lookup](docs/修复审批与自动资料获取.md).
 
 See [local Docker simulation with real Codex](docs/端到端模拟验证.md) for the five-revision scenario (new goals, replacement, restoration and retirement), [six-improvement acceptance results](docs/验收测试记录-2026-11-13-六项优化.md) for the measured results and evidence boundaries, and [earlier workflow analysis](docs/AI协作改进.md) for the original dialogue-chain findings.
 
