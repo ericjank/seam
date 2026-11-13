@@ -86,6 +86,10 @@ describe("生命周期自动推进的迟到回调隔离", () => {
     await advanceAgentWorkflow("job");
     expect(newJobs()).toHaveLength(1);
     for (const job of newJobs()) expect(job.values.payload.lifecycleSnapshot).toMatchObject({ revision: 1, phase: "plan_synthesis", documentHash: "a".repeat(64) });
+    const dispatch = state.inserted.find(entry => entry.table === "messages")!.values;
+    expect(dispatch.metadata.dispatch.targets).toEqual([{ jobId: newJobs()[0]!.values.id, participantId: "a", projectId: "project-a", projectName: "a", agentId: "agent-a", agentName: "a" }]);
+    expect(dispatch.body).toContain("项目「a」 · Agent「a」");
+    expect(dispatch.body).not.toContain("Agent「b」");
   });
 
   it("管理员追加新版本后，旧版本回调不能抢占新流程预算", async () => {

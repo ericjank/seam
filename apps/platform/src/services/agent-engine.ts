@@ -5,6 +5,7 @@ import { agentTurnResultSchema, informationTaskFor, lifecycleActions, type Colla
 import { newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
 import { normalizeLifecycleOutcome } from "@/lib/lifecycle-outcome";
+import { dispatchMessage, type DispatchTarget } from "@/lib/dispatch-message";
 import { nextWorkflowTargets, type Workflow } from "@/lib/workflow";
 import { requireCollaborationAccess } from "@/lib/access";
 import { getCollaborationDetail } from "./collaborations";
@@ -45,6 +46,7 @@ async function enqueueTurns(detail: Awaited<ReturnType<typeof getCollaborationDe
     (!participantIds || participantIds.includes(row.participant.id)));
   if (!targets.length) throw new HttpError(409, "没有可派发的项目 Agent，请先绑定 Agent 并接受项目邀请");
   const jobs = [];
+  const recipients: DispatchTarget[] = [];
   for (const row of targets) {
     const id = newId();
     const context = buildContext(detail, row.participant.id, id);
@@ -56,12 +58,15 @@ async function enqueueTurns(detail: Awaited<ReturnType<typeof getCollaborationDe
       } : null },
     });
     jobs.push(id);
+    recipients.push({ jobId: id, participantId: row.participant.id, projectId: row.participant.projectId, projectName: row.project.name,
+      agentId: row.participant.agentId as string, agentName: row.agent?.name ?? row.participant.agentId as string });
   }
   await db.update(collaborations).set({ negotiationRound: detail.collaboration.negotiationRound + 1, updatedAt: new Date() })
     .where(eq(collaborations.id, detail.collaboration.id));
   await db.insert(messages).values({
     id: newId(), collaborationId: detail.collaboration.id, authorType: "system", authorName: "Seam", kind: "system",
-    body: `已向 ${jobs.length} 个项目 Agent 派发本次第 ${workflow.round}/${workflow.maxRounds} 批协作。`,
+    body: dispatchMessage({ workflowId: workflow.id, round: workflow.round, maxRounds: workflow.maxRounds, targets: recipients }),
+    metadata: { dispatch: { workflowId: workflow.id, round: workflow.round, maxRounds: workflow.maxRounds, targets: recipients } },
   });
   return jobs;
 }

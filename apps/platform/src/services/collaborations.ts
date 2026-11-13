@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { adapterTelemetrySchema } from "@seam/protocol";
 import { db } from "@/db";
 import {
@@ -26,6 +26,7 @@ import { audit } from "@/lib/audit";
 import { listProjects } from "./projects";
 import { HttpError } from "@/lib/http";
 import { getLifecycleContext } from "./lifecycle";
+import { hasLegacyDispatch, recoverDispatchNames } from "@/lib/dispatch-message";
 
 async function resolveProjectAgent(projectId: string, agentId?: string) {
   const candidates = await db.select({ id: agents.id }).from(agents).where(eq(agents.projectId, projectId));
@@ -169,8 +170,20 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
   }));
   const jobRows = await db.select({
     id: connectorJobs.id, agentId: connectorJobs.agentId, kind: connectorJobs.kind,
+    projectName: sql<string | null>`NULLIF(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.projectName')), 'null')`,
+    agentName: sql<string | null>`NULLIF(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.agentName')), 'null')`,
     cancellationAckAt: connectorJobs.cancellationAckAt, leaseUntil: connectorJobs.leaseUntil, status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt, result: connectorJobs.result,
   }).from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(20);
+  const dispatchJobs = hasLegacyDispatch(messageRows) ? await db.select({
+    jobId: connectorJobs.id, agentId: connectorJobs.agentId, createdAt: connectorJobs.createdAt,
+    workflowId: sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.workflow.id'))`,
+    round: sql<number>`CAST(JSON_EXTRACT(${connectorJobs.payload}, '$.workflow.round') AS UNSIGNED)`,
+    maxRounds: sql<number>`CAST(JSON_EXTRACT(${connectorJobs.payload}, '$.workflow.maxRounds') AS UNSIGNED)`,
+    participantId: sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.id'))`,
+    projectId: sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.projectId'))`,
+    projectName: sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.projectName'))`,
+    agentName: sql<string>`NULLIF(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.agentName')), 'null')`,
+  }).from(connectorJobs).where(and(eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"))).orderBy(asc(connectorJobs.sequence)) : [];
   const agentIds = participantRows.flatMap((row) => row.agent ? [row.agent.id] : []);
   const capabilityRows = agentIds.length ? await db.select().from(auditEvents).where(and(
     eq(auditEvents.action, "connector.capabilities"), inArray(auditEvents.actorId, agentIds),
@@ -182,7 +195,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     lifecycle: await getLifecycleContext(collaborationId),
     lifecycleHistory: await db.select({ revision: lifecycleRevisions.revision, requirements: lifecycleRevisions.requirements, document: lifecycleRevisions.document, documentHash: lifecycleRevisions.documentHash, report: lifecycleRevisions.report }).from(lifecycleRevisions).where(eq(lifecycleRevisions.collaborationId, collaborationId)).orderBy(desc(lifecycleRevisions.revision)),
     participants: participantRows,
-    messages: messageRows,
+    messages: dispatchJobs.length ? recoverDispatchNames(messageRows, dispatchJobs) : messageRows,
     artifacts: artifactRows.map((artifact) => ({
       ...artifact,
       versions: versionRows.filter((version) => version.artifactId === artifact.id),
