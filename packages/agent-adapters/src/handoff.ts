@@ -6,7 +6,7 @@ import type { CollaborationContext } from "@seam/protocol";
 import { buildNativeOutputSchema } from "./response-schema.js";
 import type { AgentRunInput } from "./types.js";
 
-export const NATIVE_HANDOFF_VERSION = 6;
+export const NATIVE_HANDOFF_VERSION = 7;
 export type HandoffCheckpoint = {
   version: typeof NATIVE_HANDOFF_VERSION;
   scope: string;
@@ -15,8 +15,8 @@ export type HandoffCheckpoint = {
 
 type Section = { key: string; title: string; content: string; source?: unknown; always?: boolean };
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
-const resourceKeys = ["baseline", "reports", "integrationReports", "report", "evidenceRuns"];
-const needsResource = (item: Section) => item.content.length > 1200 || resourceKeys.includes(item.key);
+const resourceKeys = ["deliveryHistory", "originalFailureReport", "baseline", "reports", "integrationReports", "report", "evidenceRuns"];
+const needsResource = (item: Section) => item.content.length > (item.key==="failureDigest"?6000:1200) || resourceKeys.includes(item.key);
 
 /** Immutable, private local resources. Nothing is written to the project checkout. */
 export async function materializeHandoffResources(input: AgentRunInput, directory = join(homedir(), ".seam", "resources"), schema = buildNativeOutputSchema(input), machineFiles = true) {
@@ -87,6 +87,8 @@ export function buildNativeHandoff(input: AgentRunInput, previous?: HandoffCheck
         "大资料按本机资源路径及SHA-256读取。确认或首次实施本版前核对完整共同文档；其他阶段按需读取，未列出的资料延续会话。不要回贴资源全文。",
         "缺失事实先查本地项目与共享资料，仍不足时用information.request向对端询证，searched记录两类检索来源；不要求用户重复填写。需要权限或秘密时用workflow.blocked并标requiresAuthorization=true，不自行寻找或公开秘密。",
         "查得事实若与已批准契约冲突，不得直接按新事实改目标或降低验收标准；如实报告未通过，先形成修复方案再由管理员批准。",
+        "使用任何共享事实须在plan.submit/amend.factRefs及完整contract.factRefs列出key，平台会在本修订自动核验来源，来源变化将重新规划；不得把历史事实未过期等同本轮已核验。",
+        "API契约effectiveRequirements逐项声明verification=http/command/review，httpChecks逐项声明requirementIds，覆盖正常、边界、无效输入及错误响应；具体期望从双方项目资料确定，不猜测。",
         "information.request尽量提供稳定key（如quote.contractVersion）；information.respond的value是精确规范值，answer说明事实及依据，validForSeconds声明有效期，sources逐个列相对文件路径和sourceVersion。文件contentHash由Connector计算，不自行编造。多方冲突须核对原始来源后答复，不把不同意见合并成已解决。",
         "失败必须说明category：code为业务或代码失败，environment为服务/网络/运行环境，missing_information为事实不足，authorization为实际权限不足，unknown为原因未知。未执行不代表代码失败；失败后的重新实施和验证仍须管理员确认。",
         "API共同文档须用httpChecks列出独立业务请求、精确状态码和bodyChecks期望，至少每个发布服务有一个非健康业务检查。健康修订及测试脚本用SEAM_REVISION动态绑定，独立期望可用$SEAM_REVISION。testChanges逐文件说明需要修改现有测试的理由，管理员批准后才修改；不得删改断言换取通过。",
@@ -115,9 +117,9 @@ function controlText(context: CollaborationContext) {
 
 export function phaseInstruction(context?: CollaborationContext) {
   if (context?.lifecycle?.paused) return "本轮已暂停，保持只读并停止执行。";
-  if (context?.informationTask) return `本轮仅执行只读信息查找（${context.informationTask.mode === "local" ? "先查本地与共享资料" : context.informationTask.mode === "reconcile" ? "各方事实存在冲突，核对本方权威来源并与其他答复核对" : context.informationTask.mode === "verify" ? "复核缓存事实的来源和当前版本" : "为对端查阅本方项目并答复"}），不实施、不运行测试、不启动服务。用information.respond答复requestId=${context.informationTask.requestId}、attempt=${context.informationTask.attempt ?? 1}；value给精确规范值，answer给说明，sources逐个列相对路径与sourceVersion，validForSeconds给有效期。local未找到时sources同时包含local_project和shared_context。不得让用户重复填资料、读取对端目录、披露秘密或假称取得权限。`;
+  if (context?.informationTask) return `本轮仅执行只读信息查找；若当前请求purpose=diagnostic，读取已有失败日志和项目资料定位原因，diagnosisCategory填写实际分类，不运行实施或测试；其他信息答复diagnosisCategory=null。（${context.informationTask.mode === "local" ? "先查本地与共享资料" : context.informationTask.mode === "reconcile" ? "各方事实存在冲突，核对本方权威来源并与其他答复核对" : context.informationTask.mode === "verify" ? "复核缓存事实的来源和当前版本" : "为对端查阅本方项目并答复"}），不实施、不运行测试、不启动服务。用information.respond答复requestId=${context.informationTask.requestId}、attempt=${context.informationTask.attempt ?? 1}；value给精确规范值，answer给说明，sources逐个列相对路径与sourceVersion，validForSeconds给有效期。local未找到时sources同时包含local_project和shared_context。不得让用户重复填资料、读取对端目录、披露秘密或假称取得权限。`;
   switch (context?.lifecycle?.phase) {
-    case "planning": return context.lifecycle.repair ? "本轮：只读分析失败原因，用plan.amend提交本方修复变更，沿用基线完整文档和不受影响职责，不重复重写全部历史；未经管理员批准不得写代码或重跑验证。" : "本轮：只读分析本地项目，用plan.submit提交本方实施分析（至少100字符），包含接口、本方修改和联合验收建议。已有资料直接复用，未经管理员批准不得写代码。";
+    case "planning": return context.lifecycle.repair ? "本轮：先用失败摘要、字段差异和已知项目实现定位原因，信息足够时不重复读取整份旧日志；只读，用plan.amend提交本方修复变更，沿用基线完整文档和不受影响职责，不重复重写全部历史；未经管理员批准不得写代码或重跑验证。" : "本轮：只读分析本地项目，用plan.submit提交本方实施分析（至少100字符），包含接口、本方修改和联合验收建议。已有资料直接复用，未经管理员批准不得写代码。";
     case "plan_synthesis": return context.lifecycle.repair ? "本轮：协调方用plan.patch基于当前文档或上版基线hash提交差异，未变字段设null。保留全部有效要求、用例、必需断言及独立检查，必要测试文件改动在testChanges明确声明。平台拼接完整新版后双方仍须确认。" : "本轮：只读，用plan.compose汇总完整契约。effectiveRequirements列稳定ID及有效要求，移除旧ID声明retiredRequirements。每方用例列完整requiredAssertions，API服务同时声明httpChecks业务请求及精确字段期望。serviceExpectations列就绪契约，testChanges明确现有测试文件变更理由（没有则空数组），baseDocumentHash使用当前值。";
     case "plan_confirmation": return "本轮：只读核对完整文档及SHA-256、有效/撤销要求、全部必需断言和就绪契约。缺少覆盖或获批后补齐责任时用plan.reject提出具体异议；可接受才plan.confirm当前revision/documentHash。确认不等于管理员批准。";
     case "executing": return "本轮：仅在 approvedHash 与 documentHash 相同且本机权限允许时实施本版计划、运行真实测试，用 execution.report 回传实际 status/summary/evidence（测试命令、结果和限制）。不必重复索取同一审批。区分落盘、测试、部署、联调与验收。";
@@ -142,7 +144,10 @@ function contextSections(context: CollaborationContext): Section[] {
   const effective = lifecycle?.contract?.effectiveRequirements ?? lifecycle?.baseline?.contract?.effectiveRequirements;
   add("effectiveRequirements", "当前有效要求（新文档待批准时不构成执行授权）", effective?.map((item) => `${item.id}：${item.text}`).join("\n") ?? "");
   add("retiredRequirements", "本版明确撤销的要求", lifecycle?.contract?.retiredRequirements?.map((item) => `${item.id}：${item.reason}`).join("\n") ?? "");
-  add("baseline", "上版契约与报告（复用未变决定，历史证据不替代本轮验证）", lifecycle?.baseline ? readable(lifecycle.baseline) : "");
+  const baseline=lifecycle?.baseline;
+  add("baseline", "上版完整契约（复用未变决定）", baseline ? readable({...baseline,report:undefined,failureDigest:undefined,informationRequests:undefined}) : "");
+  add("failureDigest", "失败字段差异与实际命令引用（先依此定位，需要时再读完整原始报告）", baseline?.failureDigest ? readable(baseline.failureDigest) : "");
+  add("originalFailureReport", "原始失败报告与日志（仅按需查证，不重复转写）", baseline?.report ?? "");
   add("objections", "需解决的契约异议", readableCollection(lifecycle?.objections ?? []));
   add("integrationReports", "本轮联合验收回执", readableCollection(lifecycle?.integrationReports ?? []));
   add("participants", "参与方", context.participants.map((participant) => `${participant.projectName}（${participant.id}）：${participant.role}，${participant.status}，${participant.approvalRequired ? "需确认" : "无需确认"}${participant.id === context.participant.id ? "；本方" : ""}`).join("\n"));
@@ -168,7 +173,10 @@ function contextSections(context: CollaborationContext): Section[] {
   // Instructions outside the recent-message window are explicitly merged, so
   // old user constraints survive a reconnect and new instructions arrive once.
   const messages = new Map([...context.messages, ...context.instructions].map((message) => [message.id, message]));
+  const deliveries=[...messages.values()].filter(message=>message.authorType==="system"&&message.metadata.dispatch);
+  add("deliveryHistory","派发审计记录（当前任务已明确，非业务指令，通常无需读取）",readableCollection(deliveries));
   for (const message of messages.values()) {
+    if(message.authorType==="system"&&message.metadata.dispatch)continue;
     add(`message:${message.id}`, `交接消息 · ${message.authorType} · ${message.participantId ? participantName(context, message.participantId) : message.authorName} · ${message.kind}`,
       `${message.body}${Object.keys(message.metadata).length ? `\n附加信息：\n${readable(message.metadata)}` : ""}`, message.metadata);
   }

@@ -50,6 +50,13 @@
       "when": 1794736145580,
       "tag": "0006_loud_shatterstar",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1794744039622,
+      "tag": "0007_woozy_hellcat",
+      "breakpoints": true
     }
   ]
 }

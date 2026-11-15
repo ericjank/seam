@@ -199,7 +199,7 @@ describe("Codex App Server 持久会话", () => {
     expect(nextPrompt).toContain(next.jobId);
     const [file] = await readdir(f.stateDir);
     const stored = JSON.parse(await readFile(join(f.stateDir, file!), "utf8"));
-    expect(stored.lastHandoff).toMatchObject({ version: 6, scope: `${value.collaborationId}:${value.participant.id}` });
+    expect(stored.lastHandoff).toMatchObject({ version: 7, scope: `${value.collaborationId}:${value.participant.id}` });
     expect(Object.values(stored.lastHandoff.sections).every((hash) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))).toBe(true);
     expect(JSON.stringify(stored.lastHandoff)).not.toContain(value.lifecycle.document);
   });

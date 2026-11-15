@@ -19,7 +19,7 @@ export function validateInformationSources(sources: Source[], localSearch = fals
 export function openInformationRequest(input: {
   requests: InformationRequest[]; id: string; revision: number; phase: string; participantId: string;
   requiredParticipantIds: string[]; question: string; searched?: Source[]; now: string;
-  key?: string; fresh?: boolean; facts?: SharedFact[]; resumeRequiresReview?: boolean;
+  key?: string; fresh?: boolean; facts?: SharedFact[]; resumeRequiresReview?: boolean; forceVerifyKey?: string; purpose?: InformationRequest["purpose"];
 }) {
   if (input.searched) validateInformationSources(input.searched, true);
   const key = informationKey(input.question, input.key);
@@ -28,10 +28,10 @@ export function openInformationRequest(input: {
   if (duplicate) return { requests: input.requests, request: duplicate };
   if (same.filter(row => row.status === "needs_admin").reduce((sum, row) => sum + (row.retryCount ?? 0) + 1, 0) >= MAX_INFORMATION_FAILURES
     || input.requests.length >= MAX_INFORMATION_REQUESTS) return { requests: input.requests, request: null };
-  const now = Date.parse(input.now), fact = input.fresh ? undefined : input.facts?.find(row => row.key === key && row.status === "active" && Date.parse(row.validUntil) > now);
+  const now = Date.parse(input.now), fact = input.forceVerifyKey ? input.facts?.find(row => row.key === input.forceVerifyKey && row.status !== "conflicted") : input.fresh ? undefined : input.facts?.find(row => row.key === key && row.status === "active" && Date.parse(row.validUntil) > now);
   const peers = input.requiredParticipantIds.filter(id => id !== input.participantId);
   const request: InformationRequest = {
-    id: input.id, key, revision: input.revision, phase: input.phase, question: input.question,
+    id: input.id, key, revision: input.revision, phase: input.phase, question: input.question, purpose: input.purpose,
     requestedByParticipantId: input.participantId, peerParticipantIds: peers,
     targetParticipantIds: fact ? [...new Set(fact.responses.map(row => row.participantId))] : peers,
     stage: fact ? "verify" : input.searched ? "peer" : "local", status: "pending", answer: null, createdAt: input.now,
@@ -39,7 +39,7 @@ export function openInformationRequest(input: {
     ...(fact ? { cachedFactKey: fact.key } : {}),
     responses: input.searched && !fact ? [{ participantId: input.participantId, mode: "local", attempt: 1, status: "unavailable", answer: "本地与共享资料未解决该问题，向对端询证。", sources: input.searched }] : [],
   };
-  if (fact?.authority === "administrator") {
+  if (fact?.authority === "administrator" && Date.parse(fact.validUntil)>now) {
     request.status = "answered"; request.answer = fact.answer; request.responses = fact.responses.map(row => ({ ...row, attempt: 1 }));
   }
   return { requests: [...input.requests, request], request };
@@ -68,7 +68,7 @@ export function answerInformationRequest(request: InformationRequest, participan
   validateInformationSources(action.sources, local && action.status === "unavailable");
   if (!local && action.status === "unavailable" && !action.sources.some(source => source.scope === "local_project")) throw new HttpError(422, "对端无法答复时必须记录本方项目资料的检索来源");
   const response = { participantId, mode, status: action.status, answer: action.answer, value: action.value?.trim() || action.answer.trim(),
-    sources: action.sources, attempt, validForSeconds: action.validForSeconds ?? 3600 };
+    sources: action.sources, diagnosisCategory:action.diagnosisCategory, attempt, validForSeconds: action.validForSeconds ?? 3600 };
   const updated = { ...request, responses: [...request.responses, response] };
   if (local) {
     if (action.status === "found") return { ...updated, status: "answered" as const, answer: action.answer, failureReason: undefined };
@@ -93,11 +93,11 @@ export function factFromRequest(request: InformationRequest, now = Date.now()): 
   const latest = request.responses.filter(row => row.status === "found" && (row.attempt ?? 1) === (request.attempt ?? 1));
   if (!latest.length) return null;
   return { key: informationKey(request.question, request.key), question: request.question, value: latest[0]!.value ?? latest[0]!.answer,
-    answer: request.answer ?? latest[0]!.answer, revision: request.revision, status: "active", authority: "project", confirmedAt: new Date(now).toISOString(),
+    answer: request.answer ?? latest[0]!.answer, revision: request.revision, verifiedRevision: request.revision, status: "active", authority: "project", confirmedAt: new Date(now).toISOString(),
     validUntil: new Date(now + Math.min(...latest.map(row => row.validForSeconds ?? 3600)) * 1000).toISOString(), responses: latest };
 }
 
 export function administratorFact(request: InformationRequest, answer: string, now = Date.now()): SharedFact {
-  return { key: informationKey(request.question, request.key), question: request.question, value: answer, answer, revision: request.revision, status: "active", authority: "administrator", confirmedAt: new Date(now).toISOString(), validUntil: new Date(now + 3600_000).toISOString(),
+  return { key: informationKey(request.question, request.key), question: request.question, value: answer, answer, revision: request.revision, verifiedRevision: request.revision, status: "active", authority: "administrator", confirmedAt: new Date(now).toISOString(), validUntil: new Date(now + 3600_000).toISOString(),
     responses: [{ participantId: request.requestedByParticipantId, mode: "local", status: "found", answer, value: answer, attempt: 1, validForSeconds: 3600, sources: [{ scope: "shared_context", reference: `administrator-resolution:${request.id}`, finding: "管理员在该问题的处理入口提供的事实；未增加本机权限。", sourceVersion: new Date(now).toISOString() }] }] };
 }

@@ -131,6 +131,13 @@ async function approved(revision = 1, overrides: Partial<SharedContract> = {}) {
   return approveLifecycle("admin", "collab", { revision, documentHash: context.documentHash! });
 }
 
+async function sharedVersion() {
+ const [a,b]=(await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string];
+ await applyLifecycleAction(actor(a),"collab",{type:"information.request",revision:1,key:"quote.version",question:"需要核对提供方当前公开接口版本",searched:[{scope:"local_project",reference:"README.md",finding:"本地尚缺此事实"},{scope:"shared_context",reference:"共同文档",finding:"尚无提供方版本"}]});
+ const request=(await getLifecycleContext("collab"))!.informationRequests.at(-1)!;
+ await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:1,status:"found",value:"v1",answer:"公开协议版本为v1",sources:[{scope:"local_project",reference:"docs/protocol.json",finding:"明确的公开协议版本",contentHash:"a".repeat(64)}]});
+ return {a,b};
+}
 beforeEach(() => {
   state.role = "owner";
   state.rows = {
@@ -138,13 +145,61 @@ beforeEach(() => {
     participants: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id, collaborationId: "collab", projectId: `project-${id}`, agentId: `agent-${id}`, role: "participant", status: "active", createdAt: new Date() })),
     projects: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `project-${id}`, name: `项目 ${id}` })),
     agents: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `agent-${id}`, status: "online", lastSeenAt: new Date() })),
-    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:6,supportsInformationLookup:true}})),
+    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:7,supportsInformationLookup:true}})),
     collaboration_lifecycles: [], lifecycle_revisions: [], lifecycle_contributions: [], messages: [], connector_jobs: [],
   };
   vi.clearAllMocks();
 });
 
 describe("管理员控制的共同开发生命周期", () => {
+  it("跨修订引用事实会先保存计划并自动核验，未变时无需模型重复提交",async()=>{
+    await startLifecycle("admin","collab");const {a,b}=await sharedVersion();await agreed();await appendLifecycleRequirements("admin","collab",{requirements:"仅追加边界，沿用公开版本"});
+    await applyLifecycleAction(actor(a),"collab",{type:"plan.submit",revision:2,content:plan(a),factRefs:["quote.version"]});
+    let state=(await getLifecycleContext("collab"))!;expect(state.contributions).toHaveLength(0);const request=state.informationRequests.at(-1)!;expect(request).toMatchObject({stage:"verify",purpose:"fact_gate",targetParticipantIds:[b]});
+    await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:2,requestId:request.id,attempt:1,status:"found",value:"v1",answer:"公开协议仍为v1",sources:[{scope:"local_project",reference:"docs/protocol.json",finding:"来源未变化",contentHash:"a".repeat(64)}]});
+    state=(await getLifecycleContext("collab"))!;expect(state.contributions[0]).toMatchObject({participantId:a,content:plan(a),factRefs:["quote.version"]});expect(state.facts[0]!.verifiedRevision).toBe(2);
+    await submit(b,2);await expect(compose(2)).rejects.toThrow("遗漏");await compose(2,"核验事实",{factRefs:["quote.version"]});state=(await getLifecycleContext("collab"))!;expect(state.document).toContain("quote.version");expect(state.factBindings).toHaveLength(1);
+  });
+  it("来源值变化不会自动沿用已保存的旧分析，会重新派发当前事实的规划",async()=>{
+    await startLifecycle("admin","collab");const {a,b}=await sharedVersion();await agreed();await appendLifecycleRequirements("admin","collab",{requirements:"沿用既有公开事实的新修订"});
+    await applyLifecycleAction(actor(a),"collab",{type:"plan.submit",revision:2,content:plan(a),factRefs:["quote.version"]});let r=(await getLifecycleContext("collab"))!.informationRequests.at(-1)!;
+    await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:2,requestId:r.id,attempt:1,status:"unavailable",answer:"资料指纹已经变化，旧值不能再用",sources:[{scope:"local_project",reference:"docs/protocol.json",finding:"来源内容变化"}]});
+    r=(await getLifecycleContext("collab"))!.informationRequests.at(-1)!;expect(r.stage).toBe("local");
+    await applyLifecycleAction(actor(a),"collab",{type:"information.respond",revision:2,requestId:r.id,attempt:2,status:"unavailable",answer:"本地与共享无法确定当前提供方版本",sources:[{scope:"local_project",reference:"README.md",finding:"本地未知新值"},{scope:"shared_context",reference:"事实索引",finding:"旧值已失效"}]});
+    await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:2,requestId:r.id,attempt:2,status:"found",value:"v2",answer:"本方公开版本已更新为v2",sources:[{scope:"local_project",reference:"docs/protocol.json",finding:"当前新版本",contentHash:"b".repeat(64)}]});
+    const current=(await getLifecycleContext("collab"))!;expect(current.phase).toBe("planning");expect(current.contributions).toHaveLength(0);expect(current.facts[0]!.value).toBe("v2");expect(current.approvedHash).toBeNull();expect(state.rows.lifecycle_contributions!.find(row=>row.participantId===a&&row.revision===2)!.pendingPlan).toBeNull();
+  });
+  it("管理员批准时过期事实先自动核验；来源不变时同一hash续批，不要求再次点击",async()=>{
+    await startLifecycle("admin","collab");const {a,b}=await sharedVersion();const ready=await agreed(1,{factRefs:["quote.version"]});
+    state.rows.collaboration_lifecycles![0]!.facts[0].validUntil=new Date(0).toISOString();
+    let current=await approveLifecycle("admin","collab",{revision:1,documentHash:ready.documentHash!});expect(current.phase).toBe("awaiting_approval");expect(current.approvedHash).toBeNull();expect(current.approvalPending?.documentHash).toBe(ready.documentHash);
+    const request=current.informationRequests.at(-1)!;await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:1,status:"found",value:"v1",answer:"当前来源及值仍一致",sources:[{scope:"local_project",reference:"docs/protocol.json",finding:"逐字节核验未变",contentHash:"a".repeat(64)}]});
+    current=(await getLifecycleContext("collab"))!;expect(current.phase).toBe("executing");expect(current.approvedHash).toBe(ready.documentHash);expect(current.approvalPending).toBeNull();
+  });
+  it("管理员已确认但事实复核发现变化时，确认意图作废并自动重新规划",async()=>{
+    await startLifecycle("admin","collab");const {a,b}=await sharedVersion();const ready=await agreed(1,{factRefs:["quote.version"]});
+    state.rows.lifecycle_contributions!.find(row=>row.participantId===a)!.factRefs=["quote.version"];
+    state.rows.collaboration_lifecycles![0]!.facts[0].validUntil=new Date(0).toISOString();
+    const waiting=await approveLifecycle("admin","collab",{revision:1,documentHash:ready.documentHash!}),request=waiting.informationRequests.at(-1)!;
+    await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:1,status:"found",value:"v2",answer:"来源已经更新为新版本",sources:[{scope:"local_project",reference:"docs/protocol.json",finding:"新的来源指纹",contentHash:"b".repeat(64)}]});
+    const current=(await getLifecycleContext("collab"))!;expect(current.phase).toBe("planning");expect(current.approvedHash).toBeNull();expect(current.documentHash).toBeNull();expect(current.approvalPending).toBeNull();expect(current.contributions.some(row=>row.participantId===a)).toBe(false);
+  });
+  it("事实核验期间管理员权限被撤销后，保存的批准意图不能自动执行",async()=>{
+    await startLifecycle("admin","collab");const {b}=await sharedVersion();const ready=await agreed(1,{factRefs:["quote.version"]});
+    state.rows.collaboration_lifecycles![0]!.facts[0].validUntil=new Date(0).toISOString();
+    const waiting=await approveLifecycle("admin","collab",{revision:1,documentHash:ready.documentHash!}),request=waiting.informationRequests.at(-1)!;
+    state.role="member";
+    await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:1,status:"found",value:"v1",answer:"来源逐字节核对保持一致",sources:[{scope:"local_project",reference:"docs/protocol.json",finding:"来源未变",contentHash:"a".repeat(64)}]});
+    const current=(await getLifecycleContext("collab"))!;expect(current.phase).toBe("awaiting_approval");expect(current.approvedHash).toBeNull();expect(current.approvalPending).toBeNull();
+  });
+  it("诊断未知失败只读查现有记录，补出具体环境原因后仍等待人工确认重试",async()=>{
+    await startLifecycle("admin","collab");await approved();const [a,b]=(await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string];
+    await applyLifecycleAction(actor(a),"collab",{type:"execution.report",revision:1,status:"failed",category:"unknown",summary:"命令异常退出但原因未定",evidence:{raw:"kept"}});await report(b);
+    let current=(await getLifecycleContext("collab"))!;const request=current.informationRequests.at(-1)!;expect(request.purpose).toBe("diagnostic");expect(current.revision).toBe(1);
+    await applyLifecycleAction(actor(a),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:1,status:"found",diagnosisCategory:"environment",value:"missing-runtime",answer:"已只读核对日志，当前环境缺少运行时依赖",sources:[{scope:"local_project",reference:"logs/test.log",finding:"明确记载运行时不存在"}]});
+    current=(await getLifecycleContext("collab"))!;expect(current.blocks[0]).toMatchObject({requiresReview:true,category:"environment"});expect(current.facts).toHaveLength(0);expect(current.revision).toBe(1);
+    await retryLifecycleValidation("admin","collab",{revision:1,documentHash:current.documentHash!});expect((await getLifecycleContext("collab"))!.attemptHistory).toHaveLength(1);
+  });
   it("在线旧Connector缺少协议能力时在创建阶段明确拒绝，不留下半成品生命周期", async()=>{
     state.rows.audit_events![0]!.metadata.protocolVersion=5;
     await expect(startLifecycle("admin","collab")).rejects.toMatchObject({status:409,message:expect.stringContaining("升级并重启Connector")});

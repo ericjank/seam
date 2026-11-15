@@ -5,6 +5,7 @@ export function contractChanges(previous: SharedContract, current: SharedContrac
   const entries = (contract: SharedContract) => new Map<string, string>([
     ["范围", contract.scope], ["风险", contract.risks], ["变更说明", contract.changeSummary],
     ["影响项目", contract.impactedParticipantIds.join("\n")], ["保留决定", contract.retainedDecisions.join("\n")],
+    ["共享事实引用", (contract.factRefs??[]).join("\n")],
     ["测试文件变更授权", JSON.stringify(contract.testChanges ?? [], null, 2)],
     ...(contract.effectiveRequirements ?? []).map((item): [string, string] => [`要求 ${item.id}`, item.text]),
     ["本版撤销要求", (contract.retiredRequirements ?? []).map((item) => `${item.id}：${item.reason}`).join("\n")],

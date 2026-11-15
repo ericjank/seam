@@ -7,6 +7,7 @@ export interface ConnectorCapabilities {
   testConfigured: boolean;
   supportsInformationLookup?: boolean;
   protocolVersion?: number;
+  build?: {kind:string;sourceId:string;files:number};
 }
 
 export class PlatformError extends Error {

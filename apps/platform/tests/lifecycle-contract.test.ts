@@ -4,6 +4,14 @@ import { fixtureContract } from "./fixtures/shared-contract";
 
 const ids = [crypto.randomUUID(), crypto.randomUUID()];
 describe("统一契约与增量审阅", () => {
+  it("按需求ID检查独立覆盖，拒绝重复正常请求冒充错误场景",()=>{
+    const contract=fixtureContract(ids,1);contract.effectiveRequirements=[{id:"normal",text:"正常响应",verification:"http"},{id:"errors",text:"无效请求拒绝",verification:"http"}];contract.serviceExpectations=[{name:"quote",publisherParticipantId:ids[0]!,healthPath:"/health",status:200,bodyChecks:[]}];
+    const good={id:"normal",requirementIds:["normal"],publisherParticipantId:ids[0]!,serviceName:"quote",method:"POST" as const,path:"/quote",requestBody:'{"quantity":2}',expectedStatus:200,bodyChecks:[{path:"subtotal",equals:24000}]};
+    contract.acceptanceCases[0]!.httpChecks=[good];expect(()=>validateSharedContract(contract,ids,null,true,true)).toThrow("每项HTTP要求");
+    contract.acceptanceCases[0]!.httpChecks!.push({...good,id:"fake-error",requirementIds:["errors"]});expect(()=>validateSharedContract(contract,ids,null,true,true)).toThrow("不同请求");
+    contract.acceptanceCases[0]!.httpChecks![1]={...good,id:"real-error",requirementIds:["errors"],requestBody:'{"quantity":0}',expectedStatus:400,bodyChecks:[]};expect(()=>validateSharedContract(contract,ids,null,true,true)).not.toThrow();
+    contract.acceptanceCases[0]!.httpChecks![1]!.requirementIds=["unknown"];expect(()=>validateSharedContract(contract,ids,null,true,true)).toThrow("要求ID");
+  });
   it("API服务的独立验收必须有业务期望，拒绝跨方服务、越界路径及未授权测试变更", () => {
     const contract=fixtureContract(ids,1);
     contract.serviceExpectations=[{name:"quote",publisherParticipantId:ids[0]!,healthPath:"/health",status:200,bodyChecks:[]}];

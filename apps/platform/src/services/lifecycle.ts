@@ -14,6 +14,7 @@ import { renderSharedContract, validateSharedContract } from "@/lib/lifecycle-co
 import { queueWorkflowWakeup } from "./workflow-outbox";
 import { authorizeActor, type Actor } from "./actor";
 import { answerInformationRequest, openInformationRequest, expireInformationRequest, factFromRequest, administratorFact, informationKey, INFORMATION_TIMEOUT_MS } from "@/lib/information";
+import { bindFacts, factsReady, sameBindings } from "@/lib/fact-bindings";
 import { repairFailures, validateRepairContract, validatePinnedTests } from "@/lib/repair";
 
 export type LifecyclePhase = LifecycleContext["phase"];
@@ -59,7 +60,7 @@ async function cancelSupersededReviews(control: Lifecycle, currentAgentId: strin
   }
 }
 
-function contextFrom(control: Lifecycle, revision: Revision, contributions: Contribution[], previous?: Revision): LifecycleContext {
+function contextFrom(control: Lifecycle, revision: Revision, contributions: Contribution[], previous?: Revision, previousContributions:Contribution[]=[]): LifecycleContext {
   const relevant = contributions.filter((row) => control.requiredParticipantIds.includes(row.participantId));
   return {
     revision: control.revision, phase: control.phase, requirements: revision.requirements,
@@ -67,10 +68,10 @@ function contextFrom(control: Lifecycle, revision: Revision, contributions: Cont
     requiredParticipantIds: control.requiredParticipantIds, coordinatorParticipantId: control.requiredParticipantIds[0], paused: Boolean(control.pausedAt),
     changeRequest: revision.changeRequest, contract: revision.sharedContract, objections: revision.objections ?? [],
     repair: revision.repair ?? null, informationRequests: revision.informationRequests ?? [],
-    protocolVersion: control.protocolVersion ?? 1, facts: (control.facts ?? []).map(fact => fact.status === "active" && Date.parse(fact.validUntil) <= Date.now() ? { ...fact, status: "stale" as const } : fact),
-    attemptHistory: revision.attemptHistory ?? [],
-    baseline: previous ? { revision: previous.revision, documentHash: previous.documentHash, document: previous.sharedContract?.effectiveRequirements ? null : previous.document, contract: previous.sharedContract, report: previous.report, informationRequests: previous.informationRequests?.filter(row => row.status === "answered") } : null,
-    contributions: relevant.flatMap((row) => row.content ? [{ participantId: row.participantId, content: row.content, baseline: row.workspaceBaseline ?? null }] : []),
+    protocolVersion: control.protocolVersion ?? 1, facts: (control.facts ?? []).map(fact => fact.status === "active" && Date.parse(fact.validUntil) <= Date.now() ? { ...fact, status: "stale" as const } : (control.protocolVersion??1)>=7 && fact.status==="active" && fact.verifiedRevision!==control.revision ? {...fact,status:"unverified" as const}:fact),
+    attemptHistory: revision.attemptHistory ?? [], factBindings:revision.factBindings??[], approvalPending:revision.approvalIntent?{documentHash:revision.approvalIntent.documentHash,requestedAt:revision.approvalIntent.requestedAt}:null,
+    baseline: previous ? { revision: previous.revision, documentHash: previous.documentHash, document: previous.sharedContract?.effectiveRequirements ? null : previous.document, contract: previous.sharedContract, report: previous.report, failureDigest:previousContributions.map(row=>({participantId:row.participantId,summary:row.reportSummary??"",checks:(row.integrationChecks??[]).filter(check=>check.status!=="passed").map(check=>({caseId:check.caseId,status:check.status,summary:check.summary})),independentResults:((row.reportEvidence?.independentResults??[]) as NonNullable<Extract<import("@seam/protocol").LifecycleAgentAction,{type:"integration.report"}>["independentResults"]>),runs:(row.evidenceRuns??[]).map(run=>({id:run.id,command:run.command,exitCode:run.exitCode}))})), informationRequests: previous.informationRequests?.filter(row => row.status === "answered") } : null,
+    contributions: relevant.flatMap((row) => row.content ? [{ participantId: row.participantId, content: row.content, baseline: row.workspaceBaseline ?? null, factRefs:row.factRefs??[] }] : []),
     confirmations: relevant.filter((row) => control.documentHash && row.confirmedHash === control.documentHash).map((row) => row.participantId),
     reports: relevant.flatMap((row) => row.reportStatus && row.reportSummary ? [{
       participantId: row.participantId, status: row.reportStatus, summary: row.reportSummary, evidence: row.reportEvidence ?? {}, testFiles: (row.reportEvidence?.testFiles as import("@seam/protocol").CommandEvidence["testFiles"] | undefined),
@@ -87,7 +88,7 @@ export async function getLifecycleContext(collaborationId: string): Promise<Life
   const control = await getControl(collaborationId);
   if (!control) return null;
   const [previous] = control.revision > 1 ? await db.select().from(lifecycleRevisions).where(and(eq(lifecycleRevisions.collaborationId, collaborationId), eq(lifecycleRevisions.revision, control.revision - 1))).limit(1) : [];
-  return contextFrom(control, await getRevision(control), await getContributions(control), previous);
+  return contextFrom(control, await getRevision(control), await getContributions(control), previous, previous?await db.select().from(lifecycleContributions).where(currentContribution(collaborationId,previous.revision)):[]);
 }
 
 export async function getLifecycleSnapshot(collaborationId: string): Promise<LifecycleSnapshot | null> {
@@ -120,7 +121,11 @@ async function locked<T>(collaborationId: string, run: (control: Lifecycle | nul
   return withTransaction(async () => {
     const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, collaborationId)).limit(1).for("update");
     if (!collaboration) throw new HttpError(404, "协作不存在");
-    return run(await getControl(collaborationId), collaboration);
+    const before=await getControl(collaborationId);
+    const state=(value:Lifecycle|null)=>value?{revision:value.revision,phase:value.phase,documentHash:value.documentHash,approvedHash:value.approvedHash,paused:Boolean(value.pausedAt)}:null;
+    const previous=state(before),result=await run(before,collaboration),current=state(await getControl(collaborationId));
+    if(current&&canonicalJson(previous)!==canonicalJson(current))await audit({collaborationId,actorType:"system",actorId:"seam",action:"lifecycle.transition",metadata:{previous,current}});
+    return result;
   });
 }
 
@@ -163,7 +168,7 @@ export async function startLifecycle(userId: string, collaborationId: string): P
   });
 }
 
-async function beginInformationLookup(control: Lifecycle, participantId: string, question: string, searched?: InformationRequest["responses"][number]["sources"], options: { key?: string; fresh?: boolean; resumeRequiresReview?: boolean } = {}) {
+async function beginInformationLookup(control: Lifecycle, participantId: string, question: string, searched?: InformationRequest["responses"][number]["sources"], options: { key?: string; fresh?: boolean; resumeRequiresReview?: boolean; forceVerifyKey?:string; purpose?:InformationRequest["purpose"] } = {}) {
   if ((control.protocolVersion ?? 1) < CONNECTOR_PROTOCOL_VERSION) {
     await db.update(collaborationLifecycles).set({ protocolVersion: CONNECTOR_PROTOCOL_VERSION, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
     control.protocolVersion = CONNECTOR_PROTOCOL_VERSION;
@@ -182,6 +187,65 @@ async function beginInformationLookup(control: Lifecycle, participantId: string,
   await db.insert(lifecycleContributions).values({ id: newId(), collaborationId: control.collaborationId, revision: control.revision, participantId, block }).onDuplicateKeyUpdate({ set: { block, updatedAt: new Date() } });
   if (outcome.request) { await queueWorkflowWakeup(control.collaborationId); if (outcome.request.status !== "answered") await queueWorkflowWakeup(control.collaborationId, undefined, INFORMATION_TIMEOUT_MS); }
   await notify(control.collaborationId, outcome.request?.status === "answered" ? `已复用管理员提供且仍有效的共享事实：${question}` : outcome.request ? `正在自动获取缺失信息：${question}；先查本地与共享资料，再向对端询证。` : block!.reason);
+}
+
+async function scheduleFactGates(control:Lifecycle, participantId:string, refs:string[]) {
+  bindFacts(refs,control.facts??[]);
+  for(const key of refs) if(!factsReady([key],control.facts??[],control.revision)) {
+    const fact=control.facts!.find(row=>row.key===key)!;
+    if(fact.authority==="administrator"&&Date.parse(fact.validUntil)>Date.now()) {
+      control.facts=control.facts!.map(row=>row.key===key?{...row,verifiedRevision:control.revision}:row);
+      await db.update(collaborationLifecycles).set({facts:control.facts}).where(eq(collaborationLifecycles.collaborationId,control.collaborationId));continue;
+    }
+    await beginInformationLookup(control,participantId,`核验本修订引用的共享事实：${fact.question}`,undefined,{key,forceVerifyKey:key,purpose:"fact_gate"});
+  }
+  if(factsReady(refs,control.facts??[],control.revision))await settleFactGates(control);
+}
+
+async function finishPlanning(control:Lifecycle, currentAgentId:string|null) {
+  const contributions=await getContributions(control), allSubmitted=control.requiredParticipantIds.every(id=>contributions.some(row=>row.participantId===id&&row.content&&!row.pendingPlan));
+  await db.update(lifecycleContributions).set({confirmedHash:null,updatedAt:new Date()}).where(currentContribution(control.collaborationId,control.revision));
+  const revision=await getRevision(control);
+  await db.update(lifecycleRevisions).set({document:null,documentHash:null,sharedContract:null,factBindings:null,approvalIntent:null,updatedAt:new Date()}).where(eq(lifecycleRevisions.id,revision.id));
+  await db.update(collaborationLifecycles).set({phase:allSubmitted?"plan_synthesis":"planning",documentHash:null,approvedHash:null,approvedById:null,approvedAt:null,updatedAt:new Date()}).where(eq(collaborationLifecycles.collaborationId,control.collaborationId));
+  if(control.phase!=="planning")await cancelSupersededReviews(control,currentAgentId);
+  await notify(control.collaborationId,allSubmitted?"各方分析及本轮事实核验已收齐，协调方汇总完整共同文档。":"已收到本方分析，等待其他项目或本轮事实核验。");
+}
+
+async function commitLifecycleApproval(userId:string, control:Lifecycle, documentHash:string) {
+  await db.update(collaborationLifecycles).set({phase:"executing",approvedHash:documentHash,approvedById:userId,approvedAt:new Date(),updatedAt:new Date()}).where(eq(collaborationLifecycles.collaborationId,control.collaborationId));
+  const revision=await getRevision(control);
+  await db.update(lifecycleRevisions).set({approvalIntent:null,updatedAt:new Date()}).where(eq(lifecycleRevisions.id,revision.id));
+  await db.update(collaborations).set({status:"in_progress",updatedAt:new Date()}).where(eq(collaborations.id,control.collaborationId));
+  await notify(control.collaborationId,`管理员已确认第 ${control.revision} 版完整开发文档（${documentHash}），本轮引用事实已核验。双方可按此版实施。`);
+  await audit({collaborationId:control.collaborationId,actorType:"user",actorId:userId,action:"lifecycle.approved",metadata:{revision:control.revision,documentHash}});
+  await queueWorkflowWakeup(control.collaborationId);
+}
+
+async function settleFactGates(control:Lifecycle,currentAgentId:string|null=null) {
+  const current=(await getControl(control.collaborationId))!,facts=current.facts??[],revision=await getRevision(current),rows=await getContributions(current);
+  let plansChanged=false;
+  for(const row of rows) if(row.pendingPlan&&factsReady(row.pendingPlan.factRefs,facts,current.revision)) {
+    const pending=row.pendingPlan,unchanged=sameBindings(pending.bindings,bindFacts(pending.factRefs,facts));
+    await db.update(lifecycleContributions).set({pendingPlan:null,content:unchanged?pending.content:null,workspaceBaseline:pending.baseline??null,factRefs:pending.factRefs,block:null,updatedAt:new Date()}).where(eq(lifecycleContributions.id,row.id));
+    plansChanged=true;
+    await notify(current.collaborationId,unchanged?"引用事实来源已核对且未变化，自动接续已保存的本方分析，无需模型重复提交。":"引用事实已变化，旧分析不再采用；本方Agent将按当前资料只读重新规划。");
+  }
+  if(plansChanged&&["planning","plan_synthesis","plan_confirmation"].includes(current.phase)) {await finishPlanning(current,currentAgentId);await queueWorkflowWakeup(current.collaborationId);return;}
+  const refs=revision.sharedContract?.factRefs??[];
+  if(!refs.length||!current.documentHash||!["plan_confirmation","awaiting_approval"].includes(current.phase))return;
+  if(!factsReady(refs,facts,current.revision))return;
+  if(!sameBindings(revision.factBindings??[],bindFacts(refs,facts))) {
+    for(const row of rows) if(row.factRefs?.some(key=>refs.includes(key))) await db.update(lifecycleContributions).set({content:null,pendingPlan:null,confirmedHash:null,block:null,updatedAt:new Date()}).where(eq(lifecycleContributions.id,row.id));
+    await finishPlanning(current,currentAgentId);
+    await notify(current.collaborationId,"完整文档引用的事实来源或值已变化，旧批准意图已作废；自动重新规划并等待管理员批准新文档。");await queueWorkflowWakeup(current.collaborationId);return;
+  }
+  const intent=revision.approvalIntent;
+  if(intent&&current.phase==="awaiting_approval"&&intent.documentHash===current.documentHash&&!current.pausedAt&&current.requiredParticipantIds.every(id=>rows.some(row=>row.participantId===id&&row.confirmedHash===current.documentHash))) {
+    try {await requireAdministrator(intent.userId,current.collaborationId);}
+    catch {await db.update(lifecycleRevisions).set({approvalIntent:null}).where(eq(lifecycleRevisions.id,revision.id));await notify(current.collaborationId,"原确认人的权限已变化，事实核验已保留，需当前管理员审阅。");return;}
+    await commitLifecycleApproval(intent.userId,current,current.documentHash);
+  }
 }
 
 async function cancelInformationJobs(control: Lifecycle, requestId: string, keepAgentId: string | null = null) {
@@ -257,6 +321,7 @@ export async function resolveInformation(userId: string, collaborationId: string
     await db.update(collaborationLifecycles).set({ facts: [...(control.facts ?? []).filter(row => row.key !== fact.key), fact].slice(-200), updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
     const owner = (await getContributions(control)).find(row => row.participantId === request.requestedByParticipantId);
     await syncInformationBlock(control, owner, revision.informationRequests!.map(row => row.id === request.id ? updated : row));
+    await settleFactGates(control);
     await db.insert(messages).values({ id: newId(), collaborationId, authorType: "user", authorName: "管理员补充事实", kind: "clarification", body: answer.trim(), metadata: { blockResolution: true, requestId, dispatch: false } });
     await queueWorkflowWakeup(collaborationId);
     return (await getLifecycleContext(collaborationId))!;
@@ -277,7 +342,7 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     const existing = (await getContributions(control)).find((row) => row.participantId === participantId);
     if (inputAction.type === "plan.amend") {
       if (!revision.repair || control.phase !== "planning") throw new HttpError(409, "仅修复规划阶段可提交基于上版的增量分析");
-      preparedAction = { type: "plan.submit", revision: inputAction.revision, baseline: inputAction.baseline,
+      preparedAction = { type: "plan.submit", revision: inputAction.revision, baseline: inputAction.baseline, factRefs:inputAction.factRefs,
         content: `本方沿用第${revision.repair.sourceRevision}版完整共同文档和既有业务目标，基线文档${revision.repair.sourceDocumentHash}。\n\n本轮修复变更：\n${inputAction.changes}\n\n双方确认完整新版后仍需管理员批准，批准前不修改代码或运行验证。` };
     }
     if (inputAction.type === "plan.patch") {
@@ -301,9 +366,15 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
       await db.update(lifecycleRevisions).set({ informationRequests: requests.map(row => row.id === request.id ? updated : row), updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
       const owner = (await getContributions(control)).find(row => row.participantId === request.requestedByParticipantId);
       await syncInformationBlock(control, owner, requests.map(row => row.id === request.id ? updated : row));
-      const fact = factFromRequest(updated), key = informationKey(request.question, request.key);
+      const fact = request.purpose==="diagnostic"?null:factFromRequest(updated), key = informationKey(request.question, request.key);
       const facts = (control.facts ?? []).map(row => row.key === key && (updated.status === "conflicted" || request.stage === "verify" && action.status === "unavailable") ? { ...row, status: updated.status === "conflicted" ? "conflicted" as const : "stale" as const } : row);
       await db.update(collaborationLifecycles).set({ facts: fact ? [...facts.filter(row => row.key !== fact.key), fact].slice(-200) : facts, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
+      if(request.purpose==="diagnostic"&&updated.status==="answered") {
+        const category=action.diagnosisCategory??"unknown",currentOwner=(await getContributions(control)).find(row=>row.participantId===request.requestedByParticipantId);
+        if(currentOwner?.block)await db.update(lifecycleContributions).set({block:{...currentOwner.block,kind:"needs_admin",category,requiresReview:true,requiresAuthorization:category==="authorization",reason:`本地Agent只读诊断：${updated.answer}；分类=${category}。管理员确认前不重新实施或验证。`.slice(0,5000)},updatedAt:new Date()}).where(eq(lifecycleContributions.id,currentOwner.id));
+        await audit({collaborationId,actorType:"agent",actorId:participantId,action:"lifecycle.diagnosed",metadata:{revision:control.revision,requestId:request.id,category}});
+      }
+      await settleFactGates(control,currentAgentId);
       if ((updated.attempt ?? 1) !== (request.attempt ?? 1)) await cancelInformationJobs(control, request.id, currentAgentId);
       await notify(collaborationId, updated.status === "answered" ? `缺失信息已获取，将自动续接原阶段：${request.question}` : updated.status === "needs_admin" ? `自动查找已穷尽，请管理员仅补充缺失事实：${request.question}` : `本地共享资料不足，正在向对端询证：${request.question}`);
       await queueWorkflowWakeup(collaborationId, undefined, updated.retryAt ? Math.max(0, Date.parse(updated.retryAt) - Date.now()) : 0);
@@ -349,34 +420,36 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     if (existing?.block) await db.update(lifecycleContributions).set({ block: null, updatedAt: new Date() }).where(eq(lifecycleContributions.id, existing.id));
     if (action.type === "plan.submit") {
       if (!["planning", "plan_synthesis", "plan_confirmation"].includes(control.phase)) throw new HttpError(409, "当前阶段不能修改开发文档");
-      if (existing?.content === action.content && JSON.stringify(existing.workspaceBaseline ?? null) === JSON.stringify(action.baseline ?? null)) return { changed: false };
+      if (existing?.content === action.content && JSON.stringify(existing.workspaceBaseline ?? null) === JSON.stringify(action.baseline ?? null) && canonicalJson(existing.factRefs??[])===canonicalJson(action.factRefs??[])) return { changed: false };
       const localAgent = required.find(row => row.participant.id === participantId)?.agent;
       if ((control.protocolVersion ?? 1) >= 6 && localAgent && ["codex", "codex-app-server", "claude-code", "generic-cli"].includes(localAgent.adapter) && (!action.baseline?.testFiles || !action.baseline.head)) throw new HttpError(422, "真实项目需由新版Connector采集Git基线及测试文件指纹后提交计划");
-      await db.insert(lifecycleContributions).values({ id: newId(), collaborationId, revision: control.revision, participantId, content: action.content, workspaceBaseline: action.baseline ?? null })
-        .onDuplicateKeyUpdate({ set: { content: action.content, workspaceBaseline: action.baseline ?? null, updatedAt: new Date() } });
-      const contributions = await getContributions(control);
-      const allSubmitted = control.requiredParticipantIds.every((id) => contributions.some((row) => row.participantId === id && row.content));
-      await db.update(lifecycleContributions).set({ confirmedHash: null, updatedAt: new Date() }).where(currentContribution(collaborationId, control.revision));
-      await db.update(lifecycleRevisions).set({ document: null, documentHash: null, sharedContract: null, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
-      await db.update(collaborationLifecycles).set({ phase: allSubmitted ? "plan_synthesis" : "planning", documentHash: null, approvedHash: null, approvedById: null, approvedAt: null, updatedAt: new Date() })
-        .where(eq(collaborationLifecycles.collaborationId, collaborationId));
-      if (control.phase !== "planning") await cancelSupersededReviews(control, currentAgentId);
-      await notify(collaborationId, allSubmitted ? "各方分析已收齐，由协调方 Agent 汇总唯一接口契约、责任和联合验收用例。" : "已收到本方分析，等待其他项目补齐。");
+      const factRefs=action.factRefs??[],bindings=bindFacts(factRefs,control.facts??[]);
+      if((control.protocolVersion??1)>=7&&!factsReady(factRefs,control.facts??[],control.revision)) {
+        const pendingPlan={content:action.content,baseline:action.baseline??null,factRefs,bindings};
+        await db.insert(lifecycleContributions).values({id:newId(),collaborationId,revision:control.revision,participantId,content:null,pendingPlan,factRefs}).onDuplicateKeyUpdate({set:{content:null,pendingPlan,factRefs,updatedAt:new Date()}});
+        await scheduleFactGates(control,participantId,factRefs);return {changed:true};
+      }
+      await db.insert(lifecycleContributions).values({id:newId(),collaborationId,revision:control.revision,participantId,content:action.content,workspaceBaseline:action.baseline??null,factRefs,pendingPlan:null}).onDuplicateKeyUpdate({set:{content:action.content,workspaceBaseline:action.baseline??null,factRefs,pendingPlan:null,updatedAt:new Date()}});
+      await finishPlanning(control,currentAgentId);
       return { changed: true };
     }
     if (action.type === "plan.compose") {
       if (control.phase !== "plan_synthesis" || participantId !== control.requiredParticipantIds[0] || action.baseDocumentHash !== control.documentHash) throw new HttpError(409, "仅协调方可基于当前版本汇总统一契约");
       const context = (await getLifecycleContext(collaborationId))!;
-      validateSharedContract(action.contract, control.requiredParticipantIds, context.baseline?.contract, (control.protocolVersion ?? 1) >= 6 && collaboration.type === "api-integration");
+      const refs=action.contract.factRefs??[],requiredRefs=[...new Set(context.contributions.flatMap(row=>row.factRefs??[]))];
+      if((control.protocolVersion??1)>=7&&requiredRefs.some(key=>!refs.includes(key)))throw new HttpError(422,"共同契约不得遗漏项目分析所引用的共享事实key");
+      const bindings=bindFacts(refs,control.facts??[]);
+      if((control.protocolVersion??1)>=7&&!factsReady(refs,control.facts??[],control.revision)){await scheduleFactGates(control,participantId,refs);return {changed:true};}
+      validateSharedContract(action.contract, control.requiredParticipantIds, context.baseline?.contract, (control.protocolVersion ?? 1) >= 6 && collaboration.type === "api-integration", (control.protocolVersion??1)>=7&&collaboration.type==="api-integration");
       if (revision.repair && context.baseline?.contract) validateRepairContract(context.baseline.contract, action.contract);
       const rows = await requiredProjects(control);
       const document = renderSharedContract({ title: collaboration.title, revision: control.revision, requirements: revision.requirements,
         changeRequest: revision.changeRequest, contract: action.contract, previous: context.baseline?.contract,
-        names: new Map(rows.map((row) => [row.participant.id, row.project.name])), baselines: context.contributions });
+        names: new Map(rows.map((row) => [row.participant.id, row.project.name])), baselines: context.contributions, factBindings:bindings });
       const documentHash = hash(document);
       if (documentHash === control.documentHash && (revision.objections ?? []).some((item) => item.documentHash === documentHash)) throw new HttpError(422, "该文档已有未解决异议，请实质修订契约后再提交");
       await db.update(lifecycleContributions).set({ confirmedHash: null, updatedAt: new Date() }).where(currentContribution(collaborationId, control.revision));
-      await db.update(lifecycleRevisions).set({ document, documentHash, sharedContract: action.contract, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
+      await db.update(lifecycleRevisions).set({ document, documentHash, sharedContract: action.contract, factBindings:bindings, approvalIntent:null, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
       await db.update(collaborationLifecycles).set({ phase: "plan_confirmation", documentHash, approvedHash: null, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
       await notify(collaborationId, "统一契约已生成。双方须检查接口语义、责任边界、联测命令和预期结果，存在冲突请提出异议。");
       return { changed: true };
@@ -486,7 +559,7 @@ async function finishReport(control: Lifecycle, revision: Revision, collaboratio
       const check = row.integrationChecks?.find(item => item.status !== "passed");
       const category = check?.category ?? row.reportEvidence?.category ?? (check?.status === "not_run" ? "environment" : "unknown");
       const reason = `${category === "environment" ? "服务或运行环境未就绪" : category === "authorization" ? "本机权限不足" : category === "missing_information" ? "必要事实不足" : "失败原因尚未确定"}：${check?.summary ?? row.reportSummary}；本轮未通过，管理员确认前不重新实施或验证。`.slice(0, 5000);
-      if (category === "missing_information") await beginInformationLookup(control, row.participantId, reason, undefined, { resumeRequiresReview: true });
+      if (category === "missing_information" || category === "unknown") await beginInformationLookup(control, row.participantId, reason, undefined, { resumeRequiresReview: true, purpose:category==="unknown"?"diagnostic":"fact" });
       else await db.update(lifecycleContributions).set({ block: { kind: "needs_admin", requiresReview: true, requiresAuthorization: category === "authorization", category: category as "environment" | "authorization" | "unknown", reason, phase: control.phase, attempts: 1, retryAt: null, retryAfterSeconds: 5, dependencyParticipantIds: [] }, updatedAt: new Date() }).where(eq(lifecycleContributions.id, row.id));
     }
     await db.update(collaborations).set({ status: "in_progress", updatedAt: new Date() }).where(eq(collaborations.id, control.collaborationId));
@@ -507,12 +580,15 @@ export async function approveLifecycle(userId: string, collaborationId: string, 
     const contributions = await getContributions(control);
     if (!control.requiredParticipantIds.every((id) => contributions.some((row) => row.participantId === id && row.confirmedHash === input.documentHash))) throw new HttpError(409, "尚未收齐双方对当前文档的确认");
     await requiredProjects(control);
-    await db.update(collaborationLifecycles).set({ phase: "executing", approvedHash: input.documentHash, approvedById: userId, approvedAt: new Date(), updatedAt: new Date() })
-      .where(eq(collaborationLifecycles.collaborationId, collaborationId));
-    await db.update(collaborations).set({ status: "in_progress", updatedAt: new Date() }).where(eq(collaborations.id, collaborationId));
-    await notify(collaborationId, `管理员已确认第 ${control.revision} 版开发文档（${input.documentHash}）。双方可按此版实施并分别提交完整实际报告。`);
-    await audit({ collaborationId, actorType: "user", actorId: userId, action: "lifecycle.approved", metadata: input });
-    await queueWorkflowWakeup(collaborationId);
+    const refs=revision.sharedContract?.factRefs??[];
+    if((control.protocolVersion??1)>=7&&!factsReady(refs,control.facts??[],control.revision)) {
+      await db.update(lifecycleRevisions).set({approvalIntent:{userId,documentHash:input.documentHash,requestedAt:new Date().toISOString()},updatedAt:new Date()}).where(eq(lifecycleRevisions.id,revision.id));
+      await scheduleFactGates(control,control.requiredParticipantIds[0]!,refs);
+      await audit({collaborationId,actorType:"user",actorId:userId,action:"lifecycle.approval_requested",metadata:input});
+      return (await getLifecycleContext(collaborationId))!;
+    }
+    if((control.protocolVersion??1)>=7&&!sameBindings(revision.factBindings??[],bindFacts(refs,control.facts??[])))throw new HttpError(409,"文档引用的事实已变化，不能沿用旧文档批准");
+    await commitLifecycleApproval(userId,control,input.documentHash);
     return (await getLifecycleContext(collaborationId))!;
   });
 }

@@ -18,3 +18,5 @@ test-results
 **/test-results
 *.tsbuildinfo
 .DS_Store
+
+apps/platform/build-info.json

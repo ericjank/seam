@@ -29,7 +29,7 @@ vi.mock("@/services/credentials", () => ({ requestCredential: vi.fn() }));
 vi.mock("@/services/acceptance", () => ({ submitAcceptance: vi.fn() }));
 vi.mock("@/services/lifecycle", () => ({ applyLifecycleAction: vi.fn(), assertLifecycleJobCurrent: vi.fn(), getLifecycleContext: vi.fn() }));
 
-import { advanceAgentWorkflow } from "../src/services/agent-engine";
+import { advanceAgentWorkflow, buildContext } from "../src/services/agent-engine";
 
 const workflow = { id: "workflow-1", round: 2, maxRounds: 12, autoAdvance: true };
 const newJobs = () => state.inserted.filter((entry) => entry.table === "connector_jobs");
@@ -50,6 +50,18 @@ beforeEach(() => {
 });
 
 describe("生命周期自动推进的迟到回调隔离", () => {
+  it("把本方最新动作拒绝原因交给下一轮，成功后不重复旧错误", () => {
+    state.detail.jobs = [{ id: "rejected-job", agentId: "agent-a", status: "failed", error: "HTTP要求遗漏独立检查", updatedAt: new Date() }];
+    expect(buildContext(state.detail as any, "a").messages.at(-1)?.body).toContain("HTTP要求遗漏独立检查");
+    state.detail.jobs.unshift({ id: "success", agentId: "agent-a", status: "completed", updatedAt: new Date() });
+    expect(buildContext(state.detail as any, "a").messages).toHaveLength(0);
+  });
+  it("其他端仍运行时，过期的本方重试按参与方独立补派发",async()=>{
+    state.detail.lifecycle.phase="executing";state.job.payload.lifecycleSnapshot.phase="executing";
+    state.detail.lifecycle.blocks=[{participantId:"a",kind:"retryable",retryAt:new Date(0).toISOString()}];
+    state.jobs.push({id:"peer-running",agentId:"agent-b",status:"running",payload:{lifecycleSnapshot:{revision:1,phase:"executing"}}});
+    await advanceAgentWorkflow("job");expect(newJobs()).toHaveLength(1);expect(newJobs()[0]!.values.agentId).toBe("agent-a");
+  });
   it("本方主任务已完成的对端仍被调度为只读事实答复；信息进展不耗尽旧推进预算", async () => {
     const now=new Date().toISOString(),requestId=crypto.randomUUID();
     const l=state.detail.lifecycle;l.phase="executing";l.blocks=[{participantId:"a",kind:"gathering_info"}];l.reports=[{participantId:"b",status:"passed"}];
@@ -108,10 +120,11 @@ describe("生命周期自动推进的迟到回调隔离", () => {
     expect(state.inserted).toEqual([]);
   });
 
-  it("被较新显式流程取代的旧回调即使当前无运行任务也不重启", async () => {
+  it("同修订旧批次回调只补当前参与方缺口，不继承旧批次预算", async () => {
     state.jobs.push({ ...state.job, id: "new-job", sequence: 11, status: "failed", payload: { ...state.job.payload, workflow: { ...workflow, id: "workflow-new" } } });
     await advanceAgentWorkflow("job");
-    expect(state.inserted).toEqual([]);
+    expect(newJobs()).toHaveLength(1);
+    expect(newJobs()[0]!.values.agentId).toBe("agent-a");
   });
 
   it("确认期重写文档后，旧hash批次结束仍会派发最新hash重新确认", async () => {
@@ -123,8 +136,9 @@ describe("生命周期自动推进的迟到回调隔离", () => {
     expect(newJobs()[0]!.values.payload.lifecycleSnapshot.documentHash).toBe("a".repeat(64));
   });
 
-  it("耗尽批次只写一次停止消息，后续迟到回调保持停止", async () => {
-    state.job.payload.workflow.round = 12;
+  it("耗尽当前参与方预算只写一次停止消息，后续迟到回调保持停止", async () => {
+    state.detail.collaboration.maxNegotiationRounds=12;
+    state.jobs=Array.from({length:12},(_,index)=>({...state.job,id:`prior-${index}`,agentId:"agent-a",payload:{...state.job.payload,context:{participant:{id:"a"},lifecycle:{revision:1,phase:"plan_synthesis"}}}}));
     await advanceAgentWorkflow("job");
     expect(newJobs()).toHaveLength(0);
     expect(state.inserted).toHaveLength(1);

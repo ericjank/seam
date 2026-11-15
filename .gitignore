@@ -12,3 +12,5 @@ output/acceptance-*/
 .env.*
 !.env.example
 .DS_Store
+
+/apps/platform/build-info.json

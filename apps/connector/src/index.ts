@@ -1,6 +1,6 @@
 import { createAgentAdapter, describeExecutionPolicy } from "@seam/agent-adapters";
 import { createHash } from "node:crypto";
-import { collaborationContextSchema } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, collaborationContextSchema } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
 import { ExecutionJournal, type JournalEntry, type ExecutionCheckpoint, type ControlReceipt } from "./journal.js";
 import { withWorkspaceLock, workspaceBaseline } from "./workspace.js";
@@ -12,6 +12,7 @@ import { runLocalTest } from "./local-test.js";
 import { attachCommandEvidence, captureCommand, probeServices, ServiceReadinessError } from "./evidence.js";
 import { discoverProject } from "./discovery.js";
 import { collectTestFiles, checkPinnedTests, fingerprintInformation, verifyCachedFact } from "./integrity.js";
+import { connectorBuildInfo } from "./build-info.js";
 import { runIndependentChecks, buildConfiguredIntegrationReport } from "./independent-checks.js";
 
 export async function runConnector(config: ConnectorConfig) {
@@ -39,12 +40,13 @@ export async function runConnector(config: ConnectorConfig) {
   };
   const credentialStore = new CredentialStore(config.agentId);
   const a2a = createA2AHandler(adapter, config.projectRoot, config.agentId, `${config.platformUrl}/api/a2a/${config.agentId}`);
+  const build = connectorBuildInfo();
   const capabilities = {
     adapter: config.adapter,
     executionMode: config.adapter === "codex" || config.adapter === "codex-app-server" ? config.codexSandbox ?? "read-only" : "external" as const,
     testConfigured: Boolean(process.env.SEAM_TEST_COMMAND),
     supportsInformationLookup: true,
-    protocolVersion: 6,
+    protocolVersion: CONNECTOR_PROTOCOL_VERSION, build,
   };
   const deliverControl = async (entry: ControlReceipt) => {
     const response = await client.heartbeat(capabilities, AbortSignal.timeout(15_000), { id: entry.jobId, attempts: entry.attempts, cancelled: true });
@@ -172,7 +174,7 @@ export async function runConnector(config: ConnectorConfig) {
             }
             for (const action of agentTurn.actions) if ((action.type === "plan.submit" || action.type === "plan.amend") && before) action.baseline = { ...before, testFiles: await collectTestFiles(config.projectRoot) };
             const conversation = await adapter.getConversation?.(input);
-            result = { agentTurn, ...(conversation ? { conversation } : {}), ...(telemetry ? { telemetry } : {}) };
+            result = { agentTurn, provenance:{connector:build,platform:(job.payload.provenance as {platform?:unknown}|undefined)?.platform??null,protocolVersion:CONNECTOR_PROTOCOL_VERSION,jobPayloadHash:input.jobPayloadHash}, ...(conversation ? { conversation } : {}), ...(telemetry ? { telemetry } : {}) };
             finished = !agentTurn.needsHumanInput && agentTurn.actions.some((action) => action.type === "execution.report" && action.status === "passed");
           } else if (job.kind === "a2a.message") {
             const response = await a2a.transport.handle(job.payload.request);
@@ -218,6 +220,7 @@ export async function runConnector(config: ConnectorConfig) {
         try { await deliverControl(control); } catch { /* Durable pending control is replayed independently of the old completion. */ }
       }
       active = undefined;
+      if(result&&job.kind==="collaboration.turn")result.provenance={connector:build,platform:(job.payload.provenance as {platform?:unknown}|undefined)?.platform??null,protocolVersion:CONNECTOR_PROTOCOL_VERSION,jobPayloadHash:createHash("sha256").update(JSON.stringify(job.payload)).digest("hex")};
       const receipt: JournalEntry = { jobId: job.id, attempts: job.attempts, state: "pending", result, error: executionError, updatedAt: new Date().toISOString() };
       await journal.save(receipt);
       await deliver(receipt);

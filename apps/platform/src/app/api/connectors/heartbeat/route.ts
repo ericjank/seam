@@ -12,7 +12,7 @@ export async function POST(request: Request) {
         adapter: z.enum(["codex", "codex-app-server", "claude-code", "generic-cli", "mock"]),
         executionMode: z.enum(["read-only", "workspace-write", "external"]), testConfigured: z.boolean(),
         supportsInformationLookup: z.boolean().optional(),
-        protocolVersion: z.number().int().positive().optional(),
+        protocolVersion: z.number().int().positive().optional(), build:z.object({kind:z.string(),sourceId:z.string().max(100),files:z.number().int().nonnegative()}).optional(),
       }).optional(),
     }).parse(await request.json());
     await authenticateConnector(request, agentId);

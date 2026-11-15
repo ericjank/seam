@@ -22,6 +22,7 @@ const supportsDiscount = businessRevision >= 2 && businessRevision <= 4;
 let readinessFields = {};
 if (repairInformation) readinessFields = JSON.parse(await readFile("docs/integration-facts.json", "utf8"));
 const maximumQuantity = businessRevision === 3 ? 50 : 100;
+const factRefs=(lifecycle?.facts??[]).filter(fact=>fact.key==="quote.contractVersion").map(fact=>fact.key);
 const actions = [];
 let message = "虚拟提供方已读取本轮上下文，无需重复执行。";
 let needsHumanInput = false;
@@ -37,10 +38,10 @@ if (!lifecycle) {
     message="已读取本方项目协议文件并答复对端，未实施或运行测试。";
   }else actions.push({type:"information.respond",revision:lifecycle.revision,requestId:request.id,attempt:context.informationTask.attempt??1,value:repairInformation?readinessFields.contractVersion:"",validForSeconds:3600,status:"unavailable",answer:"已检查本方README与现有接口，未找到所问事实。",sources:[{scope:"local_project",reference:"README.md",finding:"已检查本方接口说明"},{scope:"shared_context",reference:"当前共同文档",finding:"没有可核对的新增事实"}]});
 } else if (lifecycle.phase === "planning" && lifecycle.repair && !lifecycle.contributions.some(item=>item.participantId===context.participant.id)) {
-  actions.push({type:"plan.amend",revision:lifecycle.revision,changes:"只修正server.mjs的HTTP金额额外加1回归；保留业务规则、全部验收断言和joint.test.mjs内容。服务健康版本动态绑定当前修订，原批准的测试不修改。管理员重新批准前只读。"});
+  actions.push({type:"plan.amend",revision:lifecycle.revision,factRefs,changes:"只修正server.mjs的HTTP金额额外加1回归；保留业务规则、全部验收断言和joint.test.mjs内容。服务健康版本动态绑定当前修订，原批准的测试不修改。管理员重新批准前只读。"});
   message="提供方只提交本次修复差异，原共同文档由平台复用。";
 } else if (lifecycle.phase === "planning" && !lifecycle.contributions.some((item) => item.participantId === context.participant.id)) {
-  actions.push({ type: "plan.submit", revision: lifecycle.revision, content: `# 提供方完整实施方案（修订${lifecycle.revision}）
+  actions.push({ type: "plan.submit", revision: lifecycle.revision, factRefs, content: `# 提供方完整实施方案（修订${lifecycle.revision}）
 
 ## 目标与范围
 按README的合成报价HTTP契约提供POST /quote业务处理，单价均使用整数分，保留SKU-001与SKU-002。修改本项目service.mjs、server.mjs、service.test.mjs及获批后新建joint.test.mjs，不操作真实业务或部署环境。
@@ -65,14 +66,14 @@ ${lifecycle.repair ? "修复诊断：已核对HTTP层server.mjs和原始联合�
 } else if (lifecycle.phase === "plan_synthesis") {
   const ids = lifecycle.requiredParticipantIds;
   actions.push({ type: "plan.compose", revision: lifecycle.revision, baseDocumentHash: lifecycle.documentHash, contract: {
-    effectiveRequirements: [{id:"quote-base",text:"当前批准的基础报价接口及边界"}], retiredRequirements: [],
+    effectiveRequirements: [{id:"quote-normal",text:"两SKU正常金额与数量边界",verification:"http"},{id:"quote-invalid",text:"无效数量与未知SKU拒绝",verification:"http"},{id:"quote-json",text:"畸形JSON拒绝",verification:"http"}], retiredRequirements: [], factRefs,
     testChanges: [],
     serviceExpectations: [{name:"quote",publisherParticipantId:context.participant.id,healthPath:"/health",status:200,bodyChecks:[{path:"ready",equals:true},{path:"revision",equals:lifecycle.revision}]}],
     scope: "在合成项目中实现并真实联合验证报价 HTTP 契约；服务代码由各端负责，服务进程由提供方实施并发布，缺失联合脚本由双方各自创建。",
-    interfaces: [{ id: "quote", definition: "POST /quote 使用 JSON。SKU-001 单价12000分，SKU-002单价4500分；quantity为1到100整数，非法请求返回400。响应保留sku、quantity、subtotal和CNY币种。" + (lifecycle.revision >= 2 ? "discountPercent为0到100整数，省略默认0，null和布尔非法；discount向下取整，total=subtotal-discount。" : "") }],
+    interfaces: [{ id: "quote", definition: "POST /quote 使用 JSON。SKU-001 单价12000分，SKU-002单价4500分；quantity为1到100整数，非法请求返回400。响应保留sku、quantity、subtotal和CNY币种。" + (supportsDiscount ? "discountPercent为0到100整数，省略默认0，null和布尔非法；discount向下取整，total=subtotal-discount。" : businessRevision === 5 ? "出现discountPercent一律400。" : "") }],
     responsibilities: ids.map((participantId) => ({ participantId, changes: "读取本项目README并完成本方业务导出和Node单元测试；批准后实施，在批准后分别创建各自缺失的joint.test.mjs，再对提供方发布的就绪服务执行真实联合验证。" })),
-    acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index+1}`, runnerParticipantId, description: "运行本项目真实HTTP联合用例，验证正常报价及非法数量和本修订边界", command: "node --test joint.test.mjs", expectedResult: "退出码0，金额正确，非法输入HTTP400", requiredAssertions: providerAssertions(businessRevision), httpChecks: [{id:"quote-amount",publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:JSON.stringify({sku:"SKU-001",quantity:2}),expectedStatus:200,bodyChecks:[{path:"subtotal",equals:24000},{path:"currency",equals:"CNY"}]}] })),
-    risks: "仅本地合成项目；网络不可用如实报告未执行，不部署，不安装依赖。", changeSummary: lifecycle.revision >= 2 ? "保留基础报价，增量增加折扣字段和兼容验证。" : "首次统一字段、错误语义、双方职责及真实联合验收。", impactedParticipantIds: ids, retainedDecisions: lifecycle.revision >= 2 ? ["保留报价路径、SKU单价和数量校验"] : [],
+    acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index+1}`, runnerParticipantId, description: "运行本项目真实HTTP联合用例，验证正常报价及非法数量和本修订边界", command: "node --test joint.test.mjs", expectedResult: "退出码0，金额正确，非法输入HTTP400", requiredAssertions: providerAssertions(businessRevision), httpChecks: [{id:"quote-amount",requirementIds:["quote-normal"],publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:JSON.stringify({sku:"SKU-001",quantity:2}),expectedStatus:200,bodyChecks:[{path:"subtotal",equals:24000},{path:"currency",equals:"CNY"}]}, {id:"invalid-quantity",requirementIds:["quote-invalid"],publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:JSON.stringify({sku:"SKU-001",quantity:0}),expectedStatus:400,bodyChecks:[]},{id:"malformed-json",requirementIds:["quote-json"],publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:"{",expectedStatus:400,bodyChecks:[]}] })),
+    risks: "仅本地合成项目；网络不可用如实报告未执行，不部署，不安装依赖。", changeSummary: repairInformation && lifecycle.revision >= 2 ? "只修复HTTP金额回归，保留业务规则及原验收测试。" : supportsDiscount ? "保留基础报价，增量增加折扣字段和兼容验证。" : businessRevision === 5 ? "撤销折扣扩展，恢复基础报价。" : "首次统一字段、错误语义、双方职责及真实联合验收。", impactedParticipantIds: ids, retainedDecisions: lifecycle.revision >= 2 ? ["保留报价路径、SKU单价和数量校验"] : [],
   } });
   message = "虚拟协调方汇总统一契约，等待双方审阅。";
 } else if (lifecycle.phase === "plan_confirmation" && !lifecycle.confirmations.includes(context.participant.id)) {

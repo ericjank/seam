@@ -59,10 +59,10 @@ export async function verifyCachedFact(context: CollaborationContext, root: stri
   const request = context.lifecycle?.informationRequests.find(row => row.id === context.informationTask!.requestId);
   const fact = context.lifecycle?.facts.find(row => row.key === request?.cachedFactKey);
   const response = fact?.responses.find(row => row.participantId === context.participant.id);
-  if (!request || !fact || !response || fact.status !== "active" || Date.parse(fact.validUntil) <= Date.now()) return null;
+  if (!request || !fact || !response || fact.status === "conflicted") return null;
   const local = response.sources.filter(source => source.scope === "local_project");
   if (!local.length || local.some(source => !source.contentHash)) return null;
   const matches = (await Promise.all(local.map(async source => await hashProjectFile(root, source.reference) === source.contentHash))).every(Boolean);
   return { message: matches ? "Connector已只读核对共享事实的本方资料指纹，复用已知事实；无需再次调用模型。" : "Connector发现缓存事实来源已变化，转入当前资料重新检索。", kind: "status", notifyParticipantIds: [], needsHumanInput: false,
-    actions: [{ type: "information.respond", revision: context.lifecycle!.revision, requestId: request.id, attempt: request.attempt ?? 1, status: matches ? "found" : "unavailable", value: fact.value, answer: matches ? fact.answer : "缓存来源的当前文件哈希与已知事实不符，不能继续使用旧值。", sources: response.sources, validForSeconds: Math.max(30, Math.floor((Date.parse(fact.validUntil) - Date.now()) / 1000)) }] };
+    actions: [{ type: "information.respond", revision: context.lifecycle!.revision, requestId: request.id, attempt: request.attempt ?? 1, status: matches ? "found" : "unavailable", value: fact.value, answer: matches ? fact.answer : "缓存来源的当前文件哈希与已知事实不符，不能继续使用旧值。", sources: response.sources, validForSeconds: Math.max(30, Math.min(86400, response.validForSeconds ?? 3600)) }] };
 }

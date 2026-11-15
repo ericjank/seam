@@ -27,7 +27,7 @@ export async function drainWorkflowWakeups(scope: { agentId?: string; collaborat
       const stale = row.snapshot && (!control || row.snapshot.revision !== control.revision);
       if (!stale && !control?.pausedAt) {
         if (row.sourceJobId) await advanceAgentWorkflow(row.sourceJobId);
-        else if (control && row.snapshot?.phase === control.phase && row.snapshot.documentHash === control.documentHash && ["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(control.phase)) {
+        else if (control && row.snapshot?.phase === control.phase && row.snapshot.documentHash === control.documentHash && control.phase!=="terminated") {
           const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, row.collaborationId)).limit(1);
           if (collaboration) await dispatchAgentTurns(collaboration.createdById, row.collaborationId, undefined, { autoAdvance: true });
         }

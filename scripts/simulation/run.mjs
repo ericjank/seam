@@ -10,6 +10,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { SimulationApi } from "./http.mjs";
 import { agentInstructions, contract, revisionOne, revisions } from "./contract.mjs";
+import { superviseController } from "./controller-supervisor.mjs";
 import { publishJointEvidence } from "./publish-joint-evidence.mjs";
 
 const exec = promisify(execFile);
@@ -17,10 +18,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const api = new SimulationApi();
 const repairInformation = process.env.SEAM_SIMULATION_SCENARIO === "repair-information";
 let contractVersion;
+let controllerAttempt=1,createdParticipantId;
 const checks = [];
 let runRoot;
 let collaborationId;
 let locals = [];
+let eventCursor=0;const lifecycleEvents=[];let frozenBuild;
 const workers = [];
 
 function lifecycle(detail) {
@@ -97,30 +100,35 @@ async function restartConsumerWithLostCheckpoint(){
   checks.push("修订3后重启本方Connector并模拟交接检查点丢失；保留同一thread，重新同步当前资料");
 }
 
-async function runUntilPhase(expected) {
-  const deadline = Date.now() + 25 * 60_000;
-  let previous;
-  while (Date.now() < deadline) {
-    const detail = await api.detail(collaborationId), current = lifecycle(detail);
-    const state = JSON.stringify([current.revision, current.phase, detail.jobs.map((job) => [job.id, job.status]), current.blocks]);
-    if (state !== previous) {
-      progress("lifecycle", { revision: current.revision, phase: current.phase, jobs: detail.jobs.map((job) => ({id:job.id,status:job.status})), blocks: current.blocks });
-      await writeFile(join(runRoot, `state-${Date.now()}.json`), JSON.stringify(detail, null, 2));
-      previous = state;
-      await writeRunIndex("running", detail);
-    }
-    if (current.phase === expected) return detail;
-    // Automatic Connector receipts can complete joint verification between two
-    // polls. The durable repair baseline proves that milestone was reached.
-    if (repairInformation && expected === "joint_verifying" && current.revision === 2 && current.repair?.sourceRevision === 1 && current.baseline?.report) return detail;
-    assert.notEqual(current.phase, "terminated");
-    const failed = detail.jobs.find((job) => job.status === "failed");
-    assert.ok(!failed, `Connector failed: ${failed?.error ?? ""}`);
-    assert.ok(!current.blocks.some((block) => block.kind === "needs_admin"), `unexpected administrator dependency: ${JSON.stringify(current.blocks)}`);
-    assert.ok(workers.every(({local}) => !local.exit), "a long-running Connector exited unexpectedly");
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+async function pollMilestones() {
+  let more=true;
+  while(more){const page=await api.call(`/api/collaborations/${collaborationId}/events?after=${eventCursor}&limit=200`,undefined,{method:"GET"});
+    for(const event of page.events){if(event.sequence>eventCursor)lifecycleEvents.push(event);}
+    eventCursor=page.nextCursor;more=page.hasMore;
+  }
+  await writeFile(join(runRoot,"lifecycle-events.json"),JSON.stringify({cursor:eventCursor,events:lifecycleEvents},null,2));
+}
+async function runUntilPhase(expected,expectedRevision) {
+  const deadline=Date.now()+25*60_000;let previous,failures=0;
+  while(Date.now()<deadline){
+    let detail;
+    try{await pollMilestones();detail=await api.detail(collaborationId);failures=0;}
+    catch(error){if(++failures>10)throw error;progress("controller-retry",{failures,message:String(error).slice(0,300)});await new Promise(resolve=>setTimeout(resolve,Math.min(5000,500*2**failures)));continue;}
+    const current=lifecycle(detail),state=JSON.stringify([current.revision,current.phase,detail.jobs.map(job=>[job.id,job.status]),current.blocks]);
+    if(state!==previous){progress("lifecycle",{revision:current.revision,phase:current.phase,jobs:detail.jobs.map(job=>({id:job.id,status:job.status})),blocks:current.blocks});await writeFile(join(runRoot,`state-${Date.now()}.json`),JSON.stringify(detail,null,2));previous=state;await writeRunIndex("running",detail);}
+    if(current.phase===expected&&(expectedRevision===undefined||current.revision===expectedRevision))return detail;
+    if(expected==="joint_verifying"&&lifecycleEvents.some(event=>event.current.phase===expected&&event.current.revision===expectedRevision)){progress("milestone-already-completed",{revision:expectedRevision,phase:expected,currentRevision:current.revision,currentPhase:current.phase});return detail;}
+    assert.notEqual(current.phase,"terminated");assert.ok(!current.blocks.some(block=>block.kind==="needs_admin"),`unexpected administrator dependency: ${JSON.stringify(current.blocks)}`);assert.ok(workers.every(({local})=>!local.exit),"a continuously polling Connector exited");
+    await new Promise(resolve=>setTimeout(resolve,750));
   }
   assert.fail(`did not reach ${expected} before deadline`);
+}
+async function buildSnapshot(){
+  const files=(await readdir(here)).filter(name=>name.endsWith(".mjs")).sort(),parts=[];
+  for(const name of files)parts.push([name,createHash("sha256").update(await readFile(join(here,name))).digest("hex")]);
+  const connector=JSON.parse(await readFile(join(here,"../../apps/connector/dist/build-info.json"),"utf8"));
+  const health=await api.call("/api/health",undefined,{method:"GET"});assert.match(connector.sourceId,/^[a-f0-9]{64}$/);assert.match(health.build?.sourceId??"",/^[a-f0-9]{64}$/);
+  return {connector,platform:health.build,harnessSourceId:createHash("sha256").update(JSON.stringify(parts)).digest("hex")};
 }
 
 async function jointHttpCheck(revision) {
@@ -213,9 +221,10 @@ async function jointHttpCheck(revision) {
 
 async function approveAndExecute(detail, baseline) {
   const ready = lifecycle(detail);
-  assert.equal(ready.phase, "awaiting_approval");
+  assert.ok(["awaiting_approval","executing","joint_verifying","awaiting_review"].includes(ready.phase));
   assert.ok(ready.document && ready.document.length >= 100);
   assert.equal(new Set(ready.confirmations).size, 2, "both participants must confirm the same full document");
+  if(ready.phase==="awaiting_approval") {
   await assertNoUnapprovedWrites(baseline);
   await writeFile(join(runRoot, `revision-${ready.revision}-approved-plan.md`), ready.document);
   await api.expect(`/api/collaborations/${collaborationId}/lifecycle`, {
@@ -223,7 +232,8 @@ async function approveAndExecute(detail, baseline) {
   }, 409);
   await assertNoUnapprovedWrites(baseline);
   await api.lifecycle(collaborationId, { action: "approve", revision: ready.revision, documentHash: ready.documentHash });
-  const reviewed = await runUntilPhase("awaiting_review");
+  }else assert.equal(ready.approvedHash,ready.documentHash);
+  const reviewed = await runUntilPhase("awaiting_review",ready.revision);
   const completed = lifecycle(reviewed);
   assert.equal(completed.reports.length, 2, "both endpoints must submit actual execution.report actions");
   assert.ok(completed.reports.every((report) => report.status === "passed"), "a failed test cannot be counted as a passed simulation");
@@ -244,12 +254,21 @@ async function approveAndExecute(detail, baseline) {
 }
 
 async function main() {
-  if (process.env.SEAM_SIMULATION_RESUME_ROOT) return resumeRepair();
+  if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==="1") {
+    const configuration=await new Promise(resolve=>process.once("message",resolve));
+    ({runRoot,collaborationId,locals,contractVersion,frozenBuild,controllerAttempt,createdParticipantId}=configuration);
+    assert.match(collaborationId,/^[a-f0-9-]{36}$/i);assert.ok(locals.every(local=>local.root.startsWith(runRoot+"/")));
+    checks.push(...configuration.checks);await api.loginOwner();assert.deepEqual(await buildSnapshot(),frozenBuild);
+    const recovered=await api.detail(collaborationId);
+    if(lifecycle(recovered).phase==="terminated") {assert.ok(lifecycle(recovered).integrationReports.every(row=>row.checks.every(check=>check.status==="passed")));await readFile(join(runRoot,"revision-2-report.json"));return finishSimulation(recovered,2);}
+    return executeWorkflow(configuration.initial);
+  }
   runRoot = await mkdtemp(join(tmpdir(), "seam-full-simulation-"));
   await mkdir(join(runRoot, "codex-state"));
   progress("simulation-started", { base: api.base, runRoot, ai: "real local Codex app-server", peer: "deterministic virtual provider" });
   await api.call("/api/health", undefined, { method: "GET" });
   await api.loginOwner();
+  frozenBuild=await buildSnapshot();await writeFile(join(runRoot,"run-build.json"),JSON.stringify(frozenBuild,null,2));
   const suffix = randomUUID().slice(0, 8);
   if (repairInformation) contractVersion = `public-quote-${randomUUID().slice(0, 8)}`;
   for (const [role, adapter] of [["provider", "generic-cli"], ["consumer", "codex-app-server"]]) {
@@ -260,7 +279,7 @@ async function main() {
     await writeFile(join(root, "AGENTS.md"), agentInstructions);
     if (repairInformation) {
       await writeFile(join(root, "README.md"), `${contract}\n\n本项目职责：${role}。服务的额外公开就绪字段contractVersion必须符合提供方现有项目文档；缺少时先查本地和共享资料，再自动询证，不由管理员填写。\n`);
-      await writeFile(join(root, "AGENTS.md"), `${agentInstructions}\n本次只实现基础报价，不增加折扣功能。修复版保持原业务和原必需断言，健康响应检查当前lifecycle.revision。测试名应是稳定标识，不把修订号写入测试名。joint.test.mjs必须从process.env.SEAM_SERVICE_URL和Number(process.env.SEAM_REVISION)获取端点和批准修订，首次生成后修复金额错误无需修改测试文件。共同契约的每方acceptanceCases必须包含httpChecks独立业务检查：POST /quote，请求JSON字符串{\"sku\":\"SKU-001\",\"quantity\":2}，expectedStatus=200，bodyChecks为subtotal=24000及currency=CNY，publisherParticipantId为提供方，serviceName=quote。testChanges=[]，修复保留原独立检查。修复计划优先plan.amend，协调方优先plan.patch只改服务健康revision及修复摘要，其他字段保留。joint_verifying只运行既有脚本并真实报告，不修改代码、测试或业务目标。失败用integration.report failed，平台只读起草修复方案，管理员批准前不再实施验证。\n${role === "consumer" ? "本项目没有提供方公开contractVersion的值。提交本方plan.submit前须先查本地和共享资料，缺失时使用information.request询证提供方；不能猜测值或要求管理员填。收到答复后复用并把contractVersion及当前revision一起列入就绪契约和实际HTTP联合测试。" : "本方公开协议事实保存在docs/integration-facts.json。"}`);
+      await writeFile(join(root, "AGENTS.md"), `${agentInstructions}\n本次只实现基础报价，不增加折扣功能。修复版保持原业务和原必需断言，健康响应检查当前lifecycle.revision。测试名应是稳定标识，不把修订号写入测试名。joint.test.mjs必须从process.env.SEAM_SERVICE_URL和Number(process.env.SEAM_REVISION)获取端点和批准修订，首次生成后修复金额错误无需修改测试文件。共同契约的每方acceptanceCases必须包含httpChecks独立业务检查：POST /quote，请求JSON字符串{\"sku\":\"SKU-001\",\"quantity\":2}，expectedStatus=200，bodyChecks为subtotal=24000及currency=CNY，publisherParticipantId为提供方，serviceName=quote。testChanges=[]，修复保留原独立检查。effectiveRequirements将正常报价、数量边界、未知SKU、畸形JSON分别列稳定ID，verification=http，公开就绪协议单列verification=review；两端各自httpChecks覆盖两SKU正常金额、quantity=0和101及字符串/空值、未知SKU、畸形JSON原始正文，requirementIds引用各对应HTTP要求。每端的factRefs引用quote.contractVersion；修复继续保留此引用，由平台自动安排来源核验，不重复改写既有计划。修复计划优先plan.amend，协调方优先plan.patch只改服务健康revision及修复摘要，其他字段保留。joint_verifying只运行既有脚本并真实报告，不修改代码、测试或业务目标。失败用integration.report failed，平台只读起草修复方案，管理员批准前不再实施验证。\n${role === "consumer" ? "本项目没有提供方公开contractVersion的值。提交本方plan.submit前须先查本地和共享资料，缺失时使用information.request询证提供方；不能猜测值或要求管理员填。收到答复后复用并把contractVersion及当前revision一起列入就绪契约和实际HTTP联合测试。" : "本方公开协议事实保存在docs/integration-facts.json。"}`);
       if (role === "provider") { await mkdir(join(root,"docs")); await writeFile(join(root,"docs/integration-facts.json"),JSON.stringify({contractVersion})); }
     }
     await exec("git", ["init", "--quiet", root]);
@@ -304,35 +323,50 @@ async function main() {
   await noSession.expect(`/api/collaborations/${collaborationId}/lifecycle`, { action: "terminate" }, 401, { token: locals[0].agent.token });
   checks.push("只读用户与Connector Token不能批准或终止协作");
 
+  createdParticipantId=created.participantId;
+  const supervision=await superviseController({file:fileURLToPath(import.meta.url),configuration:{runRoot,collaborationId,locals,contractVersion,frozenBuild,checks,initial,createdParticipantId},onEvent:event=>progress(event.event,event)});
+  await writeFile(join(runRoot,"controller-supervision.json"),JSON.stringify({ok:true,...supervision,temporaryTakeover:false,connectorsRestarted:false},null,2));
+}
+
+async function executeWorkflow(initial) {
   const revisionCount=repairInformation ? 2 : Number(process.env.SEAM_SIMULATION_REVISIONS ?? 5);
   assert.ok(Number.isInteger(revisionCount) && revisionCount>=2 && revisionCount<=5);
   let baseline=initial, ready;
   if (repairInformation) {
-    const first = await runUntilPhase("awaiting_approval"), firstState=lifecycle(first);
-    const lookup=firstState.informationRequests.find(row=>row.status==="answered"&&row.responses.some(reply=>reply.mode==="peer"&&reply.status==="found"&&reply.answer.includes(contractVersion)));
-    assert.ok(lookup,"the missing fact must come from a persisted peer information response, not the administrator");
-    await assertNoUnapprovedWrites(initial);
-    await writeFile(join(runRoot,"information-evidence.json"),JSON.stringify({request:lookup,expectedPublicContractVersion:contractVersion},null,2));
-    await writeFile(join(runRoot,"revision-1-approved-plan.md"),firstState.document);
-    await api.lifecycle(collaborationId,{action:"approve",revision:1,documentHash:firstState.documentHash});
-    const verifying=await runUntilPhase("joint_verifying"),oldService=lifecycle(verifying).services.find(row=>row.name==="quote") ?? JSON.parse(await readFile(join(runRoot,"mock-state",`${collaborationId}.json`),"utf8"));assert.ok(oldService.baseUrl);
-    const implementationBaseline=await Promise.all(locals.map(local=>snapshot(local.root)));
-    ready=await runUntilPhase("awaiting_approval");const repair=lifecycle(ready);
-    assert.equal(repair.revision,2);assert.equal(repair.repair.sourceRevision,1);assert.equal(repair.approvedHash,null);assert.ok(repair.baseline.report.includes("失败"));
-    await assertNoUnapprovedWrites(implementationBaseline);
-    await new Promise(resolve=>setTimeout(resolve,2000));await assertNoUnapprovedWrites(implementationBaseline);
-    await api.expect(`/api/collaborations/${collaborationId}/lifecycle`,{action:"approve",revision:1,documentHash:firstState.documentHash},409);
-    await api.expect(`/api/collaborations/${collaborationId}/test-runs`,{participantId:created.participantId},409);
-    const wrongResponse=await fetch(oldService.baseUrl+"/quote",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sku:"SKU-001",quantity:2})});
-    const wrong=await wrongResponse.json();assert.equal(wrong.subtotal,24001,"the failed HTTP implementation remains unchanged before repair approval");
-    await writeFile(join(runRoot,"revision-1-report.json"),JSON.stringify({status:"failed",revision:1,documentHash:firstState.documentHash,report:repair.baseline.report,failures:repair.repair.failures,actualFailedHTTPResponse:wrong},null,2));
-    await writeFile(join(runRoot,"repair-approval-evidence.json"),JSON.stringify({repair:repair.repair,approvedHashBeforeAdministrator:null,before:implementationBaseline,after:await Promise.all(locals.map(local=>snapshot(local.root))),noRepairWritesBeforeApproval:true},null,2));
-    checks.push("本地与共享查找后自动向对端取得公开contractVersion；管理员未填写任何接口资料");
-    checks.push("真实HTTP金额故障产生失败证据，平台自动起草修复版；原报告保留、旧批准失效、批准前双方文件保持不变且故障仍存在");
+    let current=await api.detail(collaborationId),state=lifecycle(current);
+    let firstState;
+    if(state.revision===1&&["planning","plan_synthesis","plan_confirmation","awaiting_approval"].includes(state.phase)) {
+      const first=state.phase==="awaiting_approval"?current:await runUntilPhase("awaiting_approval",1);firstState=lifecycle(first);
+      const lookup=firstState.informationRequests.find(row=>row.status==="answered"&&row.responses.some(reply=>reply.mode==="peer"&&reply.status==="found"&&reply.answer.includes(contractVersion)));
+      assert.ok(lookup);await assertNoUnapprovedWrites(initial);
+      await writeFile(join(runRoot,"information-evidence.json"),JSON.stringify({request:lookup,expectedPublicContractVersion:contractVersion},null,2));
+      await writeFile(join(runRoot,"revision-1-approved-plan.md"),firstState.document);
+      await api.lifecycle(collaborationId,{action:"approve",revision:1,documentHash:firstState.documentHash});
+      if(process.env.SEAM_SIMULATION_INJECT_CONTROLLER_EXIT==="after_first_approval") {
+        let inject=false;try{await writeFile(join(runRoot,"controller-injected-once.json"),JSON.stringify({at:new Date().toISOString(),scope:"owned controller exits; Connectors stay alive"}),{flag:"wx"});inject=true;}catch(error){if(error.code!=="EEXIST")throw error;}
+        if(inject)process.exit(88);
+      }
+    }
+    current=await api.detail(collaborationId);state=lifecycle(current);
+    if(state.revision===1)await runUntilPhase("joint_verifying",1);
+    current=await api.detail(collaborationId);state=lifecycle(current);
+    let implementationBaseline;
+    try{implementationBaseline=JSON.parse(await readFile(join(runRoot,"revision-1-implementation-baseline.json"),"utf8"));}
+    catch{assert.ok(state.revision===1||state.revision===2&&!state.approvedHash,"a restart cannot invent an old pre-approval snapshot");implementationBaseline=await Promise.all(locals.map(local=>snapshot(local.root)));await writeFile(join(runRoot,"revision-1-implementation-baseline.json"),JSON.stringify(implementationBaseline,null,2));}
+    if(state.revision===1||state.revision===2&&["planning","plan_synthesis","plan_confirmation","awaiting_approval"].includes(state.phase)) {
+      ready=state.revision===2&&state.phase==="awaiting_approval"?current:await runUntilPhase("awaiting_approval",2);
+      const repair=lifecycle(ready);assert.equal(repair.revision,2);assert.equal(repair.repair.sourceRevision,1);assert.equal(repair.approvedHash,null);await assertNoUnapprovedWrites(implementationBaseline);
+      await new Promise(resolve=>setTimeout(resolve,2000));await assertNoUnapprovedWrites(implementationBaseline);
+      await api.expect(`/api/collaborations/${collaborationId}/lifecycle`,{action:"approve",revision:1,documentHash:repair.baseline.documentHash},409);
+      await api.expect(`/api/collaborations/${collaborationId}/test-runs`,{participantId:createdParticipantId},409);
+      const oldService=JSON.parse(await readFile(join(runRoot,"mock-state",`${collaborationId}.json`),"utf8"));assert.equal(oldService.revision,1);
+      const response=await fetch(oldService.baseUrl+"/quote",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sku:"SKU-001",quantity:2})});const wrong=await response.json();assert.equal(wrong.subtotal,24001);
+      await writeFile(join(runRoot,"revision-1-report.json"),JSON.stringify({status:"failed",revision:1,documentHash:repair.baseline.documentHash,report:repair.baseline.report,failures:repair.repair.failures,actualFailedHTTPResponse:wrong},null,2));
+      await writeFile(join(runRoot,"repair-approval-evidence.json"),JSON.stringify({repair:repair.repair,approvedHashBeforeAdministrator:null,before:implementationBaseline,after:await Promise.all(locals.map(local=>snapshot(local.root))),noRepairWritesBeforeApproval:true},null,2));
+    }else {assert.equal(state.revision,2);ready=current;}
+    checks.push("自动询证公开事实；首轮真实故障保留原报告；来源端自动复核跨修订事实；修复前文件不变且故障仍存在");
     await approveAndExecute(ready,implementationBaseline);
-    const repaired=await api.detail(collaborationId);assert.equal(lifecycle(repaired).repair.sourceRevision,1);
-    assert.ok(lifecycle(repaired).integrationReports.every(entry=>entry.checks.every(check=>check.status==="passed")));
-    checks.push("管理员确认新修复文档后，两端重新实施并真实验证通过；没有人工追加修复目标或自动批准");
+    checks.push("管理员批准完整修复文档后，双方真实实施验证通过；控制器使用持久事件自动接续，无人工接管");
   } else for(let index=0;index<revisionCount;index++){
     if(index>0){
       if(index===3) await restartConsumerWithLostCheckpoint();
@@ -354,8 +388,9 @@ async function main() {
 
 async function finishSimulation(ready,revisionCount) {
   const noSession = new SimulationApi(api.base);
-  const beforeTermination = await Promise.all(locals.map((local) => snapshot(local.root)));
-  await api.lifecycle(collaborationId, { action: "terminate" });
+  let beforeTermination;try{beforeTermination=JSON.parse(await readFile(join(runRoot,"termination-baseline.json"),"utf8"));}catch{beforeTermination=await Promise.all(locals.map(local=>snapshot(local.root)));await writeFile(join(runRoot,"termination-baseline.json"),JSON.stringify(beforeTermination));}
+  await assertNoUnapprovedWrites(beforeTermination);
+  if(lifecycle(await api.detail(collaborationId)).phase!=="terminated")await api.lifecycle(collaborationId, { action: "terminate" });
   const terminated = await api.detail(collaborationId);
   assert.equal(lifecycle(terminated).phase, "terminated");
   assert.ok(!terminated.jobs.some((job) => ["pending", "running"].includes(job.status)));
@@ -370,7 +405,12 @@ async function finishSimulation(ready,revisionCount) {
   await assertNoUnapprovedWrites(beforeTermination);
   checks.push(`管理员终止后无运行任务，禁止继续派发/批准，${locals[0].agent.token ? "旧回执409" : "无认证回执401"}被拒绝，项目文件保持不变`);
 
-  const result = { ok: true, collaborationId, base: api.base, runRoot, checks, revisions: revisionCount, scenario:repairInformation ? "repair-information" : "five-revision", runLabel: `验收-${runRoot.split("-").at(-1)}`,
+  await pollMilestones();assert.deepEqual(await buildSnapshot(),frozenBuild,"source changed during cold acceptance run");
+  const executions=[];let cursor=0,more=true;
+  while(more){const page=await api.call(`/api/collaborations/${collaborationId}/executions?after=${cursor}&limit=200`,undefined,{method:"GET"});executions.push(...page.executions);cursor=page.nextCursor;more=page.hasMore;}
+  for(const execution of executions.filter(row=>row.status==="completed"&&row.kind==="collaboration.turn")){assert.equal(execution.provenance?.connector.sourceId,frozenBuild.connector.sourceId);assert.equal(execution.provenance?.platform.sourceId,frozenBuild.platform.sourceId);}
+  await writeFile(join(runRoot,"execution-builds.json"),JSON.stringify({ok:true,executions},null,2));
+  const result = { ok: true, coldStart:true, temporaryTakeover:false, automaticControllerRecoveries:controllerAttempt-1, builds:frozenBuild, collaborationId, base: api.base, runRoot, checks, revisions: revisionCount, scenario:repairInformation ? "repair-information" : "five-revision", runLabel: `验收-${runRoot.split("-").at(-1)}`,
     concurrency: "two independent continuously polling Connector processes; no provider-first scheduler",
     realAI: "local Codex app-server", virtualPeer: "deterministic provider implemented and tested locally",
     scope: "本地Docker中心及MySQL、两个隔离合成项目、真实HTTP报价接口；不代表实际业务项目联调或生产部署" };
@@ -380,55 +420,20 @@ async function finishSimulation(ready,revisionCount) {
 }
 
 
-// Acceptance-controller recovery only: adopt the existing task and continuously
-// polling Connectors. No credential access, token rotation or new native thread.
-async function resumeRepair() {
-  assert.ok(repairInformation, "resume only the two-revision repair scenario");
-  runRoot=process.env.SEAM_SIMULATION_RESUME_ROOT;
-  assert.match(runRoot,/^\/(?:private\/)?var\/folders\/.+\/T\/seam-full-simulation-[A-Za-z0-9]+$/);
-  collaborationId=process.env.SEAM_SIMULATION_RESUME_ID;
-  assert.match(collaborationId??"",/^[a-f0-9-]{36}$/i);
-  await api.loginOwner();
-  const first=await api.detail(collaborationId), control=lifecycle(first);
-  assert.equal(control.revision,2);assert.equal(control.repair?.sourceRevision,1);assert.equal(control.approvedHash,null);
-  for(const role of ["provider","consumer"]) {
-    const row=first.participants.find(row=>row.project.name.startsWith(`simulation-${role}-`));assert.ok(row?.agent);
-    locals.push({project:row.project,agent:row.agent,root:join(runRoot,role),role});
-  }
-  const baseline=await Promise.all(locals.map(local=>snapshot(local.root)));
-  const ready=await runUntilPhase("awaiting_approval"),repair=lifecycle(ready);
-  await assertNoUnapprovedWrites(baseline);
-  const service=JSON.parse(await readFile(join(runRoot,"mock-state",`${collaborationId}.json`),"utf8"));assert.equal(service.revision,1);
-  const response=await fetch(service.baseUrl+"/quote",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sku:"SKU-001",quantity:2})});const wrong=await response.json();assert.equal(wrong.subtotal,24001);
-  await new Promise(resolve=>setTimeout(resolve,2000));await assertNoUnapprovedWrites(baseline);
-  await api.expect(`/api/collaborations/${collaborationId}/lifecycle`,{action:"approve",revision:1,documentHash:repair.baseline.documentHash},409);
-  await api.expect(`/api/collaborations/${collaborationId}/test-runs`,{participantId:first.participants[0].participant.id},409);
-  await writeFile(join(runRoot,"revision-1-report.json"),JSON.stringify({status:"failed",revision:1,documentHash:repair.baseline.documentHash,report:repair.baseline.report,failures:repair.repair.failures,actualFailedHTTPResponse:wrong},null,2));
-  await writeFile(join(runRoot,"repair-approval-evidence.json"),JSON.stringify({repair:repair.repair,approvedHashBeforeAdministrator:null,before:baseline,after:await Promise.all(locals.map(local=>snapshot(local.root))),noRepairWritesBeforeApproval:true},null,2));
-  const information=JSON.parse(await readFile(join(runRoot,"information-evidence.json"),"utf8"));assert.equal(information.request.status,"answered");assert.ok(repair.facts.some(fact=>fact.value===information.expectedPublicContractVersion));
-  checks.push("前段在同一任务完成双端建连、自动询证、共同文档与首轮批准实施；Connector实际联测检出24001金额错误，原失败报告持久化");
-  checks.push("快速联合回执超出旧控制器轮询采样后，依据持久化修复里程碑接续同一任务与同一Codex会话；不重建项目、不索取资料或Agent凭据");
-  checks.push("修复规划期间双方文件保持不变，实际HTTP故障仍存在；旧批准与旁路测试入口均被拒绝，等待管理员批准完整修复文档");
-  await approveAndExecute(ready,baseline);
-  const parent=Number(process.env.SEAM_SIMULATION_REPLACED_RUNNER_PID);assert.ok(Number.isInteger(parent)&&parent>1&&parent!==process.pid);
-  process.kill(parent,"SIGTERM");
-  await writeFile(join(runRoot,"controller-recovery.json"),JSON.stringify({at:new Date().toISOString(),replacedRunner:parent,collaborationId,reason:"A short-lived joint_verifying phase was missed by the original polling controller. Durable original failure and existing agents were adopted; no platform state was forged.",sameProjects:true,noConnectorRestart:true,noNewNativeThread:true},null,2));
-  await finishSimulation(ready,2);
-}
-
 main().catch(async (error) => {
   if (collaborationId) await api.lifecycle(collaborationId, { action: "pause" }).catch(() => {});
   const result = { ok: false, collaborationId, base: api.base, runRoot, checks, error: error instanceof Error ? error.message : String(error) };
   if (runRoot) await writeFile(join(runRoot, "failure.json"), JSON.stringify(result, null, 2)).catch(() => undefined);
   await writeRunIndex("failed").catch(()=>{});
   console.error(JSON.stringify(result, null, 2));
+  process.send?.({status:"failed",error:result.error});
   process.exitCode = 1;
 }).finally(async () => {
+  if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==="1"){if(!process.exitCode)process.send?.({status:"passed"});process.disconnect?.();return;}
   for (const { child, local, logs } of workers) {
     try { process.kill(-child.pid, "SIGTERM"); } catch {}
     await writeFile(join(runRoot, `${local.role}-connector.log`), logs.join(""));
   }
-  for(const pid of JSON.parse(process.env.SEAM_SIMULATION_ADOPTED_WORKER_PIDS??"[]")){assert.ok(Number.isInteger(pid)&&pid>1);try{process.kill(-pid,"SIGTERM");}catch{}}
   if (runRoot) for (const name of await readdir(join(runRoot, "mock-state")).catch(() => [])) {
     if (!name.endsWith(".json")) continue;
     const service = JSON.parse(await readFile(join(runRoot, "mock-state", name), "utf8"));

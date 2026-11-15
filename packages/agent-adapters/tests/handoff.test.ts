@@ -30,6 +30,22 @@ function input(value = context()): AgentRunInput {
 }
 
 describe("Native human-readable handoff", () => {
+  it("修复交接内联具体失败摘要，完整原始报告和派发审计按需读取且原文可校验", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "seam-repair-digest-"));
+    try {
+      const value = context(), raw = "ORIGINAL_FAILURE_LOG\n".repeat(1000);
+      value.lifecycle!.baseline = { revision: 1, document: "原完整文档", documentHash: "a".repeat(64), contract: null, report: raw,
+        failureDigest: [{ participantId: value.participant.id, summary: "subtotal expected 24000, actual 24001", checks: [], independentResults: [], runs: [{ id: "real-run-1", command: "node --test joint.test.mjs", exitCode: 1 }] }] };
+      value.messages = [{ ...message(90, "DISPATCH_AUDIT_ONLY"), authorType: "system", metadata: { dispatch: { revision: 1, targets: [value.participant.id] } } }];
+      const prepared = await materializeHandoffResources(input(value), directory), handoff = buildNativeHandoff(prepared);
+      expect(handoff.prompt).toContain("subtotal expected 24000, actual 24001"); expect(handoff.prompt).toContain("real-run-1");
+      expect(handoff.prompt).not.toContain("ORIGINAL_FAILURE_LOG"); expect(handoff.prompt).not.toContain("DISPATCH_AUDIT_ONLY");
+      const report = prepared.resources!.find(row => row.key === "originalFailureReport")!;
+      expect(await readFile(report.path, "utf8")).toBe(raw); expect(report.hash).toBe(digest(raw));
+      const deliveries = prepared.resources!.find(row => row.key === "deliveryHistory")!;
+      expect(await readFile(deliveries.path, "utf8")).toContain("DISPATCH_AUDIT_ONLY");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it("累计要求不重复初始目标或当前delta，未变轮次只保留当前授权控制", () => {
     const value = context(), delta = "DELTA_SENTINEL：本次撤销折扣";
     value.lifecycle = { ...value.lifecycle!, revision: 5, requirements: `${value.objective}\n\n## 第5版\n${delta}`, changeRequest: delta };

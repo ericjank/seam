@@ -34,9 +34,9 @@ describe("Native response schema", () => {
     value.context!.lifecycle!.repair={sourceRevision:3,sourceDocumentHash:"b".repeat(64),sourceReportHash:"c".repeat(64),cycle:1,failures:[{participantId:value.context!.participant.id,stage:"joint_verifying",caseId:"amount",status:"failed",summary:"真实金额错误"}]};
     value.context!.lifecycle!.baseline={revision:3,document:"完整原方案",documentHash:"b".repeat(64),contract:null,report:"真实失败"};
     inspectStrictObjects(buildNativeOutputSchema(value));
-    expect(parse([{type:"plan.amend",revision:4,changes:"仅修正金额计算的额外加1回归，保留完整原验收规则与测试文件。"}],value).actions[0]!.type).toBe("plan.amend");
-    value.context!.lifecycle!.phase="plan_synthesis";inspectStrictObjects(buildNativeOutputSchema(value));
-    const delta={scope:null,interfaces:null,responsibilities:null,acceptanceCases:null,serviceExpectations:null,risks:null,changeSummary:"只修正金额计算回归，保留完整业务范围与断言",impactedParticipantIds:[value.context!.participant.id],retainedDecisions:null,testChanges:null};
+    expect(parse([{type:"plan.amend",revision:4,factRefs:[],changes:"仅修正金额计算的额外加1回归，保留完整原验收规则与测试文件。"}],value).actions[0]!.type).toBe("plan.amend");
+    value.context!.lifecycle!.phase="plan_synthesis";const repairSchema=buildNativeOutputSchema(value);inspectStrictObjects(repairSchema);expect(JSON.stringify(repairSchema)).not.toContain("plan.compose");expect(Buffer.byteLength(JSON.stringify(repairSchema))).toBeLessThan(11336);
+    const delta={scope:null,interfaces:null,responsibilities:null,acceptanceCases:null,serviceExpectations:null,risks:null,changeSummary:"只修正金额计算回归，保留完整业务范围与断言",impactedParticipantIds:[value.context!.participant.id],retainedDecisions:null,testChanges:null,factRefs:null};
     const result=parse([{type:"plan.patch",revision:4,baseDocumentHash:"a".repeat(64),delta}],value);
     expect((result.actions[0] as any).delta).toEqual({changeSummary:delta.changeSummary,impactedParticipantIds:delta.impactedParticipantIds});
   });
@@ -44,7 +44,7 @@ describe("Native response schema", () => {
     const value=input("executing"),requestId=crypto.randomUUID();
     value.context!.lifecycle!.approvedHash=value.context!.lifecycle!.documentHash;
     value.context!.informationTask={requestId,mode:"peer"};
-    const response={type:"information.respond",revision:4,requestId,attempt:1,value:"v1",validForSeconds:3600,status:"found",answer:"从本方协议查到所需事实",sources:[{scope:"local_project",reference:"docs/api.md",finding:"明确规定接口字段",sourceVersion:null}]};
+    const response={type:"information.respond",revision:4,requestId,diagnosisCategory:"unknown",attempt:1,value:"v1",validForSeconds:3600,status:"found",answer:"从本方协议查到所需事实",sources:[{scope:"local_project",reference:"docs/api.md",finding:"明确规定接口字段",sourceVersion:null}]};
     expect(parse([response],value).actions).toEqual([response]);
     expect(()=>parse([{...response,requestId:crypto.randomUUID()}],value)).toThrow("当前阶段");
     const schema=buildNativeOutputSchema(value);inspectStrictObjects(schema);
@@ -74,7 +74,7 @@ describe("Native response schema", () => {
     expect(parse([confirm], value).actions).toEqual([confirm]);
     expect(() => parse([{ ...confirm, revision: 3 }], value)).toThrow("revision/documentHash");
     expect(() => parse([{ ...confirm, documentHash: "b".repeat(64) }], value)).toThrow("revision/documentHash");
-    expect(parse([{ type: "plan.submit", revision: 4, content: "修订说明".repeat(40) }], value).actions[0]?.type).toBe("plan.submit");
+    expect(parse([{ type: "plan.submit", revision: 4, factRefs:[], content: "修订说明".repeat(40) }], value).actions[0]?.type).toBe("plan.submit");
     value.context!.lifecycle!.documentHash = null;
     expect(() => parse([confirm], value)).toThrow("当前阶段");
   });

@@ -6,6 +6,7 @@ import { newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
 import { normalizeLifecycleOutcome } from "@/lib/lifecycle-outcome";
 import { dispatchMessage, type DispatchTarget } from "@/lib/dispatch-message";
+import { platformBuildInfo } from "@/lib/build-info";
 import { nextWorkflowTargets, type Workflow } from "@/lib/workflow";
 import { requireCollaborationAccess } from "@/lib/access";
 import { getCollaborationDetail } from "./collaborations";
@@ -26,20 +27,39 @@ export async function dispatchAgentTurns(userId: string, collaborationId: string
       eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"),
       inArray(connectorJobs.status, ["pending", "running"]),
     ));
-    if (active.length) return active.map((job) => job.id);
     const detail = await getCollaborationDetail(userId, collaborationId);
-    if (detail.lifecycle) {
-      if (detail.lifecycle.paused || !["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(detail.lifecycle.phase)) throw new HttpError(409, "当前阶段等待管理员确认，不能继续派发实施");
-      const eligible = lifecycleTargets(detail.lifecycle);
-      if (!eligible.length && options.autoAdvance) return [];
-      participantIds = participantIds ? participantIds.filter((id) => eligible.includes(id)) : eligible;
-    }
+    if(detail.lifecycle)return enqueueManaged(detail,active,participantIds,options);
+    if (active.length) return active.map(job=>job.id);
     const workflow: Workflow = {
       id: newId(), round: 1, maxRounds: Math.max(1, Math.min(collaboration.maxNegotiationRounds, 12)),
       autoAdvance: options.autoAdvance ?? false, inputMessageId: detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id,
     };
     return enqueueTurns(detail, workflow, participantIds);
   });
+}
+
+async function enqueueManaged(detail:Awaited<ReturnType<typeof getCollaborationDetail>>,active:typeof connectorJobs.$inferSelect[],participantIds?:string[],options:{autoAdvance?:boolean}={}) {
+  const lifecycle=detail.lifecycle!,collaborationId=detail.collaboration.id;
+      if (lifecycle.paused || !["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(lifecycle.phase) && !lifecycle.requiredParticipantIds.some(id=>informationTaskFor(lifecycle!,id))) throw new HttpError(409, "当前阶段等待管理员确认，不能继续派发实施");
+      const eligible = lifecycleTargets(lifecycle);
+      const busyAgents=new Set(active.filter(job=>["pending","running"].includes(job.status)).map(job=>job.agentId));
+      const free=eligible.filter(id=>!busyAgents.has(detail.participants.find(row=>row.participant.id===id)?.participant.agentId??""));
+      const history=await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId,collaborationId),eq(connectorJobs.kind,"collaboration.turn"),inArray(connectorJobs.status,["completed","failed"])));
+      const eligibleIds=participantIds ? participantIds.filter(id=>free.includes(id)) : free;
+      participantIds=[];
+      for(const id of eligibleIds) {
+        const info=informationTaskFor(lifecycle,id),agentId=detail.participants.find(row=>row.participant.id===id)?.participant.agentId;
+        const count=history.filter(job=>{const context=(job.payload as {context?:CollaborationContext}).context;return ["completed","failed"].includes(job.status)&&job.agentId===agentId&&context?.lifecycle?.revision===lifecycle!.revision&&context.lifecycle.phase===lifecycle!.phase&&!context.informationTask;}).length;
+        if(info||count<Math.min(detail.collaboration.maxNegotiationRounds??12,12))participantIds.push(id);
+        else {
+          const key=`${lifecycle.revision}:${lifecycle.phase}:${id}`;
+          if(!detail.messages.some(row=>(row.metadata as Record<string,unknown>).participantBudgetStopped===key))await db.insert(messages).values({id:newId(),collaborationId,authorType:"system",authorName:"Seam",kind:"system",body:`${detail.participants.find(row=>row.participant.id===id)?.project.name??id} 本阶段自动重试已达上限，其他端仍可独立推进。`,metadata:{participantBudgetStopped:key}});
+        }
+      }
+      if (!participantIds.length) return active.map(job=>job.id);
+
+  const workflow:Workflow={id:newId(),round:1,maxRounds:Math.max(1,Math.min(detail.collaboration.maxNegotiationRounds??12,12)),autoAdvance:options.autoAdvance??false};
+  return enqueueTurns(detail,workflow,participantIds);
 }
 
 async function enqueueTurns(detail: Awaited<ReturnType<typeof getCollaborationDetail>>, workflow: Workflow, participantIds?: string[]) {
@@ -53,7 +73,7 @@ async function enqueueTurns(detail: Awaited<ReturnType<typeof getCollaborationDe
     const context = buildContext(detail, row.participant.id, id);
     await db.insert(connectorJobs).values({
       id, agentId: row.participant.agentId as string, collaborationId: detail.collaboration.id,
-      kind: "collaboration.turn", payload: { context, workflow, lifecycleSnapshot: detail.lifecycle ? {
+      kind: "collaboration.turn", payload: { context, workflow, provenance:{platform:platformBuildInfo()}, lifecycleSnapshot: detail.lifecycle ? {
         revision: detail.lifecycle.revision, phase: detail.lifecycle.phase,
         documentHash: detail.lifecycle.documentHash, approvedHash: detail.lifecycle.approvedHash,
       } : null },
@@ -85,13 +105,19 @@ export function buildContext(detail: Awaited<ReturnType<typeof getCollaborationD
     kind: message.kind, body: message.body, metadata: message.metadata as Record<string, unknown>, createdAt: message.createdAt.toISOString(),
   });
   const referencedVersions = new Set(detail.proposals.map((p) => p.artifactVersionId));
+  const lastReceipt = detail.jobs?.find((job) => job.agentId === participant.agentId && ["completed", "failed"].includes(job.status));
+  const feedback = lastReceipt?.status === "failed" && lastReceipt.error ? [{
+    id: lastReceipt.id, participantId: null, authorType: "system" as const, authorName: "Seam", kind: "status" as const,
+    body: `上次交接未被平台接受，修改已回滚。请修正以下问题后重新提交：${lastReceipt.error.slice(0, 2000)}`,
+    metadata: { rejectedJobId: lastReceipt.id }, createdAt: lastReceipt.updatedAt.toISOString(),
+  }] : [];
   return {
     lifecycle: detail.lifecycle,
     informationTask: detail.lifecycle ? informationTaskFor(detail.lifecycle, participantId) : null,
     jobId, collaborationId: detail.collaboration.id, title: detail.collaboration.title,
     type: detail.collaboration.type, status: detail.collaboration.status, objective: detail.collaboration.objective,
     participant, participants: participantRows,
-    messages: detail.messages.slice(-30).map(mapMessage),
+    messages: [...detail.messages.slice(-30).map(mapMessage), ...feedback],
     instructions: detail.messages.filter((message) => message.authorType === "user").map(mapMessage),
     artifacts: detail.artifacts.map((artifact) => ({
       id: artifact.id, title: artifact.title, type: artifact.type, currentVersion: artifact.currentVersion,
@@ -208,32 +234,22 @@ export async function advanceAgentWorkflow(jobId: string) {
     const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId!)).limit(1).for("update");
     if (!collaboration) return;
     const allJobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, collaboration.id), eq(connectorJobs.kind, "collaboration.turn")));
+    const detail=await getCollaborationDetail(collaboration.createdById,collaboration.id);
+    if(detail.lifecycle) {
+      const snapshot=(job.payload as {lifecycleSnapshot?:LifecycleSnapshot}).lifecycleSnapshot;
+      if(!snapshot||snapshot.revision!==detail.lifecycle.revision)return;
+      const transitions:Record<string,string[]>={planning:["planning","plan_synthesis"],plan_synthesis:["plan_confirmation"],plan_confirmation:["plan_confirmation","plan_synthesis"],executing:["executing","joint_verifying"],joint_verifying:["joint_verifying","planning"]};
+      if(!transitions[snapshot.phase]?.includes(detail.lifecycle.phase))return;
+      if(detail.lifecycle.paused||detail.lifecycle.phase==="terminated"||!["planning","plan_synthesis","plan_confirmation","executing","joint_verifying"].includes(detail.lifecycle.phase)&&!detail.lifecycle.requiredParticipantIds.some(id=>informationTaskFor(detail.lifecycle!,id)))return;
+      await enqueueManaged(detail,allJobs.filter(row=>["pending","running"].includes(row.status)),undefined,{autoAdvance:true});return;
+    }
     const runJobs = allJobs.filter((j) => (j.payload as { workflow?: Workflow }).workflow?.id === workflow.id);
     if (runJobs.some((j) => (j.payload as { workflow: Workflow }).workflow.round > workflow.round)) return;
     const batch = runJobs.filter((j) => (j.payload as { workflow: Workflow }).workflow.round === workflow.round);
     if (batch.some((j) => j.status === "running" || j.status === "pending")) return;
     // A newer explicit run supersedes a late callback from an older one.
     if (allJobs.some((j) => j.status === "pending" || j.status === "running")) return;
-    const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
     if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
-    if (detail.lifecycle) {
-      if (allJobs.some((j) => j.sequence > job.sequence && (j.payload as { workflow?: Workflow }).workflow?.id !== workflow.id)) return;
-      const snapshot = (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot;
-      if (!snapshot || snapshot.revision !== detail.lifecycle.revision) return;
-      const transitions: Record<string, string[]> = { planning: ["planning", "plan_synthesis"], plan_synthesis: ["plan_confirmation"], plan_confirmation: ["plan_confirmation", "plan_synthesis"], executing: ["executing", "joint_verifying"], joint_verifying: ["joint_verifying"] };
-      if (!transitions[snapshot.phase]?.includes(detail.lifecycle.phase)) return;
-      // Managed tasks advance by explicit phase receipts, never by the legacy
-      // message heuristic. Both approval and final closure remain human gates.
-      if (detail.lifecycle.paused || ["awaiting_approval", "awaiting_review", "terminated"].includes(detail.lifecycle.phase)) return;
-      const targets = lifecycleTargets(detail.lifecycle);
-      const informationProgress = batch.some(row => row.status === "completed" && (row.result as { agentTurn?: { actions?: Array<{ type: string }> } } | null)?.agentTurn?.actions?.some(action => action.type === "information.respond"));
-      if (targets.length && (workflow.round < workflow.maxRounds || informationProgress)) {
-        await enqueueTurns(detail, { ...workflow, id: informationProgress ? newId() : workflow.id, round: informationProgress ? 1 : workflow.round + 1 }, targets);
-      } else if (targets.length) {
-        await db.insert(messages).values({ id: newId(), collaborationId: collaboration.id, authorType: "system", authorName: "Seam", kind: "system", body: "自动协作连续重试已达上限，请查看失败原因后重试。", metadata: { workflowStopped: workflow.id } });
-      }
-      return;
-    }
     if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
     const lastInputId = detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id;
     const outcome = nextWorkflowTargets({

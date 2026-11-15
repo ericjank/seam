@@ -193,6 +193,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     collaboration,
     canAdminister: role === "owner",
     lifecycle: await getLifecycleContext(collaborationId),
+    lifecycleEvents:(await db.select().from(auditEvents).where(and(eq(auditEvents.collaborationId,collaborationId),eq(auditEvents.action,"lifecycle.transition"))).orderBy(desc(auditEvents.sequence)).limit(100)).reverse().flatMap(event=>{const state=(event.metadata as {current?:{revision:number;phase:string;paused:boolean;documentHash:string|null}}).current;return state?[{sequence:event.sequence,at:event.createdAt.toISOString(),...state}]:[];}),
     lifecycleHistory: await db.select({ revision: lifecycleRevisions.revision, requirements: lifecycleRevisions.requirements, document: lifecycleRevisions.document, documentHash: lifecycleRevisions.documentHash, report: lifecycleRevisions.report }).from(lifecycleRevisions).where(eq(lifecycleRevisions.collaborationId, collaborationId)).orderBy(desc(lifecycleRevisions.revision)),
     participants: participantRows,
     messages: dispatchJobs.length ? recoverDispatchNames(messageRows, dispatchJobs) : messageRows,
@@ -213,9 +214,9 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     auditEvents: auditRows,
     availableProjects,
     jobs: jobRows.map(({ result, ...job }) => {
-      const record = result as { conversation?: { threadId?: unknown; transport?: unknown; title?: unknown; runLabel?: unknown }; telemetry?: unknown } | null;
+      const record = result as { conversation?: { threadId?: unknown; transport?: unknown; title?: unknown; runLabel?: unknown }; telemetry?: unknown;provenance?:{connector?:{sourceId?:string};platform?:{sourceId?:string};protocolVersion?:number} } | null;
       const conversation = record?.conversation, telemetry = adapterTelemetrySchema.safeParse(record?.telemetry);
-      return { ...job, telemetry: telemetry.success ? telemetry.data : null, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)
+      return { ...job, provenance:record?.provenance?{connectorSourceId:/^[a-f0-9]{64}$/.test(record.provenance.connector?.sourceId??"")?record.provenance.connector!.sourceId!:"unknown",platformSourceId:/^[a-f0-9]{64}$/.test(record.provenance.platform?.sourceId??"")?record.provenance.platform!.sourceId!:"unknown",protocolVersion:record.provenance.protocolVersion}:null, telemetry: telemetry.success ? telemetry.data : null, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)
         ? { threadId: conversation.threadId, transport: "codex-app-server" as const, title: typeof conversation.title === "string" ? conversation.title.slice(0, 200) : "本机 Codex 对话", runLabel: typeof conversation.runLabel === "string" ? conversation.runLabel.slice(0, 40) : "" } : null };
     }),
     connectorCapabilities: agentIds.flatMap((agentId) => {

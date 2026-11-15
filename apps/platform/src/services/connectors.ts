@@ -35,6 +35,7 @@ export async function heartbeat(agentId: string, capabilities?: {
   testConfigured: boolean;
   supportsInformationLookup?: boolean;
   protocolVersion?: number;
+  build?: {kind:string;sourceId:string;files:number};
 }, activeJob?: { id: string; attempts: number; cancelled?: boolean }) {
   await db.update(agents).set({ status: "online", lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(agents.id, agentId));
   if (capabilities) {
@@ -42,7 +43,7 @@ export async function heartbeat(agentId: string, capabilities?: {
       eq(auditEvents.actorId, agentId), eq(auditEvents.action, "connector.capabilities"),
     )).orderBy(desc(auditEvents.sequence)).limit(1);
     const previous = latest?.metadata as typeof capabilities | undefined;
-    if (!previous || previous.adapter !== capabilities.adapter || previous.executionMode !== capabilities.executionMode || previous.testConfigured !== capabilities.testConfigured || previous.supportsInformationLookup !== capabilities.supportsInformationLookup || previous.protocolVersion !== capabilities.protocolVersion) {
+    if (!previous || previous.adapter !== capabilities.adapter || previous.executionMode !== capabilities.executionMode || previous.testConfigured !== capabilities.testConfigured || previous.supportsInformationLookup !== capabilities.supportsInformationLookup || previous.protocolVersion !== capabilities.protocolVersion || previous.build?.sourceId !== capabilities.build?.sourceId) {
       await db.insert(auditEvents).values({ id: newId(), actorType: "connector", actorId: agentId, action: "connector.capabilities", metadata: capabilities });
     }
   }
