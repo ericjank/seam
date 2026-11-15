@@ -15,7 +15,7 @@ import { createProposal, decideProposal } from "./proposals";
 import { createWorkItem, updateWorkItem } from "./work-items";
 import { requestCredential } from "./credentials";
 import { submitAcceptance } from "./acceptance";
-import { applyLifecycleAction, assertLifecycleJobCurrent, getLifecycleContext, type LifecycleSnapshot } from "./lifecycle";
+import { applyLifecycleAction, assertLifecycleJobCurrent, getLifecycleContext, recordRetryBudgetStop, type LifecycleSnapshot } from "./lifecycle";
 
 export async function dispatchAgentTurns(userId: string, collaborationId: string, participantIds?: string[], options: { autoAdvance?: boolean } = {}) {
   await requireCollaborationAccess(userId, collaborationId, true);
@@ -49,10 +49,12 @@ async function enqueueManaged(detail:Awaited<ReturnType<typeof getCollaborationD
       participantIds=[];
       for(const id of eligibleIds) {
         const info=informationTaskFor(lifecycle,id),agentId=detail.participants.find(row=>row.participant.id===id)?.participant.agentId;
-        const count=history.filter(job=>{const context=(job.payload as {context?:CollaborationContext}).context;return ["completed","failed"].includes(job.status)&&job.agentId===agentId&&context?.lifecycle?.revision===lifecycle!.revision&&context.lifecycle.phase===lifecycle!.phase&&!context.informationTask;}).length;
+        const grant=lifecycle.retryBudget?.grants.filter(row=>row.participantId===id&&row.phase===lifecycle.phase).at(-1);
+        const count=history.filter(job=>{const context=(job.payload as {context?:CollaborationContext}).context;return (!grant||job.sequence>grant.afterSequence)&&["completed","failed"].includes(job.status)&&job.agentId===agentId&&context?.lifecycle?.revision===lifecycle!.revision&&context.lifecycle.phase===lifecycle!.phase&&!context.informationTask;}).length;
         if(info||count<Math.min(detail.collaboration.maxNegotiationRounds??12,12))participantIds.push(id);
         else {
-          const key=`${lifecycle.revision}:${lifecycle.phase}:${id}`;
+          const key=`${lifecycle.revision}:${lifecycle.phase}:${id}:${grant?.generation??0}`;
+          await recordRetryBudgetStop(collaborationId,{revision:lifecycle.revision,phase:lifecycle.phase,participantId:id,generation:grant?.generation??0,used:count,limit:Math.min(detail.collaboration.maxNegotiationRounds??12,12)});
           if(!detail.messages.some(row=>(row.metadata as Record<string,unknown>).participantBudgetStopped===key))await db.insert(messages).values({id:newId(),collaborationId,authorType:"system",authorName:"Seam",kind:"system",body:`${detail.participants.find(row=>row.participant.id===id)?.project.name??id} 本阶段自动重试已达上限，其他端仍可独立推进。`,metadata:{participantBudgetStopped:key}});
         }
       }
@@ -238,7 +240,7 @@ export async function advanceAgentWorkflow(jobId: string) {
     if(detail.lifecycle) {
       const snapshot=(job.payload as {lifecycleSnapshot?:LifecycleSnapshot}).lifecycleSnapshot;
       if(!snapshot||snapshot.revision!==detail.lifecycle.revision)return;
-      const transitions:Record<string,string[]>={planning:["planning","plan_synthesis"],plan_synthesis:["plan_confirmation"],plan_confirmation:["plan_confirmation","plan_synthesis"],executing:["executing","joint_verifying"],joint_verifying:["joint_verifying","planning"]};
+      const transitions:Record<string,string[]>={planning:["planning","plan_synthesis"],plan_synthesis:["plan_synthesis","plan_confirmation"],plan_confirmation:["plan_confirmation","plan_synthesis"],executing:["executing","joint_verifying"],joint_verifying:["joint_verifying","planning"]};
       if(!transitions[snapshot.phase]?.includes(detail.lifecycle.phase))return;
       if(detail.lifecycle.paused||detail.lifecycle.phase==="terminated"||!["planning","plan_synthesis","plan_confirmation","executing","joint_verifying"].includes(detail.lifecycle.phase)&&!detail.lifecycle.requiredParticipantIds.some(id=>informationTaskFor(detail.lifecycle!,id)))return;
       await enqueueManaged(detail,allJobs.filter(row=>["pending","running"].includes(row.status)),undefined,{autoAdvance:true});return;

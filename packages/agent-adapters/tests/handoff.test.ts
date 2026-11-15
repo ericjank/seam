@@ -30,6 +30,12 @@ function input(value = context()): AgentRunInput {
 }
 
 describe("Native human-readable handoff", () => {
+  it("失败交接排除成功检查，双方相同差异合并且保留每个失败引用",()=>{
+    const value=context(),failed={id:"failed-left",caseId:"amount",status:"failed" as const,category:"code" as const,specHash:"c".repeat(64),documentHash:"a".repeat(64),capturedAt:"2026-11-15T00:00:00.000Z",actualStatus:200,summary:"金额差异",mismatches:[{path:"subtotal",expected:24000,actual:24001,actualPresent:true}]};
+    value.lifecycle!.baseline={revision:1,document:"原文档",documentHash:"a".repeat(64),contract:null,report:null,failureDigest:[{participantId:value.participant.id,summary:"原回执",checks:[],independentResults:[failed,{...failed,id:"failed-right"},{...failed,id:"PASSED_MUST_NOT_BE_SENT",status:"passed"}],runs:[{id:"bad-run",command:"node --test joint.test.mjs",exitCode:1},{id:"GOOD_RUN_NOT_NEEDED",command:"node --test",exitCode:0}]}]};
+    const prompt=buildNativeHandoff(input(value)).prompt;expect(prompt).toContain("failed-left");expect(prompt).toContain("failed-right");expect(prompt).toContain("bad-run");expect(prompt).not.toContain("PASSED_MUST_NOT_BE_SENT");expect(prompt).not.toContain("GOOD_RUN_NOT_NEEDED");expect(occurrences(prompt,"actual: 24001")).toBe(1);
+  });
+
   it("修复交接内联具体失败摘要，完整原始报告和派发审计按需读取且原文可校验", async () => {
     const directory = await mkdtemp(join(tmpdir(), "seam-repair-digest-"));
     try {
@@ -42,8 +48,8 @@ describe("Native human-readable handoff", () => {
       expect(handoff.prompt).not.toContain("ORIGINAL_FAILURE_LOG"); expect(handoff.prompt).not.toContain("DISPATCH_AUDIT_ONLY");
       const report = prepared.resources!.find(row => row.key === "originalFailureReport")!;
       expect(await readFile(report.path, "utf8")).toBe(raw); expect(report.hash).toBe(digest(raw));
-      const deliveries = prepared.resources!.find(row => row.key === "deliveryHistory")!;
-      expect(await readFile(deliveries.path, "utf8")).toContain("DISPATCH_AUDIT_ONLY");
+      expect(prepared.resources!.some(row => row.key === "deliveryHistory")).toBe(false);
+      expect(prepared.context!.messages[0]!.body).toBe("DISPATCH_AUDIT_ONLY");
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
   it("累计要求不重复初始目标或当前delta，未变轮次只保留当前授权控制", () => {

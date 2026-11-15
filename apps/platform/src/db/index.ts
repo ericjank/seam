@@ -5,6 +5,7 @@ import * as schema from "./schema";
 
 const globalForDb = globalThis as unknown as {
   seamPool?: mysql.Pool;
+  seamReadinessPool?: mysql.Pool;
 };
 
 export const pool = globalForDb.seamPool ?? mysql.createPool({
@@ -20,12 +21,21 @@ export const pool = globalForDb.seamPool ?? mysql.createPool({
   timezone: "Z",
 });
 
+// Readiness has one dedicated connection and cannot queue behind stalled business writes.
+export const readinessPool = globalForDb.seamReadinessPool ?? mysql.createPool({
+  host: process.env.DB_HOST ?? "127.0.0.1", port: Number(process.env.DB_PORT ?? 3306),
+  user: process.env.DB_USERNAME, password: process.env.DB_PASSWORD,
+  database: process.env.DB_DATABASE ?? "seam", charset: process.env.DB_CHARSET ?? "utf8mb4",
+  connectionLimit: 1, waitForConnections: false, connectTimeout: 1500, timezone: "Z",
+});
+
 pool.on("connection", (connection) => {
   void connection.query("SET time_zone = '+00:00'");
 });
 
 if (process.env.NODE_ENV !== "production") {
   globalForDb.seamPool = pool;
+  globalForDb.seamReadinessPool = readinessPool;
 }
 
 const database = drizzle(pool, { schema, mode: "default" });

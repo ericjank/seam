@@ -156,7 +156,7 @@ export const acceptanceSubmitActionSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
 });
 
-export const CONNECTOR_PROTOCOL_VERSION = 7;
+export const CONNECTOR_PROTOCOL_VERSION = 8;
 export const testFileSchema = z.object({ path: z.string().min(1).max(1000), sha256: z.string().length(64) });
 export const httpCheckSchema = z.object({
   requirementIds: z.array(z.string().min(1).max(100)).min(1).max(200).optional(),
@@ -164,7 +164,15 @@ export const httpCheckSchema = z.object({
   method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]), path: z.string().min(1).max(2000),
   requestBody: z.string().max(65_536).nullable(), expectedStatus: z.number().int().min(100).max(599),
   bodyChecks: z.array(z.object({ path: z.string().min(1).max(500), equals: z.union([z.string(), z.number(), z.boolean(), z.null()]) })).max(100),
+  bodyAssertions: z.array(z.object({ path: z.string().min(1).max(500), type: z.enum(["string", "number", "boolean", "object", "array", "null"]), nonEmpty: z.boolean() })).max(100).optional(),
+  headerChecks: z.array(z.object({ name: z.string().min(1).max(200), includes: z.string().min(1).max(2000) })).max(30).optional(),
+  emptyBody: z.boolean().optional(),
 });
+export const retryBudgetStateSchema = z.object({
+  grants: z.array(z.object({ participantId: idSchema, phase: z.string(), generation: z.number().int().positive(), afterSequence: z.number().int().nonnegative(), grantedById: z.string(), grantedAt: z.string(), reason: z.string() })),
+  stops: z.array(z.object({ participantId: idSchema, phase: z.string(), generation: z.number().int().nonnegative(), used: z.number().int().nonnegative(), limit: z.number().int().positive(), stoppedAt: z.string(), reason: z.string() })),
+});
+export type RetryBudgetState = z.infer<typeof retryBudgetStateSchema>;
 export const workspaceBaselineSchema = z.object({
   head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(), testFiles: z.array(testFileSchema).max(500).optional(),
 });
@@ -205,7 +213,7 @@ export const independentResultSchema = z.object({
   id: z.string(), caseId: z.string(), specHash: z.string().length(64), documentHash: z.string().length(64),
   status: z.enum(["passed", "failed", "not_run"]), category: z.enum(["code", "environment", "authorization", "unknown"]),
   summary: z.string().max(10_000), capturedAt: z.string(), actualStatus: z.number().nullable(),
-  failureStage: z.enum(["connect", "read_body", "parse", "assertion", "policy", "permission"]).optional(),
+  failureStage: z.enum(["connect", "read_body", "parse", "assertion", "policy", "permission", "response_status"]).optional(),
   errorCode: z.string().max(100).optional(),
   mismatches: z.array(z.object({ path: z.string().max(500), expected: z.union([z.string().max(2000),z.number(),z.boolean(),z.null()]), actual: z.union([z.string().max(2000),z.number(),z.boolean(),z.null()]), actualPresent: z.boolean() })).max(100).optional(),
 });
@@ -302,6 +310,7 @@ export function lifecycleActions(phase: string, informationOnly = false): string
   return actions[phase] ? [...actions[phase]!, "workflow.blocked", "information.request"] : [];
 }
 export const lifecycleContextSchema = z.object({
+  retryBudget: retryBudgetStateSchema.optional(),
   factBindings: z.array(factBindingSchema).max(200).optional(),
   approvalPending: z.object({ documentHash: z.string(), requestedAt: z.string() }).nullable().optional(),
   revision: z.number().int().positive(), phase: lifecyclePhaseSchema, requirements: z.string(),

@@ -184,6 +184,8 @@ Missing facts are searched locally and in shared materials before a peer is aske
 
 See [local Docker simulation with real Codex](docs/端到端模拟验证.md) for the five-revision scenario (new goals, replacement, restoration and retirement), [six-improvement acceptance results](docs/验收测试记录-2026-11-13-六项优化.md) for the measured results and evidence boundaries, and [earlier workflow analysis](docs/AI协作改进.md) for the original dialogue-chain findings.
 
+See [retry budgets, writable readiness, fault recovery and portable traces](docs/六项加固与故障验收.md) for the current protocol 8 mechanisms and [the full hardening acceptance record](docs/验收测试记录-2026-11-15-六项加固.md) for the latest frozen-build results. Two-real-Agent acceptance remains deferred.
+
 ## Verification
 
 ```bash

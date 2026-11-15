@@ -27,7 +27,7 @@ vi.mock("@/services/proposals", () => ({ createProposal: vi.fn(), decideProposal
 vi.mock("@/services/work-items", () => ({ createWorkItem: vi.fn(), updateWorkItem: vi.fn() }));
 vi.mock("@/services/credentials", () => ({ requestCredential: vi.fn() }));
 vi.mock("@/services/acceptance", () => ({ submitAcceptance: vi.fn() }));
-vi.mock("@/services/lifecycle", () => ({ applyLifecycleAction: vi.fn(), assertLifecycleJobCurrent: vi.fn(), getLifecycleContext: vi.fn() }));
+vi.mock("@/services/lifecycle", () => ({ applyLifecycleAction: vi.fn(), assertLifecycleJobCurrent: vi.fn(), getLifecycleContext: vi.fn(), recordRetryBudgetStop: vi.fn() }));
 
 import { advanceAgentWorkflow, buildContext } from "../src/services/agent-engine";
 
@@ -50,6 +50,18 @@ beforeEach(() => {
 });
 
 describe("生命周期自动推进的迟到回调隔离", () => {
+  it("协调方案被拒绝后在同阶段有界补派发，不依赖人工点重试",async()=>{
+    state.job.status="failed";state.job.payload.lifecycleSnapshot.phase="plan_synthesis";
+    await advanceAgentWorkflow("job");expect(newJobs()).toHaveLength(1);expect(newJobs()[0]!.values.agentId).toBe("agent-a");
+  });
+
+  it("管理员新预算只计算水位之后的本方任务，其他端继续保持原预算",async()=>{
+    state.detail.collaboration.maxNegotiationRounds=12;
+    state.jobs=Array.from({length:12},(_,index)=>({...state.job,id:`old-${index}`,sequence:index+1,agentId:"agent-a",payload:{...state.job.payload,context:{participant:{id:"a"},lifecycle:{revision:1,phase:"plan_synthesis"}}}}));
+    state.detail.lifecycle.retryBudget={grants:[{participantId:"a",phase:"plan_synthesis",generation:1,afterSequence:12}],stops:[]};
+    await advanceAgentWorkflow("job");expect(newJobs()).toHaveLength(1);expect(newJobs()[0]!.values.agentId).toBe("agent-a");
+  });
+
   it("把本方最新动作拒绝原因交给下一轮，成功后不重复旧错误", () => {
     state.detail.jobs = [{ id: "rejected-job", agentId: "agent-a", status: "failed", error: "HTTP要求遗漏独立检查", updatedAt: new Date() }];
     expect(buildContext(state.detail as any, "a").messages.at(-1)?.body).toContain("HTTP要求遗漏独立检查");

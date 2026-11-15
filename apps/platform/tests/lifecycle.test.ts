@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { audit } from "../src/lib/audit";
 import { canonicalJson, type SharedContract } from "@seam/protocol";
 import { createHash } from "node:crypto";
 
@@ -89,6 +90,7 @@ vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => {}) }));
 vi.mock("@/services/actor", () => ({ authorizeActor: vi.fn(async (actor) => actor.kind === "participant" ? actor.id : null) }));
 
 import {
+  recordRetryBudgetStop, grantRetryBudget,
   appendLifecycleRequirements, applyLifecycleAction, approveLifecycle, assertLifecycleJobCurrent,
   getLifecycleContext, getLifecycleSnapshot, pauseLifecycle, startLifecycle, terminateLifecycle,
   recoverInformationLookups, retryInformationLookup, retryLifecycleValidation, resolveInformation,
@@ -145,13 +147,26 @@ beforeEach(() => {
     participants: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id, collaborationId: "collab", projectId: `project-${id}`, agentId: `agent-${id}`, role: "participant", status: "active", createdAt: new Date() })),
     projects: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `project-${id}`, name: `项目 ${id}` })),
     agents: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `agent-${id}`, status: "online", lastSeenAt: new Date() })),
-    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:7,supportsInformationLookup:true}})),
+    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:8,supportsInformationLookup:true}})),
     collaboration_lifecycles: [], lifecycle_revisions: [], lifecycle_contributions: [], messages: [], connector_jobs: [],
   };
   vi.clearAllMocks();
 });
 
 describe("管理员控制的共同开发生命周期", () => {
+  it("预算耗尽持久阻塞，只有管理员能为当前epoch授权且不改文档或批准",async()=>{
+    await startLifecycle("admin","collab");const a=(await getLifecycleContext("collab"))!.requiredParticipantIds[0]!;
+    const stopped={revision:1,phase:"planning",participantId:a,generation:0,used:12,limit:12};
+    await recordRetryBudgetStop("collab",stopped);await recordRetryBudgetStop("collab",stopped);
+    expect((await getLifecycleContext("collab"))!.retryBudget!.stops).toHaveLength(1);
+    state.role="member";await expect(grantRetryBudget("admin","collab",{...stopped,reason:"已核对记录，继续原范围内剩余工作"})).rejects.toThrow("只有组织管理员");
+    state.role="owner";state.rows.connector_jobs!.push({id:"previous",collaborationId:"collab",sequence:42});
+    const current=await grantRetryBudget("admin","collab",{...stopped,reason:"已核对记录，继续原范围内剩余工作"});
+    expect(current.retryBudget!.stops).toHaveLength(0);expect(current.retryBudget!.grants[0]).toMatchObject({generation:1,afterSequence:42,participantId:a});expect(current.documentHash).toBeNull();expect(current.approvedHash).toBeNull();
+    await expect(grantRetryBudget("admin","collab",{...stopped,reason:"重复旧授权不得增加执行预算"})).rejects.toThrow("重复或旧授权");
+    expect(vi.mocked(audit).mock.calls.filter(([row])=>row.action==="lifecycle.retry_budget_granted")).toHaveLength(1);
+  });
+
   it("跨修订引用事实会先保存计划并自动核验，未变时无需模型重复提交",async()=>{
     await startLifecycle("admin","collab");const {a,b}=await sharedVersion();await agreed();await appendLifecycleRequirements("admin","collab",{requirements:"仅追加边界，沿用公开版本"});
     await applyLifecycleAction(actor(a),"collab",{type:"plan.submit",revision:2,content:plan(a),factRefs:["quote.version"]});

@@ -4,9 +4,10 @@ import { requireCollaborationAccess } from "@/lib/access";
 import { requireUser } from "@/lib/auth";
 import { handleApiError } from "@/lib/http";
 import { drainWorkflowWakeups } from "@/services/workflow-outbox";
-import { appendLifecycleRequirements, approveLifecycle, getLifecycleContext, pauseLifecycle, startLifecycle, terminateLifecycle, retryInformationLookup, retryLifecycleValidation, resolveInformation } from "@/services/lifecycle";
+import { appendLifecycleRequirements, approveLifecycle, getLifecycleContext, pauseLifecycle, startLifecycle, terminateLifecycle, retryInformationLookup, retryLifecycleValidation, resolveInformation, grantRetryBudget } from "@/services/lifecycle";
 
 const inputSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("grant-retry-budget"), revision: z.number().int().positive(), phase: z.string(), participantId: z.string().uuid(), generation: z.number().int().nonnegative(), reason: z.string().trim().min(10).max(1000) }),
   z.object({ action: z.literal("start") }),
   z.object({ action: z.literal("approve"), revision: z.number().int().positive(), documentHash: z.string().regex(/^[a-f0-9]{64}$/) }),
   z.object({ action: z.literal("append"), requirements: z.string().trim().min(1).max(50_000) }),
@@ -33,6 +34,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const { id } = await params;
     const input = inputSchema.parse(await request.json());
     const lifecycle = input.action === "start" ? await startLifecycle(user.id, id)
+      : input.action === "grant-retry-budget" ? await grantRetryBudget(user.id, id, input)
       : input.action === "retry-information" ? await retryInformationLookup(user.id, id, input.requestId)
       : input.action === "resolve-information" ? await resolveInformation(user.id, id, input.requestId, input.resolution)
       : input.action === "retry-validation" ? await retryLifecycleValidation(user.id, id, input)

@@ -4,6 +4,20 @@ import { fixtureContract } from "./fixtures/shared-contract";
 
 const ids = [crypto.randomUUID(), crypto.randomUUID()];
 describe("统一契约与增量审阅", () => {
+  it("完整文档共用相同HTTP定义，各端引用与所有响应约束仍完整",()=>{
+    const contract=fixtureContract(ids,1);
+    const check={id:"left",publisherParticipantId:ids[0]!,serviceName:"quote",method:"POST" as const,path:"/quote",requestBody:'{"quantity":0}',expectedStatus:400,bodyChecks:[],bodyAssertions:[{path:"error",type:"string" as const,nonEmpty:true}],headerChecks:[{name:"content-type",includes:"application/json"}],emptyBody:false};
+    contract.acceptanceCases[0]!.httpChecks=[check];contract.acceptanceCases[1]!.httpChecks=[{...check,id:"right"}];
+    const document=renderSharedContract({title:"合成",revision:1,requirements:"明确错误语义",changeRequest:null,contract,names:new Map(ids.map(id=>[id,"项目"])),baselines:[]});
+    expect(document.match(/### HTTP-1\n/g)).toHaveLength(1);expect(document).not.toContain("### HTTP-2");expect(document).toContain("left → HTTP-1");expect(document).toContain("right → HTTP-1");expect(document).toContain("error:string，非空");expect(document).toContain('content-type 包含 "application/json"');expect(document).toContain(JSON.stringify(check.requestBody));
+  });
+  it("协议8错误响应不能仅有状态码，明确空正文与字段类型均受校验",()=>{
+    const contract=fixtureContract(ids,1);contract.serviceExpectations=[{name:"quote",publisherParticipantId:ids[0]!,healthPath:"/health",status:200,bodyChecks:[]}];
+    const check={id:"error",publisherParticipantId:ids[0]!,serviceName:"quote",method:"POST" as const,path:"/quote",requestBody:"null",expectedStatus:400,bodyChecks:[]};contract.acceptanceCases[0]!.httpChecks=[check];
+    expect(()=>validateSharedContract(contract,ids,null,false,false,true)).toThrow("仅状态码");
+    contract.acceptanceCases[0]!.httpChecks![0]={...check,headerChecks:[{name:"content-type",includes:"application/json"}],bodyAssertions:[{path:"error",type:"string",nonEmpty:true}]};expect(()=>validateSharedContract(contract,ids,null,false,false,true)).not.toThrow();
+    contract.acceptanceCases[0]!.httpChecks![0]!.emptyBody=true;expect(()=>validateSharedContract(contract,ids,null,false,false,true)).toThrow("空正文");
+  });
   it("按需求ID检查独立覆盖，拒绝重复正常请求冒充错误场景",()=>{
     const contract=fixtureContract(ids,1);contract.effectiveRequirements=[{id:"normal",text:"正常响应",verification:"http"},{id:"errors",text:"无效请求拒绝",verification:"http"}];contract.serviceExpectations=[{name:"quote",publisherParticipantId:ids[0]!,healthPath:"/health",status:200,bodyChecks:[]}];
     const good={id:"normal",requirementIds:["normal"],publisherParticipantId:ids[0]!,serviceName:"quote",method:"POST" as const,path:"/quote",requestBody:'{"quantity":2}',expectedStatus:200,bodyChecks:[{path:"subtotal",equals:24000}]};

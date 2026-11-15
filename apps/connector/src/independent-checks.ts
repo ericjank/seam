@@ -21,18 +21,30 @@ export async function runIndependentChecks(context: CollaborationContext, networ
       const response=await fetch(url,{method:check.method,headers:{"content-type":"application/json"},...(check.method!=="GET"&&check.requestBody!==null?{body:check.requestBody}:{}),redirect:"manual",signal:AbortSignal.any([signal,AbortSignal.timeout(10_000)])});
       base.actualStatus=response.status;
       if(response.status!==check.expectedStatus&&[401,403].includes(response.status)){await response.body?.cancel();results.push(unavailable("服务拒绝本次验收权限；不能据此判定业务代码错误。","permission","authorization"));continue;}
-      if(response.status!==check.expectedStatus&&response.status>=500){await response.body?.cancel();results.push(unavailable("服务返回异常5xx，先诊断运行环境与上游状态。","connect","unknown"));continue;}
+      if(response.status!==check.expectedStatus&&response.status>=500){await response.body?.cancel();results.push(unavailable("服务返回异常5xx，先诊断运行环境与上游状态。","response_status","unknown"));continue;}
       const mismatches:NonNullable<IndependentResult["mismatches"]>=[];
+      for (const header of check.headerChecks ?? []) {
+        const actual = response.headers.get(header.name);
+        if (actual === null || !actual.toLowerCase().includes(header.includes.toLowerCase())) mismatches.push({path:`$headers.${header.name.toLowerCase()}`,expected:header.includes,actual,actualPresent:actual!==null});
+      }
       if(response.status!==check.expectedStatus)mismatches.push({path:"$status",expected:check.expectedStatus,actual:response.status,actualPresent:true});
       let parseFailed=false;
-      if(check.bodyChecks.length){
+      if(check.bodyChecks.length || check.bodyAssertions?.length || check.emptyBody === true){
         stage="read_body";const reader=response.body?.getReader();let bytes=0,text="";
         try {
           const decoder=new TextDecoder();
           if(reader) for(;;){const chunk=await reader.read();if(chunk.done)break;bytes+=chunk.value.byteLength;if(bytes>65536){const error=new Error("response limit");error.name="RESPONSE_LIMIT";throw error;}text+=decoder.decode(chunk.value,{stream:true});}
           text+=decoder.decode();signal.throwIfAborted();
         } finally {await reader?.cancel().catch(()=>{});}
-        stage="parse";let body:unknown;try{body=JSON.parse(text);}catch{parseFailed=check.bodyChecks.some(field=>field.path!=="$text");}
+        stage="parse";let body:unknown;try{body=JSON.parse(text);}catch{parseFailed=check.bodyChecks.some(field=>field.path!=="$text") || Boolean(check.bodyAssertions?.length);}
+        if (check.emptyBody === true && bytes !== 0) mismatches.push({path:"$bodyBytes",expected:0,actual:bytes,actualPresent:true});
+        for (const assertion of check.bodyAssertions ?? []) {
+          let value:unknown = body;
+          for(const key of assertion.path === "$" ? [] : assertion.path.split(".")) value=value!==null && typeof value==="object" && Object.hasOwn(value,key)?(value as Record<string,unknown>)[key]:undefined;
+          const type = value===null ? "null" : Array.isArray(value) ? "array" : typeof value;
+          const nonEmpty = typeof value==="string" ? value.trim().length>0 : Array.isArray(value) ? value.length>0 : value!==null && typeof value==="object" ? Object.keys(value).length>0 : false;
+          if (type!==assertion.type || assertion.nonEmpty&&!nonEmpty || type==="number"&&!Number.isFinite(value)) mismatches.push({path:assertion.path,expected:`${assertion.type}${assertion.nonEmpty?" nonempty":""}`,actual:value===undefined?null:scalar(value),actualPresent:value!==undefined});
+        }
         for(const field of check.bodyChecks){
           let value=field.path==="$text"?text:body;
           for(const key of ["$","$text"].includes(field.path)?[]:field.path.split("."))value=value!==null&&typeof value==="object"&&Object.hasOwn(value,key)?(value as Record<string,unknown>)[key]:undefined;

@@ -67,10 +67,11 @@ function contextFrom(control: Lifecycle, revision: Revision, contributions: Cont
     document: revision.document, documentHash: control.documentHash, approvedHash: control.approvedHash,
     requiredParticipantIds: control.requiredParticipantIds, coordinatorParticipantId: control.requiredParticipantIds[0], paused: Boolean(control.pausedAt),
     changeRequest: revision.changeRequest, contract: revision.sharedContract, objections: revision.objections ?? [],
+    retryBudget: revision.retryBudget ?? { grants: [], stops: [] },
     repair: revision.repair ?? null, informationRequests: revision.informationRequests ?? [],
     protocolVersion: control.protocolVersion ?? 1, facts: (control.facts ?? []).map(fact => fact.status === "active" && Date.parse(fact.validUntil) <= Date.now() ? { ...fact, status: "stale" as const } : (control.protocolVersion??1)>=7 && fact.status==="active" && fact.verifiedRevision!==control.revision ? {...fact,status:"unverified" as const}:fact),
     attemptHistory: revision.attemptHistory ?? [], factBindings:revision.factBindings??[], approvalPending:revision.approvalIntent?{documentHash:revision.approvalIntent.documentHash,requestedAt:revision.approvalIntent.requestedAt}:null,
-    baseline: previous ? { revision: previous.revision, documentHash: previous.documentHash, document: previous.sharedContract?.effectiveRequirements ? null : previous.document, contract: previous.sharedContract, report: previous.report, failureDigest:previousContributions.map(row=>({participantId:row.participantId,summary:row.reportSummary??"",checks:(row.integrationChecks??[]).filter(check=>check.status!=="passed").map(check=>({caseId:check.caseId,status:check.status,summary:check.summary})),independentResults:((row.reportEvidence?.independentResults??[]) as NonNullable<Extract<import("@seam/protocol").LifecycleAgentAction,{type:"integration.report"}>["independentResults"]>),runs:(row.evidenceRuns??[]).map(run=>({id:run.id,command:run.command,exitCode:run.exitCode}))})), informationRequests: previous.informationRequests?.filter(row => row.status === "answered") } : null,
+    baseline: previous ? { revision: previous.revision, documentHash: previous.documentHash, document: previous.sharedContract?.effectiveRequirements ? null : previous.document, contract: previous.sharedContract, report: previous.report, failureDigest:previousContributions.map(row=>({participantId:row.participantId,summary:row.reportSummary??"",checks:(row.integrationChecks??[]).filter(check=>check.status!=="passed").map(check=>({caseId:check.caseId,status:check.status,summary:check.summary})),independentResults:((row.reportEvidence?.independentResults??[]) as NonNullable<Extract<import("@seam/protocol").LifecycleAgentAction,{type:"integration.report"}>["independentResults"]>).filter(result=>result.status!=="passed"),runs:(row.evidenceRuns??[]).map(run=>({id:run.id,command:run.command,exitCode:run.exitCode}))})), informationRequests: previous.informationRequests?.filter(row => row.status === "answered") } : null,
     contributions: relevant.flatMap((row) => row.content ? [{ participantId: row.participantId, content: row.content, baseline: row.workspaceBaseline ?? null, factRefs:row.factRefs??[] }] : []),
     confirmations: relevant.filter((row) => control.documentHash && row.confirmedHash === control.documentHash).map((row) => row.participantId),
     reports: relevant.flatMap((row) => row.reportStatus && row.reportSummary ? [{
@@ -440,7 +441,7 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
       if((control.protocolVersion??1)>=7&&requiredRefs.some(key=>!refs.includes(key)))throw new HttpError(422,"共同契约不得遗漏项目分析所引用的共享事实key");
       const bindings=bindFacts(refs,control.facts??[]);
       if((control.protocolVersion??1)>=7&&!factsReady(refs,control.facts??[],control.revision)){await scheduleFactGates(control,participantId,refs);return {changed:true};}
-      validateSharedContract(action.contract, control.requiredParticipantIds, context.baseline?.contract, (control.protocolVersion ?? 1) >= 6 && collaboration.type === "api-integration", (control.protocolVersion??1)>=7&&collaboration.type==="api-integration");
+      validateSharedContract(action.contract, control.requiredParticipantIds, context.baseline?.contract, (control.protocolVersion ?? 1) >= 6 && collaboration.type === "api-integration", (control.protocolVersion??1)>=7&&collaboration.type==="api-integration", (control.protocolVersion??1)>=8&&collaboration.type==="api-integration");
       if (revision.repair && context.baseline?.contract) validateRepairContract(context.baseline.contract, action.contract);
       const rows = await requiredProjects(control);
       const document = renderSharedContract({ title: collaboration.title, revision: control.revision, requirements: revision.requirements,
@@ -689,6 +690,40 @@ export async function pauseLifecycle(userId: string, collaborationId: string, pa
     else await queueWorkflowWakeup(collaborationId);
     await notify(collaborationId, paused ? "管理员已暂停协作，正在通知本机停止。已产生的文件修改不会自动撤销。" : "管理员已恢复协作，双方将核对现状后继续未完成阶段。");
     await audit({ collaborationId, actorType: "user", actorId: userId, action: paused ? "lifecycle.paused" : "lifecycle.resumed" });
+    return (await getLifecycleContext(collaborationId))!;
+  });
+}
+
+/** Called under the collaboration scheduling lock; repeated wakeups are idempotent. */
+export async function recordRetryBudgetStop(collaborationId: string, input: {
+  revision: number; phase: string; participantId: string; generation: number; used: number; limit: number;
+}) {
+  return locked(collaborationId, async control => {
+    if (!control || control.revision !== input.revision || control.phase !== input.phase || !control.requiredParticipantIds.includes(input.participantId)) return;
+    const revision = await getRevision(control), state = revision.retryBudget ?? { grants: [], stops: [] };
+    if (state.stops.some(row => row.participantId === input.participantId && row.phase === input.phase && row.generation === input.generation)) return;
+    const stop = { ...input, stoppedAt: new Date().toISOString(), reason: `本端本阶段已使用 ${input.used}/${input.limit} 次自动推进预算。请管理员核对记录后授权新的有界重试；原文档及批准范围保持有效。` };
+    await db.update(lifecycleRevisions).set({ retryBudget: { ...state, stops: [...state.stops, stop] }, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
+    await audit({ collaborationId, actorType: "system", actorId: "seam", action: "lifecycle.retry_budget_exhausted", metadata: stop });
+  });
+}
+
+export async function grantRetryBudget(userId: string, collaborationId: string, input: {
+  revision: number; phase: string; participantId: string; generation: number; reason: string;
+}) {
+  return locked(collaborationId, async control => {
+    await requireAdministrator(userId, collaborationId);
+    if (!control || control.pausedAt || control.revision !== input.revision || control.phase !== input.phase || control.phase === "terminated") throw new HttpError(409, "当前阶段或修订已变化，不能恢复旧预算");
+    const revision = await getRevision(control), state = revision.retryBudget ?? { grants: [], stops: [] };
+    const stop = state.stops.find(row => row.participantId === input.participantId && row.phase === input.phase && row.generation === input.generation);
+    if (!stop || input.reason.trim().length < 10 || input.reason.length > 1000) throw new HttpError(409, "只能为当前已耗尽的预算授权，重复或旧授权不会生效");
+    const [latest] = await db.select().from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(1);
+    const grant = { participantId: input.participantId, phase: input.phase, generation: input.generation + 1, afterSequence: latest?.sequence ?? 0, grantedById: userId, grantedAt: new Date().toISOString(), reason: input.reason.trim() };
+    await db.update(lifecycleRevisions).set({ retryBudget: { grants: [...state.grants, grant], stops: state.stops.filter(row => row !== stop) }, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
+    await audit({ collaborationId, actorType: "user", actorId: userId, action: "lifecycle.retry_budget_granted", metadata: grant });
+    const owner = (await requiredProjects(control)).find(row => row.participant.id === input.participantId)!;
+    await notify(collaborationId, `管理员已为 ${owner.project.name} / ${owner.agent?.name ?? input.participantId} 授权新一轮有界重试：${grant.reason}`);
+    await queueWorkflowWakeup(collaborationId);
     return (await getLifecycleContext(collaborationId))!;
   });
 }

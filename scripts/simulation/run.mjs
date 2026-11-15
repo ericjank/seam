@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, stat, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -11,6 +11,8 @@ import { promisify } from "node:util";
 import { SimulationApi } from "./http.mjs";
 import { agentInstructions, contract, revisionOne, revisions } from "./contract.mjs";
 import { superviseController } from "./controller-supervisor.mjs";
+import { launchOwned, processMatches, stopOwned, savePrivate, readPrivate } from "./owned-processes.mjs";
+import { preflight } from "./preflight.mjs";
 import { publishJointEvidence } from "./publish-joint-evidence.mjs";
 
 const exec = promisify(execFile);
@@ -25,6 +27,8 @@ let collaborationId;
 let locals = [];
 let eventCursor=0;const lifecycleEvents=[];let frozenBuild;
 const workers = [];
+let initialSnapshot, parentResuming=false, controllerFinished=false;
+process.on("disconnect",()=>{if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==="1"&&!controllerFinished)process.exit(87);});
 
 function lifecycle(detail) {
   const value = detail.lifecycle ?? detail.collaboration.lifecycle;
@@ -68,12 +72,10 @@ async function startConnectors(selected = locals) {
       env.SEAM_TEST_COMMAND = "node --test joint.test.mjs";
     } else if (repairInformation) env.SEAM_TEST_COMMAND = "node --test joint.test.mjs";
     else delete env.SEAM_TEST_COMMAND;
-    const child = spawn(process.execPath, [join(here, "../../apps/connector/dist/cli.js")], { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    const logs = [];
-    child.stdout.on("data", (chunk) => logs.push(chunk.toString()));
-    child.stderr.on("data", (chunk) => logs.push(chunk.toString()));
-    child.on("exit", (code, signal) => { local.exit = { code, signal }; });
-    workers.push({ child, local, logs });
+    const prior=local.worker;
+    if(prior&&await processMatches(prior)){workers.push({child:{pid:prior.pid},local,record:prior});continue;}
+    const record=await launchOwned({entry:join(here,"connector-process.mjs"),env,logPath:join(runRoot,`${local.role}-connector.log`)});
+    local.worker=record;delete local.exit;workers.push({child:{pid:record.pid},local,record});
   }
   progress("independent-connectors-started", { pids: workers.map(({child}) => child.pid) });
 }
@@ -87,15 +89,14 @@ async function writeRunIndex(status, detail) {
 async function restartConsumerWithLostCheckpoint(){
   const index=workers.findIndex(worker=>worker.local.role==="consumer"),worker=workers[index];
   assert.ok(worker);
-  const closed=new Promise(resolve=>worker.child.once("exit",resolve));
-  process.kill(-worker.child.pid,"SIGTERM");await closed;
-  await writeFile(join(runRoot,"consumer-connector-before-restart.log"),worker.logs.join(""));
+  await stopOwned(worker.record);await awaitOwnedExit(worker.record);
+  await writeFile(join(runRoot,"consumer-connector-before-restart.log"),await readFile(worker.record.logPath));
   workers.splice(index,1);delete worker.local.exit;
   const directory=join(runRoot,"codex-state");
   const file=(await readdir(directory)).find(name=>name.endsWith(".json"));assert.ok(file);
   const path=join(directory,file),session=JSON.parse(await readFile(path,"utf8"));
   delete session.lastHandoff;await writeFile(path,JSON.stringify(session),{mode:0o600});
-  await startConnectors([worker.local]);
+  delete worker.local.worker;await startConnectors([worker.local]);
   progress("connector-restarted",{threadId:session.threadId,checkpointReset:true,scope:"owned idle Connector; checkpoint loss, not claimed actual model compaction"});
   checks.push("修订3后重启本方Connector并模拟交接检查点丢失；保留同一thread，重新同步当前资料");
 }
@@ -258,16 +259,25 @@ async function main() {
     const configuration=await new Promise(resolve=>process.once("message",resolve));
     ({runRoot,collaborationId,locals,contractVersion,frozenBuild,controllerAttempt,createdParticipantId}=configuration);
     assert.match(collaborationId,/^[a-f0-9-]{36}$/i);assert.ok(locals.every(local=>local.root.startsWith(runRoot+"/")));
-    checks.push(...configuration.checks);await api.loginOwner();assert.deepEqual(await buildSnapshot(),frozenBuild);
-    const recovered=await api.detail(collaborationId);
+    checks.push(...configuration.checks);await loginReady();assert.deepEqual(await stableRead(buildSnapshot),frozenBuild);
+    const recovered=await stableRead(()=>api.detail(collaborationId));
     if(lifecycle(recovered).phase==="terminated") {assert.ok(lifecycle(recovered).integrationReports.every(row=>row.checks.every(check=>check.status==="passed")));await readFile(join(runRoot,"revision-2-report.json"));return finishSimulation(recovered,2);}
     return executeWorkflow(configuration.initial);
   }
+  if(process.env.SEAM_SIMULATION_RESUME_ROOT){
+    runRoot=process.env.SEAM_SIMULATION_RESUME_ROOT;const saved=await readPrivate(runRoot,"bootstrap.json");
+    ({collaborationId,locals,contractVersion,frozenBuild,createdParticipantId,initialSnapshot}=saved);checks.push(...saved.checks);parentResuming=true;
+    assert.equal(saved.base,api.base);await loginReady();await waitReady();assert.deepEqual(await stableRead(buildSnapshot),frozenBuild);
+    for(const record of saved.controllers??[]){if(await processMatches(record)){await stopOwned(record);await awaitOwnedExit(record);}}
+    await startConnectors();await recoveryEvent({event:"parent-restored",pid:process.pid,connectorPids:workers.map(worker=>worker.child.pid)});progress("parent-restored",{runRoot,collaborationId,connectorPids:workers.map(worker=>worker.child.pid)});
+    return launchController(initialSnapshot);
+  }
+  await preflight();await waitReady();
   runRoot = await mkdtemp(join(tmpdir(), "seam-full-simulation-"));
   await mkdir(join(runRoot, "codex-state"));
   progress("simulation-started", { base: api.base, runRoot, ai: "real local Codex app-server", peer: "deterministic virtual provider" });
   await api.call("/api/health", undefined, { method: "GET" });
-  await api.loginOwner();
+  await loginReady();
   frozenBuild=await buildSnapshot();await writeFile(join(runRoot,"run-build.json"),JSON.stringify(frozenBuild,null,2));
   const suffix = randomUUID().slice(0, 8);
   if (repairInformation) contractVersion = `public-quote-${randomUUID().slice(0, 8)}`;
@@ -279,7 +289,7 @@ async function main() {
     await writeFile(join(root, "AGENTS.md"), agentInstructions);
     if (repairInformation) {
       await writeFile(join(root, "README.md"), `${contract}\n\n本项目职责：${role}。服务的额外公开就绪字段contractVersion必须符合提供方现有项目文档；缺少时先查本地和共享资料，再自动询证，不由管理员填写。\n`);
-      await writeFile(join(root, "AGENTS.md"), `${agentInstructions}\n本次只实现基础报价，不增加折扣功能。修复版保持原业务和原必需断言，健康响应检查当前lifecycle.revision。测试名应是稳定标识，不把修订号写入测试名。joint.test.mjs必须从process.env.SEAM_SERVICE_URL和Number(process.env.SEAM_REVISION)获取端点和批准修订，首次生成后修复金额错误无需修改测试文件。共同契约的每方acceptanceCases必须包含httpChecks独立业务检查：POST /quote，请求JSON字符串{\"sku\":\"SKU-001\",\"quantity\":2}，expectedStatus=200，bodyChecks为subtotal=24000及currency=CNY，publisherParticipantId为提供方，serviceName=quote。testChanges=[]，修复保留原独立检查。effectiveRequirements将正常报价、数量边界、未知SKU、畸形JSON分别列稳定ID，verification=http，公开就绪协议单列verification=review；两端各自httpChecks覆盖两SKU正常金额、quantity=0和101及字符串/空值、未知SKU、畸形JSON原始正文，requirementIds引用各对应HTTP要求。每端的factRefs引用quote.contractVersion；修复继续保留此引用，由平台自动安排来源核验，不重复改写既有计划。修复计划优先plan.amend，协调方优先plan.patch只改服务健康revision及修复摘要，其他字段保留。joint_verifying只运行既有脚本并真实报告，不修改代码、测试或业务目标。失败用integration.report failed，平台只读起草修复方案，管理员批准前不再实施验证。\n${role === "consumer" ? "本项目没有提供方公开contractVersion的值。提交本方plan.submit前须先查本地和共享资料，缺失时使用information.request询证提供方；不能猜测值或要求管理员填。收到答复后复用并把contractVersion及当前revision一起列入就绪契约和实际HTTP联合测试。" : "本方公开协议事实保存在docs/integration-facts.json。"}`);
+      await writeFile(join(root, "AGENTS.md"), `${agentInstructions}\n本次只实现基础报价，不增加折扣功能。修复版保持原业务和原必需断言，健康响应检查当前lifecycle.revision。测试名应是稳定标识，不把修订号写入测试名。joint.test.mjs必须从process.env.SEAM_SERVICE_URL和Number(process.env.SEAM_REVISION)获取端点和批准修订，首次生成后修复金额错误无需修改测试文件。共同契约的每方acceptanceCases必须包含httpChecks独立业务检查：POST /quote，请求JSON字符串{\"sku\":\"SKU-001\",\"quantity\":2}，expectedStatus=200，bodyChecks为subtotal=24000及currency=CNY，publisherParticipantId为提供方，serviceName=quote。testChanges=[]，修复保留原独立检查。effectiveRequirements将正常报价、数量边界、未知SKU、畸形JSON分别列稳定ID，verification=http，公开就绪协议单列verification=review；两端各自httpChecks覆盖两SKU正常金额、quantity=0和101及字符串/空值、未知SKU、畸形JSON原始正文，requirementIds引用各对应HTTP要求。每个httpChecks还须headerChecks=[{name:"content-type",includes:"application/json"}]，错误响应bodyAssertions=[{path:"error",type:"string",nonEmpty:true}]，emptyBody=false，正常请求bodyAssertions=[]。每端的factRefs引用quote.contractVersion；修复继续保留此引用，由平台自动安排来源核验，不重复改写既有计划。修复计划优先plan.amend，协调方优先plan.patch只改服务健康revision及修复摘要，其他字段保留。joint_verifying只运行既有脚本并真实报告，不修改代码、测试或业务目标。失败用integration.report failed，平台只读起草修复方案，管理员批准前不再实施验证。\n${role === "consumer" ? "本项目没有提供方公开contractVersion的值。提交本方plan.submit前须先查本地和共享资料，缺失时使用information.request询证提供方；不能猜测值或要求管理员填。收到答复后复用并把contractVersion及当前revision一起列入就绪契约和实际HTTP联合测试。" : "本方公开协议事实保存在docs/integration-facts.json。"}`);
       if (role === "provider") { await mkdir(join(root,"docs")); await writeFile(join(root,"docs/integration-facts.json"),JSON.stringify({contractVersion})); }
     }
     await exec("git", ["init", "--quiet", root]);
@@ -297,6 +307,7 @@ async function main() {
   const initial = await Promise.all(locals.map((local) => snapshot(local.root)));
   assert.ok(!contract.includes("discountPercent") && !contract.includes("修订2"), "future business requirements must not be preannounced");
   const created = await api.call("/api/collaborations", {
+    type: "api-integration",
     title: repairInformation ? "资料获取与审批修复验收" : "合成报价接口联调", objective: repairInformation ? "按双方现有报价协议完成对接，自动查清缺失事实；失败后起草修复方案，经管理员批准后再实施验证。" : revisionOne, projectId: locals[1].project.id, agentId: locals[1].agent.id,
     targetProjectId: locals[0].project.id, targetAgentId: locals[0].agent.id,
   });
@@ -323,9 +334,10 @@ async function main() {
   await noSession.expect(`/api/collaborations/${collaborationId}/lifecycle`, { action: "terminate" }, 401, { token: locals[0].agent.token });
   checks.push("只读用户与Connector Token不能批准或终止协作");
 
-  createdParticipantId=created.participantId;
-  const supervision=await superviseController({file:fileURLToPath(import.meta.url),configuration:{runRoot,collaborationId,locals,contractVersion,frozenBuild,checks,initial,createdParticipantId},onEvent:event=>progress(event.event,event)});
-  await writeFile(join(runRoot,"controller-supervision.json"),JSON.stringify({ok:true,...supervision,temporaryTakeover:false,connectorsRestarted:false},null,2));
+  createdParticipantId=created.participantId;initialSnapshot=initial;
+  await savePrivate(runRoot,"bootstrap.json",{base:api.base,runRoot,collaborationId,locals,contractVersion,frozenBuild,checks,initialSnapshot,createdParticipantId,controllers:[]});
+  process.send?.({event:"bootstrap-ready",runRoot,collaborationId});
+  await launchController(initialSnapshot);
 }
 
 async function executeWorkflow(initial) {
@@ -410,7 +422,7 @@ async function finishSimulation(ready,revisionCount) {
   while(more){const page=await api.call(`/api/collaborations/${collaborationId}/executions?after=${cursor}&limit=200`,undefined,{method:"GET"});executions.push(...page.executions);cursor=page.nextCursor;more=page.hasMore;}
   for(const execution of executions.filter(row=>row.status==="completed"&&row.kind==="collaboration.turn")){assert.equal(execution.provenance?.connector.sourceId,frozenBuild.connector.sourceId);assert.equal(execution.provenance?.platform.sourceId,frozenBuild.platform.sourceId);}
   await writeFile(join(runRoot,"execution-builds.json"),JSON.stringify({ok:true,executions},null,2));
-  const result = { ok: true, coldStart:true, temporaryTakeover:false, automaticControllerRecoveries:controllerAttempt-1, builds:frozenBuild, collaborationId, base: api.base, runRoot, checks, revisions: revisionCount, scenario:repairInformation ? "repair-information" : "five-revision", runLabel: `验收-${runRoot.split("-").at(-1)}`,
+  const result = { ok: true, coldStart:true, temporaryTakeover:false, automaticControllerRecoveries:(await recoveryTotals()).controllerRecoveries, automaticParentRestores:(await recoveryTotals()).parentRestores, builds:frozenBuild, collaborationId, base: api.base, runRoot, checks, revisions: revisionCount, scenario:repairInformation ? "repair-information" : "five-revision", runLabel: `验收-${runRoot.split("-").at(-1)}`,
     concurrency: "two independent continuously polling Connector processes; no provider-first scheduler",
     realAI: "local Codex app-server", virtualPeer: "deterministic provider implemented and tested locally",
     scope: "本地Docker中心及MySQL、两个隔离合成项目、真实HTTP报价接口；不代表实际业务项目联调或生产部署" };
@@ -429,14 +441,41 @@ main().catch(async (error) => {
   process.send?.({status:"failed",error:result.error});
   process.exitCode = 1;
 }).finally(async () => {
-  if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==="1"){if(!process.exitCode)process.send?.({status:"passed"});process.disconnect?.();return;}
-  for (const { child, local, logs } of workers) {
-    try { process.kill(-child.pid, "SIGTERM"); } catch {}
-    await writeFile(join(runRoot, `${local.role}-connector.log`), logs.join(""));
-  }
+  if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==="1"){controllerFinished=true;if(!process.exitCode)process.send?.({status:"passed"});process.disconnect?.();return;}
+  for (const worker of workers) { await stopOwned(worker.record).catch(()=>{}); }
+  process.send?.({status:process.exitCode?"failed":"passed",runRoot,collaborationId,...(process.exitCode?{error:"parent workflow failed; retained failure.json"}:{})});
+  if(process.connected)process.disconnect();
   if (runRoot) for (const name of await readdir(join(runRoot, "mock-state")).catch(() => [])) {
     if (!name.endsWith(".json")) continue;
     const service = JSON.parse(await readFile(join(runRoot, "mock-state", name), "utf8"));
-    if (service.pid) try { process.kill(service.pid, "SIGTERM"); } catch {}
+    if(service.pid) await stopOwned({pid:service.pid,entry:"server.mjs",marker:join(runRoot,"mock-state",name),detached:false}).catch(()=>{});
   }
 });
+
+async function waitReady(){
+ const deadline=Date.now()+60_000;let error;
+ do{try{const {response,data}=await api.raw('/api/ready',undefined,{method:'GET'});if(response.ok&&data.writable)return;}catch(value){error=value;}await new Promise(resolve=>setTimeout(resolve,500));}while(Date.now()<deadline);
+ throw Error(`platform not write-ready: ${error?.message??'database write unavailable'}`);
+}
+async function awaitOwnedExit(record){for(let i=0;i<100;i++){if(!await processMatches(record))return;await new Promise(resolve=>setTimeout(resolve,100));}throw Error('owned process did not stop');}
+async function recoveryEvent(event){await appendFile(join(runRoot,'recovery-events.jsonl'),JSON.stringify({at:new Date().toISOString(),...event})+'\n',{mode:0o600});}
+async function recoveryTotals(){const text=await readFile(join(runRoot,'recovery-events.jsonl'),'utf8').catch(()=>'');const events=text.trim().split('\n').filter(Boolean).map(JSON.parse);return {controllerRecoveries:events.filter(event=>event.event==='controller-recovered').length,parentRestores:events.filter(event=>event.event==='parent-restored').length};}
+async function launchController(initial){
+ const supervision=await superviseController({file:fileURLToPath(import.meta.url),configuration:{runRoot,collaborationId,locals,contractVersion,frozenBuild,checks,initial,createdParticipantId},onEvent:async event=>{progress(event.event,event);await recoveryEvent(event);},onSpawn:async record=>{const saved=await readPrivate(runRoot,'bootstrap.json');saved.controllers=[record];await savePrivate(runRoot,'bootstrap.json',saved);}});
+ const totals=await recoveryTotals();await writeFile(join(runRoot,'controller-supervision.json'),JSON.stringify({ok:true,attempts:supervision.attempts,recoveries:totals.controllerRecoveries,parentRestores:totals.parentRestores,temporaryTakeover:false,connectorPids:workers.map(worker=>worker.child.pid)},null,2));
+}
+
+process.on('message',async message=>{
+ if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==='1'||message?.action!=='restart-provider')return;
+ try{
+  const index=workers.findIndex(worker=>worker.local.role==='provider'),worker=workers[index];assert.ok(worker);
+  const detail=await api.detail(collaborationId);assert.ok(!detail.jobs.some(job=>job.agentId===worker.local.agent.id&&['pending','running'].includes(job.status)),'only the owned idle provider may restart');
+  await stopOwned(worker.record);await awaitOwnedExit(worker.record);workers.splice(index,1);delete worker.local.worker;await startConnectors([worker.local]);
+  const saved=await readPrivate(runRoot,'bootstrap.json');saved.locals=locals;await savePrivate(runRoot,'bootstrap.json',saved);await recoveryEvent({event:'connector-restarted',role:'provider',oldPid:worker.record.pid,newPid:worker.local.worker.pid});
+  process.send?.({event:'provider-restarted',oldPid:worker.record.pid,newPid:worker.local.worker.pid});
+ }catch(error){process.send?.({event:'provider-restart-failed',error:String(error)});}
+});
+
+async function loginReady(){let last;for(let attempt=0;attempt<8;attempt++){try{await waitReady();await api.loginOwner();return;}catch(error){last=error;if(/HTTP (401|403|422)/.test(String(error)))throw error;await new Promise(resolve=>setTimeout(resolve,Math.min(5000,500*(attempt+1))));}}throw last;}
+
+async function stableRead(operation){let last;for(let attempt=0;attempt<10;attempt++){try{return await operation();}catch(error){last=error;if(!/HTTP 5[0-9]{2}|fetch failed|ECONN|socket|Socket|Timeout|aborted/.test(String(error)))throw error;await new Promise(resolve=>setTimeout(resolve,1000));}}throw last;}

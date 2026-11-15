@@ -250,6 +250,7 @@ export const lifecycleRevisions = mysqlTable("lifecycle_revisions", {
   sharedContract: json("shared_contract").$type<import("@seam/protocol").SharedContract>(),
   factBindings: json("fact_bindings").$type<import("@seam/protocol").LifecycleContext["factBindings"]>(),
   approvalIntent: json("approval_intent").$type<{ userId: string; documentHash: string; requestedAt: string }>(),
+  retryBudget: json("retry_budget").$type<import("@seam/protocol").RetryBudgetState>(),
   repair: json("repair_context").$type<import("@seam/protocol").LifecycleContext["repair"]>(),
   informationRequests: json("information_requests").$type<import("@seam/protocol").InformationRequest[]>(),
   attemptHistory: json("attempt_history").$type<import("@seam/protocol").LifecycleContext["attemptHistory"]>(),
@@ -294,3 +295,10 @@ export const workflowWakeups = mysqlTable("workflow_wakeups", {
   error: text("error"),
   ...timestamps,
 }, (table) => [index("workflow_wakeups_pending_idx").on(table.completedAt, table.availableAt)]);
+
+// One bounded operational row verifies an actual committed readiness write.
+export const readinessProbes = mysqlTable("readiness_probes", {
+  id: varchar("id", { length: 50 }).primaryKey(),
+  nonce: varchar("nonce", { length: 36 }).notNull(),
+  checkedAt: timestamp("checked_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
+});

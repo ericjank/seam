@@ -9,10 +9,10 @@ const require=createRequire('/app/apps/platform/package.json'),mysql=require('my
 const db=await mysql.createConnection({host:'mysql',user:process.env.DB_USERNAME,password:process.env.DB_PASSWORD,database:process.env.DB_DATABASE,timezone:'Z'});
 const api=new SimulationApi('http://127.0.0.1:3000'),checks=[],observations=[],suffix=randomUUID().slice(0,8),owned=[];
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-const caps={adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:7};
+const caps={adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:8};
 async function claim(peer,expected=true){
  const deadline=Date.now()+12_000;
- do{const {job}=await api.call('/api/connectors/poll',{agentId:peer.agent.id,waitMs:0,supportsInformationLookup:true,protocolVersion:7},{token:peer.agent.token});if(job||!expected)return job;await delay(150);}while(Date.now()<deadline);
+ do{const {job}=await api.call('/api/connectors/poll',{agentId:peer.agent.id,waitMs:0,supportsInformationLookup:true,protocolVersion:8},{token:peer.agent.token});if(job||!expected)return job;await delay(150);}while(Date.now()<deadline);
  assert.fail('expected a run-owned synthetic job');
 }
 const complete=(peer,job,actions)=>api.call('/api/connectors/complete',{agentId:peer.agent.id,jobId:job.id,attempts:job.attempts,status:'completed',result:{agentTurn:{message:'显式合成协议夹具，不代表真实模型或业务执行',kind:'status',actions,needsHumanInput:false,notifyParticipantIds:[]}}},{token:peer.agent.token});

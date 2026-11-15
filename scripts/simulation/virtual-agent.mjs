@@ -5,6 +5,7 @@ import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { jointFixture, providerAssertions, providerReadinessApproved } from "./joint-fixture.mjs";
 import { providerServerSource } from "./provider-server.mjs";
+import { stopOwned } from "./owned-processes.mjs";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -75,6 +76,7 @@ ${lifecycle.repair ? "修复诊断：已核对HTTP层server.mjs和原始联合�
     acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index+1}`, runnerParticipantId, description: "运行本项目真实HTTP联合用例，验证正常报价及非法数量和本修订边界", command: "node --test joint.test.mjs", expectedResult: "退出码0，金额正确，非法输入HTTP400", requiredAssertions: providerAssertions(businessRevision), httpChecks: [{id:"quote-amount",requirementIds:["quote-normal"],publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:JSON.stringify({sku:"SKU-001",quantity:2}),expectedStatus:200,bodyChecks:[{path:"subtotal",equals:24000},{path:"currency",equals:"CNY"}]}, {id:"invalid-quantity",requirementIds:["quote-invalid"],publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:JSON.stringify({sku:"SKU-001",quantity:0}),expectedStatus:400,bodyChecks:[]},{id:"malformed-json",requirementIds:["quote-json"],publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:"{",expectedStatus:400,bodyChecks:[]}] })),
     risks: "仅本地合成项目；网络不可用如实报告未执行，不部署，不安装依赖。", changeSummary: repairInformation && lifecycle.revision >= 2 ? "只修复HTTP金额回归，保留业务规则及原验收测试。" : supportsDiscount ? "保留基础报价，增量增加折扣字段和兼容验证。" : businessRevision === 5 ? "撤销折扣扩展，恢复基础报价。" : "首次统一字段、错误语义、双方职责及真实联合验收。", impactedParticipantIds: ids, retainedDecisions: lifecycle.revision >= 2 ? ["保留报价路径、SKU单价和数量校验"] : [],
   } });
+  for (const action of actions) if(action.type==="plan.compose") for(const item of action.contract.acceptanceCases) for(const check of item.httpChecks){check.headerChecks=[{name:"content-type",includes:"application/json"}];check.bodyAssertions=check.expectedStatus>=400?[{path:"error",type:"string",nonEmpty:true}]:[];check.emptyBody=false;}
   message = "虚拟协调方汇总统一契约，等待双方审阅。";
 } else if (lifecycle.phase === "plan_confirmation" && !lifecycle.confirmations.includes(context.participant.id)) {
   assert.ok(lifecycle.document && lifecycle.documentHash, "confirmation requires the full shared document and hash");
@@ -129,7 +131,7 @@ ${supportsDiscount ? `test("discount boundaries and validation", () => {
   // Deliberate, observed HTTP-layer bug for the repair scenario; no passed result is fabricated.
   if(repairInformation && !lifecycle.repair) serverSource=serverSource.replace("const result=quote(JSON.parse(body));","const result=quote(JSON.parse(body)); result.subtotal += 1;");
   if (serviceState?.revision !== lifecycle.revision) {
-    if(serviceState?.pid) try {process.kill(serviceState.pid,"SIGTERM");} catch {}
+    if(serviceState?.pid) await stopOwned({pid:serviceState.pid,entry:"server.mjs",marker:statePath,detached:false});
     await writeFile("server.mjs", serverSource);
     const child=spawn(process.execPath,["server.mjs",statePath],{cwd:process.cwd(),detached:true,stdio:"ignore"}); child.unref();
     for(let attempt=0;attempt<50;attempt++) {try {const state=JSON.parse(await readFile(statePath,"utf8"));if(state.revision===lifecycle.revision){serviceState=state;break;}} catch {} await new Promise(resolve=>setTimeout(resolve,50));}

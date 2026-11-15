@@ -28,9 +28,15 @@ export class SimulationApi {
   }
 
   async call(path, body, options) {
-    const result = await this.raw(path, body, options);
-    assert.ok(result.response.ok, `${path}: HTTP ${result.response.status}: ${JSON.stringify(result.data)}`);
-    return result.data;
+    const retries=options?.method==="GET"?6:1;
+    for(let attempt=0;attempt<retries;attempt++) {
+      let result;
+      try { result=await this.raw(path,body,options); }
+      catch(error) { if(attempt+1===retries)throw error;await new Promise(resolve=>setTimeout(resolve,500));continue; }
+      if(result.response.status>=500&&attempt+1<retries){await new Promise(resolve=>setTimeout(resolve,500));continue;}
+      assert.ok(result.response.ok, `${path}: HTTP ${result.response.status}: ${JSON.stringify(result.data)}`);
+      return result.data;
+    }
   }
 
   async expect(path, body, status, options) {

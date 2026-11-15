@@ -49,7 +49,7 @@ async function register(label: string): Promise<Local> {
   return { projectId: project.id, agentId: agent.id, token: agent.token };
 }
 async function claim(local: Local): Promise<Claimed> {
-  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: 7, supportsInformationLookup: true }, { token: local.token });
+  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: 8, supportsInformationLookup: true }, { token: local.token });
   assert.ok(result.job, "the platform must automatically enqueue the expected turn");
   return result.job;
 }
@@ -79,7 +79,7 @@ async function main() {
   await expected("/api/collaborations", create, 409);
   const listed = await api("/api/collaborations", undefined, { method: "GET" });
   assert.ok(!listed.collaborations.some((row: any) => row.collaboration.title === create.title));
-  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 7 } }, { token: local.token });
+  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 8 } }, { token: local.token });
   const created = await api("/api/collaborations", create);
   const path = `/api/collaborations/${created.id}`;
   const detail = () => api(path, undefined, { method: "GET" });

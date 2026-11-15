@@ -1,7 +1,7 @@
 import type { LifecycleContext, SharedContract } from "@seam/protocol";
 import { HttpError } from "./http";
 
-export function validateSharedContract(contract: SharedContract, required: string[], previous?: SharedContract | null, requireIndependent = false, requireCoverage = false) {
+export function validateSharedContract(contract: SharedContract, required: string[], previous?: SharedContract | null, requireIndependent = false, requireCoverage = false, requireResponseAssertions = false) {
   const unique = (values: string[]) => new Set(values).size === values.length;
   const owners = contract.responsibilities.map((item) => item.participantId);
   if (!unique(owners) || owners.length !== required.length || required.some((id) => !owners.includes(id))) throw new HttpError(422, "统一契约必须且只能包含每个指定参与方的一份责任划分");
@@ -37,6 +37,13 @@ export function validateSharedContract(contract: SharedContract, required: strin
       if(signatures.size<2||!own.some(check=>check.expectedStatus>=200&&check.expectedStatus<300)||!own.some(check=>check.expectedStatus>=400))throw new HttpError(422,"共享API服务须独立验证不同请求的成功与错误场景，重复同一个正常请求不能代替错误边界");
     }
   }
+  for (const item of contract.acceptanceCases) for (const check of item.httpChecks ?? []) {
+    if ((check.headerChecks ?? []).some(header => !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(header.name))
+      || (check.bodyAssertions ?? []).some(field => !/^(?:\$|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)$/.test(field.path) || field.nonEmpty && !["string","object","array"].includes(field.type))
+      || check.bodyChecks.length + (check.bodyAssertions?.length ?? 0) + (check.headerChecks?.length ?? 0) + 2 > 100
+      || check.emptyBody && (check.bodyChecks.length || check.bodyAssertions?.length)) throw new HttpError(422,"HTTP响应断言的字段、类型、响应头、空正文或总数量无效");
+    if (requireResponseAssertions && check.expectedStatus >= 400 && (!(check.headerChecks?.length) || !(check.bodyChecks.length || check.bodyAssertions?.length || check.emptyBody === true))) throw new HttpError(422,"错误响应须明确响应头及正文断言，或明确声明空正文；仅状态码不构成完整独立验收");
+  }
   for (const change of contract.testChanges ?? []) if (!required.includes(change.participantId) || /^(?:\/|~|[A-Za-z]:)|(?:^|[\\/])\.\.(?:$|[\\/])/.test(change.path)) throw new HttpError(422, "测试变更只能声明本轮项目内的相对文件路径");
 }
 
@@ -63,6 +70,15 @@ export function renderSharedContract(input: {
 }) {
   const c = input.contract;
   const name = (id: string) => `${input.names.get(id) ?? id}（${id}）`;
+  const definitions: Array<{ id: string; check: NonNullable<SharedContract["acceptanceCases"][number]["httpChecks"]>[number] }> = [];
+  const references = new Map<string,string>();
+  for (const item of c.acceptanceCases) for (const check of item.httpChecks ?? []) {
+    const {id:_id,...spec} = check;
+    const signature = JSON.stringify(spec);
+    let entry = definitions.find(row => { const {id:_prior,...prior} = row.check; return JSON.stringify(prior) === signature; });
+    if (!entry) { entry = {id:`HTTP-${definitions.length+1}`,check}; definitions.push(entry); }
+    references.set(`${item.id}/${check.id}`,entry.id);
+  }
   return [
     `# ${input.title}：统一开发对接实施文档（第 ${input.revision} 版）`,
     c.effectiveRequirements?.length ? `## 当前有效要求\n\n${c.effectiveRequirements.map((item) => `- ${item.id}：${item.text}；验收方式=${item.verification??"历史未声明"}`).join("\n")}\n\n${c.retiredRequirements?.length ? `本轮撤销：\n${c.retiredRequirements.map((item) => `- ${item.id}：${item.reason}`).join("\n")}` : "无撤销要求"}` : `## 本轮要求（历史文档）\n\n${input.requirements}`,
@@ -72,7 +88,8 @@ export function renderSharedContract(input: {
     `## 实施范围\n\n${c.scope}`,
     `## 唯一接口契约\n\n${c.interfaces.map((item) => `### ${item.id}\n\n${item.definition}`).join("\n\n")}`,
     `## 项目责任与实施步骤\n\n${c.responsibilities.map((item) => `### ${name(item.participantId)}\n\n${item.changes}`).join("\n\n")}`,
-    `## 联合验收\n\n${c.acceptanceCases.map((item) => `### ${item.id} · ${name(item.runnerParticipantId)}\n\n${item.description}\n\n执行命令：${item.command}\n\n预期：${item.expectedResult}\n\n必需成功断言：${item.requiredAssertions?.join("；") ?? "历史文档未声明完整断言集"}\n\n独立HTTP检查：${item.httpChecks?.length ? JSON.stringify(item.httpChecks, null, 2) : "未声明；该用例仅有命令证据"}`).join("\n\n")}\n\n命令由本机 Agent 按本地权限核对执行，平台不直接执行远程文本。独立检查由固定Connector执行批准请求及期望，$SEAM_REVISION绑定当前批准修订，不需为修订号修改测试逻辑。`,
+    `## 联合验收\n\n${c.acceptanceCases.map((item) => `### ${item.id} · ${name(item.runnerParticipantId)}\n\n${item.description}\n\n执行命令：${item.command}\n\n预期：${item.expectedResult}\n\n必需成功断言：${item.requiredAssertions?.join("；") ?? "历史文档未声明完整断言集"}\n\n独立HTTP检查：${item.httpChecks?.map(check=>`${check.id} → ${references.get(`${item.id}/${check.id}`)}`).join("；") || "未声明；该用例仅有命令证据"}`).join("\n\n")}\n\n命令由本机 Agent 按本地权限核对执行，平台不直接执行远程文本。每端独立执行其引用的全部HTTP检查，规范相同仅在文档中共用定义；实际结果分别保存。$SEAM_REVISION绑定当前批准修订。`,
+    `## 完整HTTP检查定义（相同规范只列一次）\n\n${definitions.map(({id,check})=>`### ${id}\n服务：${name(check.publisherParticipantId)} / ${check.serviceName}；${check.method} ${check.path}\n原始请求正文：${check.requestBody === null ? "无" : JSON.stringify(check.requestBody)}\n预期状态：${check.expectedStatus}；关联要求：${check.requirementIds?.join("、") ?? "历史未声明"}\n字段精确值：${check.bodyChecks.map(field=>`${field.path}=${JSON.stringify(field.equals)}`).join("；") || "无"}\n字段类型：${check.bodyAssertions?.map(field=>`${field.path}:${field.type}${field.nonEmpty?"，非空":""}`).join("；") || "无"}\n响应头：${check.headerChecks?.map(header=>`${header.name} 包含 ${JSON.stringify(header.includes)}`).join("；") || "未声明"}\n空正文：${check.emptyBody===true?"必须为空":"未要求"}`).join("\n\n") || "没有独立HTTP检查"}`,
     `## 需求与独立检查覆盖\n\n${c.effectiveRequirements?.map(requirement=>`${requirement.id}：${requirement.verification??"历史未声明"}；${requirement.verification==="http"?c.acceptanceCases.flatMap(item=>(item.httpChecks??[]).filter(check=>check.requirementIds?.includes(requirement.id)).map(check=>`${item.id}/${check.id}`)).join("、")||"无独立覆盖": "由对应项目命令或双方审阅确认"}`).join("\n\n")??"历史文档未声明"}`,
     `## 服务就绪契约\n\n${c.serviceExpectations?.map((item) => `${name(item.publisherParticipantId)} / ${item.name}：${item.healthPath} HTTP ${item.status}；${item.bodyChecks.map((check) => `${check.path}=${JSON.stringify(check.equals)}`).join("；")}`).join("\n\n") || "未声明共享服务"}`,
     `## 风险与运行约束\n\n${c.risks}`,

@@ -4,5 +4,5 @@ import { pool } from "@/db";
 
 export async function GET() {
   await pool.query("SELECT 1");
-  return NextResponse.json({ status: "ok", database: "mysql", build:platformBuildInfo() });
+  return NextResponse.json({ status: "ok", database: "mysql", readinessPath: "/api/ready", build:platformBuildInfo() });
 }
