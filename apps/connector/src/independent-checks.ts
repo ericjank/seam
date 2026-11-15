@@ -1,3 +1,4 @@
+import { expandSharedContract } from "@seam/protocol";
 import { createHash } from "node:crypto";
 import { canonicalJson, type AgentTurnResult, type CollaborationContext, type CommandEvidence } from "@seam/protocol";
 import { commandText } from "./evidence.js";
@@ -7,7 +8,7 @@ const scalar = (value: unknown): string | number | boolean | null => value === n
 export async function runIndependentChecks(context: CollaborationContext, networkAllowed: boolean, signal: AbortSignal) {
   const results: IndependentResult[] = [], lifecycle=context.lifecycle;
   if (!lifecycle || lifecycle.paused || lifecycle.phase!=="joint_verifying" || !lifecycle.approvedHash || lifecycle.approvedHash!==lifecycle.documentHash || context.informationTask) return results;
-  for (const item of lifecycle.contract?.acceptanceCases.filter(row=>row.runnerParticipantId===context.participant.id)??[]) for(const check of item.httpChecks??[]) {
+  for (const item of (lifecycle.contract ? expandSharedContract(lifecycle.contract).acceptanceCases : []).filter(row=>row.runnerParticipantId===context.participant.id)??[]) for(const check of item.httpChecks??[]) {
     signal.throwIfAborted();
     const base={id:check.id,caseId:item.id,specHash:createHash("sha256").update(canonicalJson(check)).digest("hex"),documentHash:lifecycle.approvedHash,capturedAt:new Date().toISOString(),actualStatus:null as number|null};
     const unavailable=(summary:string,stage:NonNullable<IndependentResult["failureStage"]>,category:IndependentResult["category"]="environment",errorCode?:string):IndependentResult=>({...base,status:"not_run",category,summary,failureStage:stage,...(errorCode?{errorCode}: {})});
@@ -76,9 +77,19 @@ export function buildConfiguredIntegrationReport(context: CollaborationContext, 
     const required = item.requiredAssertions ?? [];
     const assertions = [...new Set(observed.filter(row => row.exitCode === 0).flatMap(row => row.assertions))];
     const passed = observed.length > 0 && !failed && !missing && required.every(name => assertions.includes(name)) && oracle.every(row => row.status === "passed");
+    const definitions = lifecycle.contract ? expandSharedContract(lifecycle.contract).acceptanceCases.find(row => row.id === item.id)?.httpChecks ?? [] : [];
+    const rootCauses = oracle.filter(row => row.status === "failed").map(row => {
+      const spec = definitions.find(check => check.id === row.id);
+      const publisher = context.participants.find(participant => participant.id === spec?.publisherParticipantId);
+      return { checkId: row.id, requirementIds: spec?.requirementIds ?? [], publisherParticipantId: spec?.publisherParticipantId ?? null, publisherName: publisher ? `${publisher.projectName} / ${publisher.agentName ?? "Agent"}` : spec?.publisherParticipantId ?? "未知服务端", serviceName: spec?.serviceName ?? "", request: spec ? `${spec.method} ${spec.path}` : "", mismatches: row.mismatches ?? [], failureStage: row.failureStage, summary: row.summary };
+    });
+    const missingAssertions = required.filter(name => !assertions.includes(name)), failedRuns = observed.filter(row => row.exitCode !== 0);
+    const failureSummary = rootCauses.length ? rootCauses.map(cause => `${cause.requirementIds.join("、")} · ${cause.publisherName} · ${cause.serviceName} ${cause.request}：${cause.mismatches.map(diff => `${diff.path} 期望${JSON.stringify(diff.expected)}，实际${diff.actualPresent === false ? "缺失" : JSON.stringify(diff.actual)}`).join("；") || cause.summary}`).join("\n").slice(0, 4000)
+      : failedRuns.length ? `实际命令退出失败：${failedRuns.map(run => `${run.command} exit=${run.exitCode}（${run.id}）`).join("；")}`
+      : missingAssertions.length ? `尚缺必需成功断言：${missingAssertions.join("；")}` : "没有本轮实际命令证据，未执行通过判定。";
     return { caseId: item.id, command: item.command, status: missing ? "not_run" as const : passed ? "passed" as const : "failed" as const,
-      category: missing?.category ?? (codeFailure ? "code" as const : "unknown" as const), summary: missing?.summary ?? (passed ? "Connector已运行本机配置命令并核对完整必需断言和独立契约结果，自动汇总实际回执。" : "配置命令失败或未覆盖完整必需断言，保留原始输出并停止通过结论。"),
-      evidence: { automaticReceipt: true }, assertionNames: assertions, runIds: observed.map(row => row.id) };
+      category: missing?.category ?? (codeFailure ? "code" as const : "unknown" as const), summary: missing?.summary ?? (passed ? "Connector已运行本机配置命令并核对完整必需断言和独立契约结果，自动汇总实际回执。" : failureSummary),
+      evidence: { automaticReceipt: true, rootCauses, missingAssertions, failedRunIds: failedRuns.map(run => run.id) }, assertionNames: assertions, runIds: observed.map(row => row.id) };
   });
   return { message: "Connector依据实际命令与独立HTTP结果直接汇总本轮联合验收，无需调用模型重复转写测试报告。", kind: "status", notifyParticipantIds: [], needsHumanInput: false,
     actions: [{ type: "integration.report", revision: lifecycle.revision, documentHash: lifecycle.approvedHash!, checks, runs, independentResults }] };

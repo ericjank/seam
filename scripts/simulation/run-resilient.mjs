@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import {spawn,execFile} from 'node:child_process';
-import {open,readFile,writeFile,appendFile} from 'node:fs/promises';
+import {open,readFile,writeFile,appendFile,stat,readdir} from 'node:fs/promises';
 import {join,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
@@ -20,7 +20,7 @@ async function launch(attempt){
  const descriptor=await open(log,'a',0o600),entry=join(here,'run.mjs'),marker=randomUUID();
  const child=spawn(process.execPath,[entry,`--seam-owned=${marker}`],{env:{...process.env,...(runRoot?{SEAM_SIMULATION_RESUME_ROOT:runRoot}:{})},stdio:['ignore',descriptor.fd,descriptor.fd,'ipc']});await descriptor.close();
  const state={child,record:{pid:child.pid,entry,marker,detached:false},attempt,result:null,exit:null};active=state;
- child.on('message',message=>{if(message.event==='bootstrap-ready'){runRoot=message.runRoot;collaborationId=message.collaborationId;void record('durable-bootstrap-ready',{runRoot,collaborationId});}if(message.status)state.result=message;if(message.event==='provider-restarted')state.providerRestart=message;if(message.event==='provider-restart-failed')semanticError=Error(message.error);});
+ child.on('message',message=>{if(message.event==='bootstrap-ready'){runRoot=message.runRoot;collaborationId=message.collaborationId;void record('durable-bootstrap-ready',{runRoot,collaborationId});}if(message.status)state.result=message;if(message.event==='provider-restarted')state.providerRestart=message;if(message.event==='consumer-restarted')state.consumerRestart=message;if(message.event==='connector-restart-failed'||message.event==='provider-restart-failed')semanticError=Error(message.error);});
  child.once('error',error=>{semanticError=error;});child.once('exit',(code,signal)=>{state.exit={code,signal};});await record('parent-started',{attempt,pid:child.pid,resume:Boolean(runRoot)});return state;
 }
 async function faultTick(){
@@ -32,7 +32,17 @@ async function faultTick(){
  if(step===1&&recovery.includes('parent-restored')){faults.push({fault:'parent-exit-and-durable-resume',ok:true});await record('fault-platform-restart',{project});await exec('docker',['compose','-p',project,'-f',join(here,'../../docker-compose.simulation.yml'),'restart','--no-deps','app'],{timeout:60000});await ready();faults.push({fault:'platform-restart',ok:true});step=2;return;}
  if(step===2){await record('fault-mysql-restart',{project});await exec('docker',['compose','-p',project,'-f',join(here,'../../docker-compose.simulation.yml'),'restart','--no-deps','mysql'],{timeout:60000});await ready();faults.push({fault:'mysql-restart',ok:true});step=3;return;}
  if(step===3){const saved=await readPrivate(runRoot,'bootstrap.json'),provider=saved.locals.find(local=>local.role==='provider');if(detail.jobs.some(job=>job.agentId===provider.agent.id&&['pending','running'].includes(job.status)))return;active.child.send({action:'restart-provider'});await record('fault-provider-restart-requested');step=4;return;}
- if(step===4&&active.providerRestart){faults.push({fault:'provider-connector-restart',ok:true,...active.providerRestart});await record('fault-matrix-completed',{faults});step=5;}
+ if(step===4&&active.providerRestart){faults.push({fault:'provider-connector-restart',ok:true,...active.providerRestart});await record('control-fault-matrix-completed',{faults});step=5;}
+ if(step===5&&state.revision===1&&state.phase==='executing'){
+  const saved=await readPrivate(runRoot,'bootstrap.json'),consumer=saved.locals.find(local=>local.role==='consumer');
+  if(!detail.jobs.some(job=>job.agentId===consumer.agent.id&&job.status==='running'&&job.kind==='collaboration.turn'))return;
+  if(!(await stat(join(consumer.root,'client.mjs')).catch(()=>null))?.size)return;
+  const sessions=await readdir(join(runRoot,'codex-state'));let activeTurn;
+  for(const name of sessions.filter(name=>name.endsWith('.json'))){const value=JSON.parse(await readFile(join(runRoot,'codex-state',name),'utf8'));if(value.active?.turnId)activeTurn={threadId:value.threadId,turnId:value.active.turnId,jobId:value.active.jobId};}
+  if(!activeTurn)return;await record('fault-consumer-interrupted-after-file-write',{pid:consumer.worker.pid,...activeTurn});active.child.send({action:'restart-consumer'});step=6;return;
+ }
+ if(step===6&&active.consumerRestart){faults.push({fault:'real-codex-connector-interrupted-after-file-write',ok:true,...active.consumerRestart});await record('fault-matrix-completed',{faults});step=7;}
+
 }
 try{
  await api.loginOwner();let attempt=1;await launch(attempt);
@@ -46,7 +56,7 @@ try{
   }
   await faultTick();await delay(500);
  }
- assert.ok(!chaos||step===5,'all requested real fault cases must complete');
+ assert.ok(!chaos||step===7,'all requested real fault cases must complete');
  await writeFile(join(runRoot,'fault-matrix.json'),JSON.stringify({ok:true,chaos,faults,parentAttempts:active.attempt,temporaryTakeover:false,scope:'real owned processes and dedicated Docker app/MySQL restarts; no unrelated process or volume changed'},null,2));
  console.log(JSON.stringify({ok:true,event:'resilient-simulation-completed',runRoot,collaborationId,parentAttempts:active.attempt,faults}));
  }catch(error){

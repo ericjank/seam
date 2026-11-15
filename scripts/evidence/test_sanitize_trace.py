@@ -1,4 +1,4 @@
-import tempfile,unittest,json,zipfile,hashlib
+import tempfile,unittest,json,zipfile,hashlib,base64
 from pathlib import Path
 from sanitize_trace import sanitize,PLACEHOLDER
 class TraceRedaction(unittest.TestCase):
@@ -22,4 +22,22 @@ class TraceRedaction(unittest.TestCase):
    with zipfile.ZipFile(raw,'w')as z:z.writestr('trace.trace','seam_session=isolated_secret_12345678901234567890')
    report=sanitize(raw,public);self.assertTrue(report['ok'])
    with zipfile.ZipFile(public)as z:self.assertNotIn(b'isolated_secret_12345678901234567890',z.read('trace.trace'))
+ def test_key_header_query_and_source_aliases_are_removed(self):
+  cases=[{'access_token':'SyntheticAccess_123456789'}, {'client_secret':'SyntheticClient_123456789'}, {'headers':[{'name':'X-API-Key','value':'SyntheticHeader_123456789'}]}, {'url':'https://example.test/?access_token=SyntheticQuery_123456789'}, {'refreshToken':'SyntheticRefresh_123456789'}, {'recoveryKey':'SyntheticRecovery_123456789'}]
+  with tempfile.TemporaryDirectory()as root:
+   raw=Path(root)/'raw.zip';public=Path(root)/'public.zip'
+   with zipfile.ZipFile(raw,'w')as z:
+    for index,value in enumerate(cases):z.writestr(f'{index}.network',json.dumps(value))
+   sanitize(raw,public)
+   with zipfile.ZipFile(public)as z:
+    for name in z.namelist():self.assertNotIn(b'Synthetic',z.read(name))
+ def test_encoded_copies_are_scrubbed_and_semantic_metadata_kept(self):
+  token='Private+/secret=123456789';encoded=base64.b64encode(token.encode()).decode()
+  with tempfile.TemporaryDirectory()as root:
+   raw=Path(root)/'raw.zip';public=Path(root)/'public.zip'
+   with zipfile.ZipFile(raw,'w')as z:
+    z.writestr('body.json',json.dumps({'token':token,'copy':encoded,'url':'https://example.test/?access_token=Private%2B%2Fsecret%3D123456789','tokenUsage':{'inputTokens':123},'specHash':'a'*64}))
+   sanitize(raw,public)
+   with zipfile.ZipFile(public)as z:
+    value=json.loads(z.read('body.json'));self.assertEqual(value['tokenUsage']['inputTokens'],123);self.assertEqual(value['specHash'],'a'*64);self.assertNotIn(token,json.dumps(value));self.assertNotIn(encoded,json.dumps(value));self.assertNotIn('Private%2B',value['url'])
 if __name__=='__main__':unittest.main()

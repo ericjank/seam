@@ -1,3 +1,4 @@
+import { capturePublicScreenshot } from "../../../scripts/evidence/public_screenshot.mjs";
 import { fixtureContract, fixtureRuns } from "../tests/fixtures/shared-contract";
 import { randomUUID } from "node:crypto";
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
@@ -19,7 +20,7 @@ test.afterEach(async ({ page }) => {
 });
 
 async function post(request: APIRequestContext, path: string, data: unknown, agent?: Agent) {
-  if (path == "/api/connectors/poll") data = { protocolVersion: 8, supportsInformationLookup: true, ...(data as object) };
+  if (path == "/api/connectors/poll") data = { protocolVersion: 9, supportsInformationLookup: true, ...(data as object) };
   const response = await request.post(path, { data, ...(agent ? { headers: { authorization: `Bearer ${agent.token}` } } : {}) });
   expect(response.ok(), `${path}: ${await response.text()}`).toBeTruthy();
   return response.json();
@@ -42,7 +43,7 @@ async function preparePeers(request: APIRequestContext, onlineBoth = true): Prom
     peers.push({ project, agent });
   }
   for (const peer of onlineBoth ? peers : peers.slice(0, 1)) {
-    await post(request, "/api/connectors/heartbeat", { agentId: peer.agent.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 8 } }, peer.agent);
+    await post(request, "/api/connectors/heartbeat", { agentId: peer.agent.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 9 } }, peer.agent);
   }
   return peers;
 }
@@ -115,7 +116,7 @@ test("管理员通过真实界面审阅两轮文档和报告，明确批准后�
 
   await panel.getByRole("button", { name: "暂停自动协作", exact: true }).click();
   await expect(panel.getByRole("button", { name: "恢复自动协作", exact: true })).toBeVisible();
-  await page.screenshot({ path: testInfo.outputPath("paused.png"), fullPage: true });
+  await capturePublicScreenshot(page, testInfo.outputPath("paused.png"), {fullPage:true});
   await panel.getByRole("button", { name: "恢复自动协作", exact: true }).click();
   await completePhase(page.request, id, peers, "planning");
   await completePhase(page.request, id, peers, "plan_synthesis");
@@ -127,7 +128,7 @@ test("管理员通过真实界面审阅两轮文档和报告，明确批准后�
   const versionOne = await (await page.request.get(`/api/collaborations/${id}`)).json();
   expect(versionOne.lifecycle.phase).toBe("awaiting_approval");
   expect(versionOne.jobs.filter((job: any) => ["pending", "running"].includes(job.status))).toHaveLength(0);
-  await page.screenshot({ path: testInfo.outputPath("revision-1-awaiting-approval.png"), fullPage: true });
+  await capturePublicScreenshot(page, testInfo.outputPath("revision-1-awaiting-approval.png"), {fullPage:true});
 
   const viewerEmail = `browser-viewer-${randomUUID()}@seam.test`;
   const viewerPassword = "BrowserViewer!2026";
@@ -193,7 +194,7 @@ test("管理员通过真实界面审阅两轮文档和报告，明确批准后�
   expect(beforeJoint.lifecycle.report).toBeNull(); }
   await completePhase(page.request, id, peers, "joint_verifying");
   await expect(panel.getByRole("heading", { name: "完整实施报告 · v2" })).toBeVisible({ timeout: 15_000 });
-  await page.screenshot({ path: testInfo.outputPath("revision-2-full-report.png"), fullPage: true });
+  await capturePublicScreenshot(page, testInfo.outputPath("revision-2-full-report.png"), {fullPage:true});
   await panel.getByRole("button", { name: "满意，确认终止任务" }).click();
   await expect(panel.getByText("管理员已终止此任务，文档、报告和对话记录已保留。", { exact: true })).toBeVisible();
   await expect(panel.getByRole("heading", { name: "开发对接实施文档 · v2" })).toBeVisible();
@@ -226,12 +227,12 @@ test("资料缺失先自动查本地共享并询证对端，找到后无需人�
   const {id,peers,peer,complete}=await beginMissingInformation(page);
   const panel=page.getByRole("region",{name:"自动对接流程"});await expect(panel.getByLabel("缺失信息自动获取")).toContainText("向对端询证",{timeout:15000});
   await expect(panel.getByLabel("补充阻塞所缺的事实")).toHaveCount(0);
-  await page.screenshot({path:testInfo.outputPath("information-peer-lookup.png"),fullPage:true});
+  await capturePublicScreenshot(page, testInfo.outputPath("information-peer-lookup.png"), {fullPage:true});
   await complete(peers[1]!,peer,{type:"information.respond",revision:1,requestId:peer.payload.context.informationTask.requestId,status:"found",answer:"当前公开协议版本为public-quote-v1",sources:[{scope:"local_project",reference:"docs/protocol.md",finding:"明确规定contractVersion=public-quote-v1"}]});
   await expect(panel.getByLabel("协作阻塞")).toHaveCount(0,{timeout:15000});
   const detail=await(await page.request.get(`/api/collaborations/${id}`)).json();expect(detail.lifecycle.informationRequests[0].status).toBe("answered");expect(detail.messages.some((row:any)=>row.metadata.blockResolution)).toBe(false);
   await panel.getByLabel("缺失信息自动获取").locator(':scope > summary').click();await expect(panel.getByLabel("缺失信息自动获取")).toContainText("已获取");
-  await page.screenshot({path:testInfo.outputPath("information-resolved-without-human.png"),fullPage:true});
+  await capturePublicScreenshot(page, testInfo.outputPath("information-resolved-without-human.png"), {fullPage:true});
 });
 
 test("自动查找穷尽后才补充必要事实，保留项目与原修订",async({page},testInfo)=>{
@@ -239,11 +240,11 @@ test("自动查找穷尽后才补充必要事实，保留项目与原修订",asy
   await complete(peers[1]!,peer,{type:"information.respond",revision:1,requestId:peer.payload.context.informationTask.requestId,status:"unavailable",answer:"已查本方资料，仍没有可核对的协议事实",sources});
   const panel=page.getByRole("region",{name:"自动对接流程"});await expect(panel.getByLabel("协作阻塞")).toContainText("查找后仍缺少事实",{timeout:15000});
   await expect(panel.getByRole("button",{name:"确认文档并执行"})).toHaveCount(0);
-  await page.screenshot({path:testInfo.outputPath("necessary-fact-after-lookups.png"),fullPage:true});
+  await capturePublicScreenshot(page, testInfo.outputPath("necessary-fact-after-lookups.png"), {fullPage:true});
   await panel.getByLabel("补充此问题的必要事实").fill("本地使用动态端口，公开协议标记为public-quote-v1。");await panel.getByRole("button",{name:"保存事实并继续"}).click();
   await expect(panel.getByLabel("协作阻塞")).toHaveCount(0,{timeout:15000});
   const detail=await(await page.request.get(`/api/collaborations/${id}`)).json();expect(detail.lifecycle.revision).toBe(1);expect(detail.lifecycle.phase).toBe("planning");expect(detail.lifecycle.informationRequests[0].administratorResolution.answer).toContain("public-quote-v1");
-  await page.screenshot({path:testInfo.outputPath("necessary-fact-resolved.png"),fullPage:true});
+  await capturePublicScreenshot(page, testInfo.outputPath("necessary-fact-resolved.png"), {fullPage:true});
 });
 
 test("失败自动起草修复方案，管理员真实点击确认后才能重新实施验证",async({page},testInfo)=>{
@@ -257,15 +258,15 @@ test("失败自动起草修复方案，管理员真实点击确认后才能重�
     await post(page.request,"/api/connectors/complete",{agentId:peer.agent.id,jobId:job.id,attempts:job.attempts,status:"completed",result:{agentTurn:{message:"修复界面合成回执",actions:[{type:"execution.report",revision:1,status:index===0?"failed":"passed",category:"code",summary:index===0?"合成失败证据：金额回归未通过":"合成实施完成",evidence:{synthetic:true}}]}}},peer.agent);
   }
   await expect(panel.getByRole("heading",{name:"自动对接 · 第 2 轮"})).toBeVisible({timeout:15000});await expect(panel.getByLabel("修复方案")).toContainText("金额回归未通过");
-  await expect(panel.getByRole("button",{name:"确认修复方案并重新实施"})).toHaveCount(0);await page.screenshot({path:testInfo.outputPath("repair-auto-drafted.png"),fullPage:true});
+  await expect(panel.getByRole("button",{name:"确认修复方案并重新实施"})).toHaveCount(0);await capturePublicScreenshot(page, testInfo.outputPath("repair-auto-drafted.png"), {fullPage:true});
   for(const phase of ["planning","plan_synthesis","plan_confirmation"])await completePhase(page.request,id,peers,phase);
   const ready=await(await page.request.get(`/api/collaborations/${id}`)).json();expect(ready.lifecycle.approvedHash).toBeNull();expect(ready.lifecycle.phase).toBe("awaiting_approval");
   const early=await page.request.post(`/api/collaborations/${id}/test-runs`,{data:{participantId:ready.participants[0].participant.id}});expect(early.status()).toBe(409);
-  await expect(panel.getByRole("button",{name:"确认修复方案并重新实施"})).toBeVisible({timeout:15000});await page.screenshot({path:testInfo.outputPath("repair-awaiting-human-approval.png"),fullPage:true});
+  await expect(panel.getByRole("button",{name:"确认修复方案并重新实施"})).toBeVisible({timeout:15000});await capturePublicScreenshot(page, testInfo.outputPath("repair-awaiting-human-approval.png"), {fullPage:true});
   await panel.getByRole("button",{name:"确认修复方案并重新实施"}).click();
   await expect.poll(async()=>(await(await page.request.get(`/api/collaborations/${id}`)).json()).lifecycle.phase).toBe("executing");
   for(const phase of ["executing","joint_verifying"])await completePhase(page.request,id,peers,phase);
-  await expect(panel.getByRole("button",{name:"满意，确认终止任务"})).toBeVisible({timeout:15000});await page.screenshot({path:testInfo.outputPath("repair-revalidated-report.png"),fullPage:true});
+  await expect(panel.getByRole("button",{name:"满意，确认终止任务"})).toBeVisible({timeout:15000});await capturePublicScreenshot(page, testInfo.outputPath("repair-revalidated-report.png"), {fullPage:true});
   await panel.getByRole("button",{name:"满意，确认终止任务"}).click();await expect(panel.getByText("管理员已终止此任务，文档、报告和对话记录已保留。",{exact:true})).toBeVisible({timeout:15000});
 });
 
@@ -279,4 +280,14 @@ test("离线对端在界面显示明确阻塞，不创建半成品协作", async
   const after = await (await page.request.get("/api/collaborations")).json();
   expect(after.collaborations.filter((row: any) => row.collaboration.objective === objective)).toHaveLength(0);
   await expect(page.locator('textarea[name="objective"]')).toHaveValue(objective);
+});
+
+test('实施中断后管理员真实确认才重试，原批准和修订保持不变',async({page},testInfo)=>{
+ await signIn(page);const peers=await preparePeers(page.request);await submitGoal(page,peers,'合成界面夹具：中断后只读核对，确认后续接原方案');await expect(page).toHaveURL(/\/collaborations\/[a-f0-9-]+$/);const id=page.url().split('/').pop()!;
+ for(const phase of['planning','plan_synthesis','plan_confirmation'])await completePhase(page.request,id,peers,phase);
+ await page.reload();const panel=page.getByRole('region',{name:'自动对接流程'});await panel.getByRole('button',{name:'确认文档并执行',exact:true}).click();
+ const before=await(await page.request.get(`/api/collaborations/${id}`)).json(),peer=peers[0]!;const {job}=await post(page.request,'/api/connectors/poll',{agentId:peer.agent.id,waitMs:0},peer.agent);
+ await post(page.request,'/api/connectors/complete',{agentId:peer.agent.id,jobId:job.id,attempts:job.attempts,status:'completed',result:{agentTurn:{message:'合成中断状态，仅验证管理员真实点击',kind:'status',actions:[{type:'workflow.blocked',revision:1,kind:'needs_admin',requiresReview:true,category:'environment',reason:'实施中断核对：显式合成状态，等待管理员确认后继续原批准范围。'}],notifyParticipantIds:[],needsHumanInput:false}}},peer.agent);
+ await page.reload();const retry=panel.getByRole('button',{name:'确认处理完成并重试实施',exact:true});await expect(retry).toBeVisible();await capturePublicScreenshot(page,testInfo.outputPath('interrupted-awaiting-owner.png'),{fullPage:true});
+ await retry.click();await expect(retry).toHaveCount(0);const after=await(await page.request.get(`/api/collaborations/${id}`)).json();expect(after.lifecycle.approvedHash).toBe(before.lifecycle.approvedHash);expect(after.lifecycle.revision).toBe(1);expect(after.lifecycle.attemptHistory).toHaveLength(1);expect(after.lifecycle.blocks).toHaveLength(0);await capturePublicScreenshot(page,testInfo.outputPath('interrupted-owner-confirmed.png'),{fullPage:true});await post(page.request,`/api/collaborations/${id}/lifecycle`,{action:'pause'});
 });

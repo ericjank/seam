@@ -89,7 +89,7 @@ async function writeRunIndex(status, detail) {
 async function restartConsumerWithLostCheckpoint(){
   const index=workers.findIndex(worker=>worker.local.role==="consumer"),worker=workers[index];
   assert.ok(worker);
-  await stopOwned(worker.record);await awaitOwnedExit(worker.record);
+  await stopOwned(worker.record,role==='consumer'?'SIGKILL':'SIGTERM');await awaitOwnedExit(worker.record);
   await writeFile(join(runRoot,"consumer-connector-before-restart.log"),await readFile(worker.record.logPath));
   workers.splice(index,1);delete worker.local.exit;
   const directory=join(runRoot,"codex-state");
@@ -119,6 +119,16 @@ async function runUntilPhase(expected,expectedRevision) {
     if(state!==previous){progress("lifecycle",{revision:current.revision,phase:current.phase,jobs:detail.jobs.map(job=>({id:job.id,status:job.status})),blocks:current.blocks});await writeFile(join(runRoot,`state-${Date.now()}.json`),JSON.stringify(detail,null,2));previous=state;await writeRunIndex("running",detail);}
     if(current.phase===expected&&(expectedRevision===undefined||current.revision===expectedRevision))return detail;
     if(expected==="joint_verifying"&&lifecycleEvents.some(event=>event.current.phase===expected&&event.current.revision===expectedRevision)){progress("milestone-already-completed",{revision:expectedRevision,phase:expected,currentRevision:current.revision,currentPhase:current.phase});return detail;}
+    const interrupted=current.blocks.find(block=>block.requiresReview&&block.reason.startsWith("实施中断核对："));
+    if(interrupted&&process.env.SEAM_SIMULATION_CHAOS==="true"){
+      assert.equal(current.phase,"executing");assert.equal(interrupted.category,"environment");
+      const before=await Promise.all(locals.map(local=>snapshot(local.root)));await new Promise(resolve=>setTimeout(resolve,2000));await assertNoUnapprovedWrites(before);
+      const recoveryJob=detail.jobs.find(job=>job.agentId===locals.find(local=>local.role==="consumer").agent.id&&job.recovery?.state==="interrupted");assert.ok(recoveryJob,"detail must expose public interrupted-turn recovery evidence");
+      assert.equal(recoveryJob.recovery.readOnly,true);assert.match(recoveryJob.recovery.turnId??"",/^[a-f0-9-]{36}$/i);
+      const evidence={at:new Date().toISOString(),revision:current.revision,approvedHash:current.approvedHash,recovery:recoveryJob.recovery,before,after:await Promise.all(locals.map(local=>snapshot(local.root))),noWritesBeforeRecoveryConfirmation:true};
+      await writeFile(join(runRoot,"interrupted-execution-confirmation.json"),JSON.stringify(evidence,null,2));
+      await api.lifecycle(collaborationId,{action:"retry-validation",revision:current.revision,documentHash:current.documentHash});progress("administrator-confirmed-interrupted-execution",{revision:current.revision});continue;
+    }
     assert.notEqual(current.phase,"terminated");assert.ok(!current.blocks.some(block=>block.kind==="needs_admin"),`unexpected administrator dependency: ${JSON.stringify(current.blocks)}`);assert.ok(workers.every(({local})=>!local.exit),"a continuously polling Connector exited");
     await new Promise(resolve=>setTimeout(resolve,750));
   }
@@ -289,7 +299,7 @@ async function main() {
     await writeFile(join(root, "AGENTS.md"), agentInstructions);
     if (repairInformation) {
       await writeFile(join(root, "README.md"), `${contract}\n\n本项目职责：${role}。服务的额外公开就绪字段contractVersion必须符合提供方现有项目文档；缺少时先查本地和共享资料，再自动询证，不由管理员填写。\n`);
-      await writeFile(join(root, "AGENTS.md"), `${agentInstructions}\n本次只实现基础报价，不增加折扣功能。修复版保持原业务和原必需断言，健康响应检查当前lifecycle.revision。测试名应是稳定标识，不把修订号写入测试名。joint.test.mjs必须从process.env.SEAM_SERVICE_URL和Number(process.env.SEAM_REVISION)获取端点和批准修订，首次生成后修复金额错误无需修改测试文件。共同契约的每方acceptanceCases必须包含httpChecks独立业务检查：POST /quote，请求JSON字符串{\"sku\":\"SKU-001\",\"quantity\":2}，expectedStatus=200，bodyChecks为subtotal=24000及currency=CNY，publisherParticipantId为提供方，serviceName=quote。testChanges=[]，修复保留原独立检查。effectiveRequirements将正常报价、数量边界、未知SKU、畸形JSON分别列稳定ID，verification=http，公开就绪协议单列verification=review；两端各自httpChecks覆盖两SKU正常金额、quantity=0和101及字符串/空值、未知SKU、畸形JSON原始正文，requirementIds引用各对应HTTP要求。每个httpChecks还须headerChecks=[{name:"content-type",includes:"application/json"}]，错误响应bodyAssertions=[{path:"error",type:"string",nonEmpty:true}]，emptyBody=false，正常请求bodyAssertions=[]。每端的factRefs引用quote.contractVersion；修复继续保留此引用，由平台自动安排来源核验，不重复改写既有计划。修复计划优先plan.amend，协调方优先plan.patch只改服务健康revision及修复摘要，其他字段保留。joint_verifying只运行既有脚本并真实报告，不修改代码、测试或业务目标。失败用integration.report failed，平台只读起草修复方案，管理员批准前不再实施验证。\n${role === "consumer" ? "本项目没有提供方公开contractVersion的值。提交本方plan.submit前须先查本地和共享资料，缺失时使用information.request询证提供方；不能猜测值或要求管理员填。收到答复后复用并把contractVersion及当前revision一起列入就绪契约和实际HTTP联合测试。" : "本方公开协议事实保存在docs/integration-facts.json。"}`);
+      await writeFile(join(root, "AGENTS.md"), `${agentInstructions}\n本次只实现基础报价，不增加折扣功能。修复版保持原业务和原必需断言，健康响应检查当前lifecycle.revision。测试名应是稳定标识，不把修订号写入测试名。joint.test.mjs必须从process.env.SEAM_SERVICE_URL和Number(process.env.SEAM_REVISION)获取端点和批准修订，首次生成后修复金额错误无需修改测试文件。共同契约用httpDefinitions只定义一次完整独立业务规范，每方acceptanceCases用httpCheckRefs引用（id是本方检查ID，definitionId指向共用规范ID），不重复生成两份定义。独立业务检查：POST /quote，请求JSON字符串{\"sku\":\"SKU-001\",\"quantity\":2}，expectedStatus=200，bodyChecks为subtotal=24000及currency=CNY，publisherParticipantId为提供方，serviceName=quote。testChanges=[]，修复保留原独立检查。effectiveRequirements将正常报价、数量边界、未知SKU、畸形JSON分别列稳定ID，verification=http，公开就绪协议单列verification=review；共用httpDefinitions覆盖两SKU正常金额、quantity=0和101及字符串/空值、未知SKU、畸形JSON原始正文，requirementIds引用各对应HTTP要求。每个httpDefinitions定义还须headerChecks=[{name:"content-type",includes:"application/json"}]，错误响应bodyAssertions=[{path:"error",type:"string",nonEmpty:true}]，emptyBody=false，正常请求bodyAssertions=[]。每端的factRefs引用quote.contractVersion；修复继续保留此引用，由平台自动安排来源核验，不重复改写既有计划。修复计划优先plan.amend，协调方优先plan.patch，保留未变HTTP规范及引用；仅修复提供方金额故障时，提供方responsibilities.mode=implement，消费方实现与原测试无需改动则mode=verify_only，并将双方本轮责任步骤更新为修复或核对复用。两端仍各自执行新的联合验证，管理员批准前不运行验证。joint_verifying只运行既有脚本并真实报告，不修改代码、测试或业务目标。失败用integration.report failed，平台只读起草修复方案，管理员批准前不再实施验证。\n${role === "consumer" ? "本项目没有提供方公开contractVersion的值。提交本方plan.submit前须先查本地和共享资料，缺失时使用information.request询证提供方；不能猜测值或要求管理员填。收到答复后复用并把contractVersion及当前revision一起列入就绪契约和实际HTTP联合测试。" : "本方公开协议事实保存在docs/integration-facts.json。"}`);
       if (role === "provider") { await mkdir(join(root,"docs")); await writeFile(join(root,"docs/integration-facts.json"),JSON.stringify({contractVersion})); }
     }
     await exec("git", ["init", "--quiet", root]);
@@ -367,7 +377,7 @@ async function executeWorkflow(initial) {
     catch{assert.ok(state.revision===1||state.revision===2&&!state.approvedHash,"a restart cannot invent an old pre-approval snapshot");implementationBaseline=await Promise.all(locals.map(local=>snapshot(local.root)));await writeFile(join(runRoot,"revision-1-implementation-baseline.json"),JSON.stringify(implementationBaseline,null,2));}
     if(state.revision===1||state.revision===2&&["planning","plan_synthesis","plan_confirmation","awaiting_approval"].includes(state.phase)) {
       ready=state.revision===2&&state.phase==="awaiting_approval"?current:await runUntilPhase("awaiting_approval",2);
-      const repair=lifecycle(ready);assert.equal(repair.revision,2);assert.equal(repair.repair.sourceRevision,1);assert.equal(repair.approvedHash,null);await assertNoUnapprovedWrites(implementationBaseline);
+      const repair=lifecycle(ready);assert.equal(repair.contract.responsibilities.find(row=>row.participantId===createdParticipantId)?.mode,"verify_only","unchanged consumer must use approved verify-only reuse");assert.equal(repair.revision,2);assert.equal(repair.repair.sourceRevision,1);assert.equal(repair.approvedHash,null);await assertNoUnapprovedWrites(implementationBaseline);
       await new Promise(resolve=>setTimeout(resolve,2000));await assertNoUnapprovedWrites(implementationBaseline);
       await api.expect(`/api/collaborations/${collaborationId}/lifecycle`,{action:"approve",revision:1,documentHash:repair.baseline.documentHash},409);
       await api.expect(`/api/collaborations/${collaborationId}/test-runs`,{participantId:createdParticipantId},409);
@@ -417,6 +427,8 @@ async function finishSimulation(ready,revisionCount) {
   await assertNoUnapprovedWrites(beforeTermination);
   checks.push(`管理员终止后无运行任务，禁止继续派发/批准，${locals[0].agent.token ? "旧回执409" : "无认证回执401"}被拒绝，项目文件保持不变`);
 
+  if(process.env.SEAM_SIMULATION_CHAOS==="true"){const recovery=JSON.parse(await readFile(join(runRoot,"interrupted-execution-confirmation.json"),"utf8"));assert.ok(recovery.noWritesBeforeRecoveryConfirmation);}
+  assert.equal(lifecycle(terminated).finalDecision?.outcome,"accepted");
   await pollMilestones();assert.deepEqual(await buildSnapshot(),frozenBuild,"source changed during cold acceptance run");
   const executions=[];let cursor=0,more=true;
   while(more){const page=await api.call(`/api/collaborations/${collaborationId}/executions?after=${cursor}&limit=200`,undefined,{method:"GET"});executions.push(...page.executions);cursor=page.nextCursor;more=page.hasMore;}
@@ -466,14 +478,16 @@ async function launchController(initial){
 }
 
 process.on('message',async message=>{
- if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==='1'||message?.action!=='restart-provider')return;
+ if(process.env.SEAM_SIMULATION_CONTROLLER_WORKER==='1'||!['restart-provider','restart-consumer'].includes(message?.action))return;
  try{
-  const index=workers.findIndex(worker=>worker.local.role==='provider'),worker=workers[index];assert.ok(worker);
-  const detail=await api.detail(collaborationId);assert.ok(!detail.jobs.some(job=>job.agentId===worker.local.agent.id&&['pending','running'].includes(job.status)),'only the owned idle provider may restart');
-  await stopOwned(worker.record);await awaitOwnedExit(worker.record);workers.splice(index,1);delete worker.local.worker;await startConnectors([worker.local]);
-  const saved=await readPrivate(runRoot,'bootstrap.json');saved.locals=locals;await savePrivate(runRoot,'bootstrap.json',saved);await recoveryEvent({event:'connector-restarted',role:'provider',oldPid:worker.record.pid,newPid:worker.local.worker.pid});
-  process.send?.({event:'provider-restarted',oldPid:worker.record.pid,newPid:worker.local.worker.pid});
- }catch(error){process.send?.({event:'provider-restart-failed',error:String(error)});}
+  const role=message.action==='restart-consumer'?'consumer':'provider';
+  const index=workers.findIndex(worker=>worker.local.role===role),worker=workers[index];assert.ok(worker);
+  const detail=await api.detail(collaborationId);if(role==='provider')assert.ok(!detail.jobs.some(job=>job.agentId===worker.local.agent.id&&['pending','running'].includes(job.status)),'only the owned idle provider may restart');
+  else assert.ok(process.env.SEAM_SIMULATION_CHAOS==='true'&&detail.lifecycle.phase==='executing'&&detail.lifecycle.revision===1,'busy fault only on this dedicated first approved execution');
+  await stopOwned(worker.record,role==='consumer'?'SIGKILL':'SIGTERM');await awaitOwnedExit(worker.record);workers.splice(index,1);delete worker.local.worker;await startConnectors([worker.local]);
+  const saved=await readPrivate(runRoot,'bootstrap.json');saved.locals=locals;await savePrivate(runRoot,'bootstrap.json',saved);await recoveryEvent({event:'connector-restarted',role,oldPid:worker.record.pid,newPid:worker.local.worker.pid});
+  process.send?.({event:role==='consumer'?'consumer-restarted':'provider-restarted',oldPid:worker.record.pid,newPid:worker.local.worker.pid});
+ }catch(error){process.send?.({event:'connector-restart-failed',error:String(error)});}
 });
 
 async function loginReady(){let last;for(let attempt=0;attempt<8;attempt++){try{await waitReady();await api.loginOwner();return;}catch(error){last=error;if(/HTTP (401|403|422)/.test(String(error)))throw error;await new Promise(resolve=>setTimeout(resolve,Math.min(5000,500*(attempt+1))));}}throw last;}

@@ -8,6 +8,7 @@ import type { ConnectorConfig } from "./config.js";
 export type JournalEntry = {
   jobId: string; attempts: number; state: "running" | "pending" | "acknowledged" | "rejected";
   result?: Record<string, unknown>; error?: string; rejection?: string; updatedAt: string;
+  recoveryKey?: string;
 };
 export type ControlReceipt = { jobId: string; attempts: number; state: "pending" | "acknowledged" | "rejected"; reason?: string };
 export type ExecutionCheckpoint = {
@@ -38,11 +39,17 @@ export class ExecutionJournal {
     const entries = await Promise.all(files.map((name) => this.read(name.slice(0, -5))));
     return entries.filter((entry): entry is JournalEntry => entry?.state === "pending");
   }
-  async begin(job: ConnectorJob) {
+  async running() {
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    const names = (await readdir(this.directory)).filter(name => /^[a-f0-9-]{36}\.json$/i.test(name));
+    const entries = await Promise.all(names.map(name => this.read(name.slice(0,-5))));
+    return entries.filter((entry): entry is JournalEntry & { recoveryKey:string } => entry?.state === "running" && typeof entry.recoveryKey === "string");
+  }
+  async begin(job: ConnectorJob, recoveryKey?: string) {
     const entry = await this.read(job.id);
     if (entry?.state === "running") throw new Error("此任务上次执行中断，完成状态未知。已阻止自动重复实施，请核对本地修改及日志后继续新任务。");
     if (entry) return entry;
-    await this.save({ jobId: job.id, attempts: job.attempts, state: "running" });
+    await this.save({ jobId: job.id, attempts: job.attempts, state: "running", recoveryKey });
     return null;
   }
   private async write(name: string, value: unknown) {

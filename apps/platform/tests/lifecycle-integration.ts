@@ -49,7 +49,7 @@ async function register(label: string): Promise<Local> {
   return { projectId: project.id, agentId: agent.id, token: agent.token };
 }
 async function claim(local: Local): Promise<Claimed> {
-  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: 8, supportsInformationLookup: true }, { token: local.token });
+  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: 9, supportsInformationLookup: true }, { token: local.token });
   assert.ok(result.job, "the platform must automatically enqueue the expected turn");
   return result.job;
 }
@@ -79,7 +79,7 @@ async function main() {
   await expected("/api/collaborations", create, 409);
   const listed = await api("/api/collaborations", undefined, { method: "GET" });
   assert.ok(!listed.collaborations.some((row: any) => row.collaboration.title === create.title));
-  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 8 } }, { token: local.token });
+  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 9 } }, { token: local.token });
   const created = await api("/api/collaborations", create);
   const path = `/api/collaborations/${created.id}`;
   const detail = () => api(path, undefined, { method: "GET" });
@@ -198,7 +198,7 @@ async function main() {
   for (const local of [first]) { const job = await claim(local); await complete(local, job, jointAction(job, "passed")); }
   assert.equal((await detail()).lifecycle.phase, "awaiting_review");
   await expected(`${path}/lifecycle`, { action: "terminate", revision: 2 }, 403, { session: memberCookie });
-  await lifecycle({ action: "terminate", revision: 2 });
+  await lifecycle({ action: "terminate", revision: 2, decision: "accepted", reportHash: (await detail()).lifecycle.reportHash });
   await expected(`${path}/dispatch`, { autoAdvance: true }, 409);
   assert.equal((await detail()).collaboration.status, "completed");
   checks.push("未执行留在原修订，普通成员不能批准重试；管理员确认后只重跑受影响一方，失败报告完整归档，手动终止后不派发");

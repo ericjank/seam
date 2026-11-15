@@ -58,7 +58,8 @@ export class SimulationApi {
     return this.call(`/api/collaborations/${id}`, undefined, { method: "GET" });
   }
 
-  lifecycle(id, body) {
+  async lifecycle(id, body) {
+    if(body.action==="terminate"&&body.decision===undefined){const {lifecycle}=await this.detail(id);const accepted=lifecycle.phase==="awaiting_review"&&lifecycle.integrationReports.length&&lifecycle.integrationReports.every(row=>row.checks.every(check=>check.status==="passed"));body={...body,revision:lifecycle.revision,decision:accepted?"accepted":"stopped",reportHash:lifecycle.reportHash??null};}
     return this.call(`/api/collaborations/${id}/lifecycle`, body);
   }
 

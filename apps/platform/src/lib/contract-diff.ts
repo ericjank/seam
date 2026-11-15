@@ -1,3 +1,4 @@
+import { expandSharedContract } from "@seam/protocol";
 import type { SharedContract } from "@seam/protocol";
 
 /** Compare content by stable identity, including edits that keep the same ID. */
@@ -13,7 +14,7 @@ export function contractChanges(previous: SharedContract, current: SharedContrac
     ...contract.interfaces.map((item): [string, string] => [`接口 ${item.id}`, item.definition]),
     ...contract.responsibilities.map((item): [string, string] => [`职责 ${item.participantId}`, item.changes]),
     ...contract.acceptanceCases.map((item): [string, string] => [`用例 ${item.id}`, `${item.runnerParticipantId}\n${item.description}\n${item.command}\n${item.expectedResult}\n${item.requiredAssertions?.join("\n") ?? "历史用例未声明完整断言集"}`]),
-    ...contract.acceptanceCases.flatMap(item => (item.httpChecks ?? []).map((check): [string, string] => [`独立HTTP ${item.id}/${check.id}`, JSON.stringify(check, null, 2)])),
+    ...expandSharedContract(contract).acceptanceCases.flatMap(item => (item.httpChecks ?? []).map((check): [string, string] => [`独立HTTP ${item.id}/${check.id}`, JSON.stringify(check, null, 2)])),
   ]);
   const before = entries(previous), after = entries(current);
   return [...new Set([...before.keys(), ...after.keys()])].filter((key) => before.get(key) !== after.get(key)).map((key) => ({ key, before: before.get(key) ?? "（无）", after: after.get(key) ?? "（已移除）" }));

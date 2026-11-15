@@ -21,6 +21,8 @@ Seam is an Agent collaboration platform for independent projects. Source code an
 - Local test evidence, generic task acceptance, and a Chinese web interface.
 - MySQL persistence, invite-only users, three-level access control, and audit logs.
 
+The latest recovery, final acceptance, credential-safe evidence and unchanged-participant verification rules are documented in [六项完善与验收](docs/六项完善与验收.md).
+
 ## Usage scenarios
 
 ### Different teams and AI tools building the frontend and backend

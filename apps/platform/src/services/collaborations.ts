@@ -27,6 +27,7 @@ import { listProjects } from "./projects";
 import { HttpError } from "@/lib/http";
 import { getLifecycleContext } from "./lifecycle";
 import { hasLegacyDispatch, recoverDispatchNames } from "@/lib/dispatch-message";
+import { recoverySummary } from "@/lib/recovery-summary";
 
 async function resolveProjectAgent(projectId: string, agentId?: string) {
   const candidates = await db.select({ id: agents.id }).from(agents).where(eq(agents.projectId, projectId));
@@ -214,9 +215,9 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     auditEvents: auditRows,
     availableProjects,
     jobs: jobRows.map(({ result, ...job }) => {
-      const record = result as { conversation?: { threadId?: unknown; transport?: unknown; title?: unknown; runLabel?: unknown }; telemetry?: unknown;provenance?:{connector?:{sourceId?:string};platform?:{sourceId?:string};protocolVersion?:number} } | null;
+      const record = result as { recovery?: unknown; conversation?: { threadId?: unknown; transport?: unknown; title?: unknown; runLabel?: unknown }; telemetry?: unknown;provenance?:{connector?:{sourceId?:string};platform?:{sourceId?:string};protocolVersion?:number} } | null;
       const conversation = record?.conversation, telemetry = adapterTelemetrySchema.safeParse(record?.telemetry);
-      return { ...job, provenance:record?.provenance?{connectorSourceId:/^[a-f0-9]{64}$/.test(record.provenance.connector?.sourceId??"")?record.provenance.connector!.sourceId!:"unknown",platformSourceId:/^[a-f0-9]{64}$/.test(record.provenance.platform?.sourceId??"")?record.provenance.platform!.sourceId!:"unknown",protocolVersion:record.provenance.protocolVersion}:null, telemetry: telemetry.success ? telemetry.data : null, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)
+      return { ...job, recovery: recoverySummary(record?.recovery), provenance:record?.provenance?{connectorSourceId:/^[a-f0-9]{64}$/.test(record.provenance.connector?.sourceId??"")?record.provenance.connector!.sourceId!:"unknown",platformSourceId:/^[a-f0-9]{64}$/.test(record.provenance.platform?.sourceId??"")?record.provenance.platform!.sourceId!:"unknown",protocolVersion:record.provenance.protocolVersion}:null, telemetry: telemetry.success ? telemetry.data : null, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)
         ? { threadId: conversation.threadId, transport: "codex-app-server" as const, title: typeof conversation.title === "string" ? conversation.title.slice(0, 200) : "本机 Codex 对话", runLabel: typeof conversation.runLabel === "string" ? conversation.runLabel.slice(0, 40) : "" } : null };
     }),
     connectorCapabilities: agentIds.flatMap((agentId) => {

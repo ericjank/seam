@@ -11,7 +11,7 @@ const inputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("start") }),
   z.object({ action: z.literal("approve"), revision: z.number().int().positive(), documentHash: z.string().regex(/^[a-f0-9]{64}$/) }),
   z.object({ action: z.literal("append"), requirements: z.string().trim().min(1).max(50_000) }),
-  z.object({ action: z.literal("terminate"), revision: z.number().int().positive().optional() }),
+  z.object({ action: z.literal("terminate"), revision: z.number().int().positive().optional(), decision: z.enum(["accepted", "stopped"]).optional(), reportHash: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional() }),
   z.object({ action: z.literal("pause") }),
   z.object({ action: z.literal("resume"), resolution: z.string().trim().min(1).max(5000).optional() }),
   z.object({ action: z.literal("retry-information"), requestId: z.string().uuid() }),

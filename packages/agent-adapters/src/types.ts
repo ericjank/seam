@@ -30,6 +30,8 @@ export interface AgentRunInput {
 export interface AgentAdapter {
   readonly type: AdapterType;
   run(input: AgentRunInput): Promise<AgentTurnResult>;
+  /** Read-only reconciliation of an existing turn, never starts a model turn. */
+  recover?(input: AgentRunInput): Promise<{ state: "completed" | "interrupted" | "unresolved"; result?: AgentTurnResult; threadId?: string; turnId?: string; reason: string }>;
   healthCheck(projectRoot: string): Promise<{ ok: boolean; detail: string }>;
   /** Actual local transport metadata, never supplied by model-generated text. */
   getConversation?(input: AgentRunInput): Promise<{ threadId: string; transport: "codex-app-server"; title?: string; runLabel?: string } | null>;

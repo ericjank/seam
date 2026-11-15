@@ -24,7 +24,7 @@ export function ProjectManager({ rows }: { rows: ProjectRow[] }) {
   }
   return <div className="stack">
     {error && <div className="notice error">{error}</div>}
-    {token && <div className="notice success">
+    {token && <div className="notice success" data-sensitive>
       <strong>Agent Token 只显示这一次，请立即保存。</strong>
       <div className="code">SEAM_AGENT_ID={token.agentId}{"\n"}SEAM_AGENT_TOKEN={token.value}{"\n"}SEAM_PLATFORM_URL=http://localhost:3000{"\n"}SEAM_PROJECT_ROOT=/path/to/private/project</div>
     </div>}

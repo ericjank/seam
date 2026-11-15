@@ -156,7 +156,7 @@ export const acceptanceSubmitActionSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
 });
 
-export const CONNECTOR_PROTOCOL_VERSION = 8;
+export const CONNECTOR_PROTOCOL_VERSION = 9;
 export const testFileSchema = z.object({ path: z.string().min(1).max(1000), sha256: z.string().length(64) });
 export const httpCheckSchema = z.object({
   requirementIds: z.array(z.string().min(1).max(100)).min(1).max(200).optional(),
@@ -191,12 +191,14 @@ export const sharedContractSchema = z.object({
   serviceExpectations: z.array(serviceExpectationSchema).max(30).optional(),
   scope: z.string().min(20).max(20_000),
   interfaces: z.array(z.object({ id: z.string().min(1).max(100), definition: z.string().min(20).max(20_000) })).min(1).max(30),
-  responsibilities: z.array(z.object({ participantId: idSchema, changes: z.string().min(20).max(20_000) })).min(2).max(50),
+  responsibilities: z.array(z.object({ participantId: idSchema, changes: z.string().min(20).max(20_000), mode: z.enum(["implement", "verify_only"]).optional() })).min(2).max(50),
+  httpDefinitions: z.array(httpCheckSchema).max(3000).optional(),
   acceptanceCases: z.array(z.object({
     id: z.string().min(1).max(100), runnerParticipantId: idSchema,
     description: z.string().min(10).max(5000), command: z.string().min(1).max(2000), expectedResult: z.string().min(1).max(5000),
     requiredAssertions: z.array(z.string().min(1).max(500)).min(1).max(100).optional(),
     httpChecks: z.array(httpCheckSchema).max(30).optional(),
+    httpCheckRefs: z.array(z.object({ id: z.string().min(1).max(100), definitionId: z.string().min(1).max(100) })).max(30).optional(),
   })).min(2).max(100),
   risks: z.string().min(1).max(10_000),
   changeSummary: z.string().min(10).max(10_000),
@@ -205,6 +207,36 @@ export const sharedContractSchema = z.object({
   testChanges: z.array(z.object({ participantId: idSchema, path: z.string().min(1).max(1000), reason: z.string().min(10).max(5000) })).max(500).optional(),
 });
 export type SharedContract = z.infer<typeof sharedContractSchema>;
+/** Expand only at the execution/rendering boundary; canonical storage uses references. */
+export function expandSharedContract(contract: SharedContract): SharedContract {
+  const definitions = new Map((contract.httpDefinitions ?? []).map(definition => [definition.id, definition]));
+  if (definitions.size !== (contract.httpDefinitions ?? []).length) throw new Error("HTTP规范ID重复");
+  return { ...contract, acceptanceCases: contract.acceptanceCases.map(item => {
+    if (item.httpCheckRefs === undefined) return item;
+    if (item.httpChecks?.length) throw new Error("HTTP检查不得同时使用内联定义和引用");
+    const httpChecks = item.httpCheckRefs.map(ref => {
+      const definition = definitions.get(ref.definitionId);
+      if (!definition) throw new Error(`HTTP规范引用不存在：${ref.definitionId}`);
+      return { ...definition, id: ref.id };
+    });
+    return { ...item, httpChecks, httpCheckRefs: undefined };
+  }) };
+}
+export function normalizeSharedContract(contract: SharedContract): SharedContract {
+  const expanded = expandSharedContract(contract), definitions: NonNullable<SharedContract["httpDefinitions"]> = [];
+  const signatures = new Map<string, string>();
+  const acceptanceCases = expanded.acceptanceCases.map(item => {
+    const { httpChecks, httpCheckRefs: _refs, ...rest } = item;
+    const refs = (httpChecks ?? []).map(check => {
+      const { id, ...spec } = check, signature = JSON.stringify(spec);
+      let definitionId = signatures.get(signature);
+      if (!definitionId) { definitionId = `HTTP-${definitions.length + 1}`; signatures.set(signature, definitionId); definitions.push({ ...spec, id: definitionId }); }
+      return { id, definitionId };
+    });
+    return { ...rest, httpCheckRefs: refs };
+  });
+  return { ...contract, httpDefinitions: definitions, acceptanceCases };
+}
 // A patch must preserve omitted fields; a full-contract default must never
 // turn an omitted list into an explicit replacement with an empty list.
 export const contractDeltaSchema = sharedContractSchema.omit({ effectiveRequirements: true, retiredRequirements: true, retainedDecisions: true })
@@ -310,6 +342,9 @@ export function lifecycleActions(phase: string, informationOnly = false): string
   return actions[phase] ? [...actions[phase]!, "workflow.blocked", "information.request"] : [];
 }
 export const lifecycleContextSchema = z.object({
+  reportHash: z.string().length(64).nullable().optional(),
+  finalDecision: z.object({ outcome: z.enum(["accepted", "stopped"]), revision: z.number(), reviewedReportHash: z.string().length(64).nullable(), sealedReportHash: z.string().length(64), documentHash: z.string().nullable(), decidedById: idSchema, decidedAt: z.string() }).nullable().optional(),
+  executionReuse: z.array(z.object({ participantId: idSchema, sourceRevision: z.number(), sourceDocumentHash: z.string().length(64), sourceReportHash: z.string().length(64), workspace: workspaceBaselineSchema, testFiles: z.array(testFileSchema) })).optional(),
   retryBudget: retryBudgetStateSchema.optional(),
   factBindings: z.array(factBindingSchema).max(200).optional(),
   approvalPending: z.object({ documentHash: z.string(), requestedAt: z.string() }).nullable().optional(),

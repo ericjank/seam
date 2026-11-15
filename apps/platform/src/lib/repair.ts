@@ -1,8 +1,9 @@
-import { canonicalJson, type LifecycleContext, type SharedContract } from "@seam/protocol";
+import { expandSharedContract, canonicalJson, type LifecycleContext, type SharedContract } from "@seam/protocol";
 import { HttpError } from "./http";
 
 /** A repair must not pass by discarding the agreed business coverage. */
 export function validateRepairContract(previous: SharedContract, current: SharedContract) {
+  previous = expandSharedContract(previous); current = expandSharedContract(current);
   const priorIds = previous.effectiveRequirements?.map(row => row.id) ?? [];
   const ids = current.effectiveRequirements?.map(row => row.id) ?? [];
   if (priorIds.length && (ids.length !== priorIds.length || priorIds.some(id => !ids.includes(id)) || current.retiredRequirements?.length)) throw new HttpError(422, "修复方案须沿用原有效要求ID，不得借修复撤销或增加业务目标；目标变更请由管理员追加");

@@ -38,7 +38,7 @@ describe("固定Connector独立验收与自动回执",()=>{
   const ctx=context(),signal=new AbortController().signal;
   const run=captureCommand({id:"observed",command:"node --test joint.test.mjs",exitCode:0,output:"TAP version 13\nok 1 - quote amount\n"},"","local-test")!;
   let results=await runIndependentChecks(ctx,true,signal);expect(results[0]!.status).toBe("failed");expect(results[0]!.specHash).toHaveLength(64);
-  expect((buildConfiguredIntegrationReport(ctx,"node --test joint.test.mjs",[run],results)!.actions[0] as any).checks[0]).toMatchObject({status:"failed",category:"code"});
+  const failure=(buildConfiguredIntegrationReport(ctx,"node --test joint.test.mjs",[run],results)!.actions[0] as any).checks[0];expect(failure).toMatchObject({status:"failed",category:"code"});expect(failure.summary).toContain("subtotal 期望24000，实际24001");expect(failure.evidence.rootCauses[0].publisherParticipantId).toBe(b);
   subtotal=24000;results=await runIndependentChecks(ctx,true,signal);expect(results[0]).toMatchObject({status:"passed",documentHash:hash,actualStatus:200});
   const receipt=buildConfiguredIntegrationReport(ctx,"node --test joint.test.mjs",[run],results)!;expect((receipt.actions[0] as any).checks[0]).toMatchObject({status:"passed",runIds:[run.id]});
   expect(buildConfiguredIntegrationReport(ctx,"some-other-local-command",[run],results)).toBeNull();

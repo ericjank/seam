@@ -1,7 +1,9 @@
+import { expandSharedContract } from "@seam/protocol";
 import type { LifecycleContext, SharedContract } from "@seam/protocol";
 import { HttpError } from "./http";
 
 export function validateSharedContract(contract: SharedContract, required: string[], previous?: SharedContract | null, requireIndependent = false, requireCoverage = false, requireResponseAssertions = false) {
+  try { contract = expandSharedContract(contract); } catch { throw new HttpError(422, "HTTP规范引用无效或重复，不能生成开发文档"); }
   const unique = (values: string[]) => new Set(values).size === values.length;
   const owners = contract.responsibilities.map((item) => item.participantId);
   if (!unique(owners) || owners.length !== required.length || required.some((id) => !owners.includes(id))) throw new HttpError(422, "统一契约必须且只能包含每个指定参与方的一份责任划分");
@@ -68,7 +70,7 @@ export function renderSharedContract(input: {
   contract: SharedContract; previous?: SharedContract | null;
   factBindings?: NonNullable<LifecycleContext["factBindings"]>; names: Map<string, string>; baselines: LifecycleContext["contributions"];
 }) {
-  const c = input.contract;
+  const c = expandSharedContract(input.contract);
   const name = (id: string) => `${input.names.get(id) ?? id}（${id}）`;
   const definitions: Array<{ id: string; check: NonNullable<SharedContract["acceptanceCases"][number]["httpChecks"]>[number] }> = [];
   const references = new Map<string,string>();
@@ -87,7 +89,7 @@ export function renderSharedContract(input: {
     `## 本轮引用的共享事实\n\n${input.factBindings?.map(fact=>`${fact.key}：${fact.value}；来源指纹=${fact.sourceHash}`).join("\n\n") || "未引用共享事实"}\n\n来源由拥有端核验并绑定本修订，变化后重新起草；管理员批准仅对本文档hash有效。`,
     `## 实施范围\n\n${c.scope}`,
     `## 唯一接口契约\n\n${c.interfaces.map((item) => `### ${item.id}\n\n${item.definition}`).join("\n\n")}`,
-    `## 项目责任与实施步骤\n\n${c.responsibilities.map((item) => `### ${name(item.participantId)}\n\n${item.changes}`).join("\n\n")}`,
+    `## 项目责任与实施步骤\n\n${c.responsibilities.map((item) => `### ${name(item.participantId)} · ${item.mode === "verify_only" ? "仅验证，复用已核验实施" : "实施并验证"}\n\n${item.changes}`).join("\n\n")}`,
     `## 联合验收\n\n${c.acceptanceCases.map((item) => `### ${item.id} · ${name(item.runnerParticipantId)}\n\n${item.description}\n\n执行命令：${item.command}\n\n预期：${item.expectedResult}\n\n必需成功断言：${item.requiredAssertions?.join("；") ?? "历史文档未声明完整断言集"}\n\n独立HTTP检查：${item.httpChecks?.map(check=>`${check.id} → ${references.get(`${item.id}/${check.id}`)}`).join("；") || "未声明；该用例仅有命令证据"}`).join("\n\n")}\n\n命令由本机 Agent 按本地权限核对执行，平台不直接执行远程文本。每端独立执行其引用的全部HTTP检查，规范相同仅在文档中共用定义；实际结果分别保存。$SEAM_REVISION绑定当前批准修订。`,
     `## 完整HTTP检查定义（相同规范只列一次）\n\n${definitions.map(({id,check})=>`### ${id}\n服务：${name(check.publisherParticipantId)} / ${check.serviceName}；${check.method} ${check.path}\n原始请求正文：${check.requestBody === null ? "无" : JSON.stringify(check.requestBody)}\n预期状态：${check.expectedStatus}；关联要求：${check.requirementIds?.join("、") ?? "历史未声明"}\n字段精确值：${check.bodyChecks.map(field=>`${field.path}=${JSON.stringify(field.equals)}`).join("；") || "无"}\n字段类型：${check.bodyAssertions?.map(field=>`${field.path}:${field.type}${field.nonEmpty?"，非空":""}`).join("；") || "无"}\n响应头：${check.headerChecks?.map(header=>`${header.name} 包含 ${JSON.stringify(header.includes)}`).join("；") || "未声明"}\n空正文：${check.emptyBody===true?"必须为空":"未要求"}`).join("\n\n") || "没有独立HTTP检查"}`,
     `## 需求与独立检查覆盖\n\n${c.effectiveRequirements?.map(requirement=>`${requirement.id}：${requirement.verification??"历史未声明"}；${requirement.verification==="http"?c.acceptanceCases.flatMap(item=>(item.httpChecks??[]).filter(check=>check.requirementIds?.includes(requirement.id)).map(check=>`${item.id}/${check.id}`)).join("、")||"无独立覆盖": "由对应项目命令或双方审阅确认"}`).join("\n\n")??"历史文档未声明"}`,

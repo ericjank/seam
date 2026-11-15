@@ -120,3 +120,7 @@ describe("Native response schema", () => {
     expect(result.actions[0]?.type).toBe("artifact.upsert");
   });
 });
+
+it('协议9的Native契约只提供共享HTTP定义和各端引用，所有对象仍严格封闭',()=>{
+ const value=input('plan_synthesis');value.context!.lifecycle!.protocolVersion=9;const schema=buildNativeOutputSchema(value);inspectStrictObjects(schema);const text=JSON.stringify(schema);expect(text).toContain('httpDefinitions');expect(text).toContain('httpCheckRefs');expect(text).not.toContain('"httpChecks"');expect(text).toContain('verify_only');
+});

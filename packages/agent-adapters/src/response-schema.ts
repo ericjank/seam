@@ -12,16 +12,20 @@ const category = z.enum(["code", "environment", "missing_information", "authoriz
 const nativeSource = informationSourceSchema.omit({ contentHash: true, sourceVersion: true }).extend({ sourceVersion: z.string().max(200).nullable() }).strict();
 const factRefs=z.array(z.string().min(1).max(200)).max(200);
 const nativeHttpCheck=sharedContractSchema.shape.acceptanceCases.element.shape.httpChecks.unwrap().element.required();
-const nativeCases = z.array(sharedContractSchema.shape.acceptanceCases.element.extend({httpChecks:z.array(nativeHttpCheck).max(30)}).required()).min(2).max(100);
-const nativeContract = sharedContractSchema.extend({ acceptanceCases: nativeCases, effectiveRequirements:z.array(sharedContractSchema.shape.effectiveRequirements.unwrap().element.required()).min(1).max(200) }).required();
+const nativeCases = z.array(sharedContractSchema.shape.acceptanceCases.element.omit({httpChecks:true}).required()).min(2).max(100);
+const nativeContract = sharedContractSchema.extend({ httpDefinitions:z.array(nativeHttpCheck).max(3000), responsibilities:z.array(sharedContractSchema.shape.responsibilities.element.required()).min(2).max(50), acceptanceCases: nativeCases, effectiveRequirements:z.array(sharedContractSchema.shape.effectiveRequirements.unwrap().element.required()).min(1).max(200) }).required();
 const nativeDelta = z.object({
   scope: sharedContractSchema.shape.scope.nullable(), interfaces: sharedContractSchema.shape.interfaces.nullable(),
-  responsibilities: sharedContractSchema.shape.responsibilities.nullable(), acceptanceCases: nativeCases.nullable(),
+  responsibilities: z.array(sharedContractSchema.shape.responsibilities.element.required()).min(2).max(50).nullable(), httpDefinitions: z.array(nativeHttpCheck).max(3000).nullable(), acceptanceCases: nativeCases.nullable(),
   serviceExpectations: sharedContractSchema.shape.serviceExpectations.unwrap().nullable(),
   risks: sharedContractSchema.shape.risks.nullable(), changeSummary: sharedContractSchema.shape.changeSummary,
   impactedParticipantIds: sharedContractSchema.shape.impactedParticipantIds, retainedDecisions: z.array(z.string().min(1).max(5000)).max(100).nullable(),
   testChanges: sharedContractSchema.shape.testChanges.unwrap().nullable(), factRefs:factRefs.nullable(),
 }).strict();
+
+const legacyCases=z.array(sharedContractSchema.shape.acceptanceCases.element.omit({httpCheckRefs:true}).extend({httpChecks:z.array(nativeHttpCheck).max(30)}).required()).min(2).max(100);
+const legacyContract=nativeContract.omit({httpDefinitions:true}).extend({acceptanceCases:legacyCases,responsibilities:z.array(sharedContractSchema.shape.responsibilities.element.omit({mode:true})).min(2).max(50)});
+const legacyDelta=nativeDelta.omit({httpDefinitions:true}).extend({acceptanceCases:legacyCases.nullable(),responsibilities:z.array(sharedContractSchema.shape.responsibilities.element.omit({mode:true})).min(2).max(50).nullable()});
 
 // Native Structured Outputs require every property to be required and every
 // object to be closed. Nullable placeholders model protocol optional fields;
@@ -52,8 +56,8 @@ function nativeResponseSchema(input: AgentRunInput) {
     switch (lifecycle.paused ? "paused" : lifecycle.phase) {
       case "planning": actions = lifecycle.repair ? [z.object({ type: z.literal("plan.amend"), revision: z.literal(lifecycle.revision), changes: z.string().min(20).max(20_000), factRefs }).strict()] : [submit]; break;
       case "plan_synthesis":
-        actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: nativeContract }).strict()];
-        if (lifecycle.repair && lifecycle.baseline?.documentHash) actions = [z.object({ type: z.literal("plan.patch"), revision: z.literal(lifecycle.revision), baseDocumentHash: z.literal(lifecycle.documentHash ?? lifecycle.baseline.documentHash), delta: nativeDelta }).strict()];
+        actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: (lifecycle.protocolVersion??1)>=9?nativeContract:legacyContract }).strict()];
+        if (lifecycle.repair && lifecycle.baseline?.documentHash) actions = [z.object({ type: z.literal("plan.patch"), revision: z.literal(lifecycle.revision), baseDocumentHash: z.literal(lifecycle.documentHash ?? lifecycle.baseline.documentHash), delta: (lifecycle.protocolVersion??1)>=9?nativeDelta:legacyDelta }).strict()];
         break;
       case "plan_confirmation":
         actions = [submit];

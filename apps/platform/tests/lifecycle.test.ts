@@ -147,7 +147,7 @@ beforeEach(() => {
     participants: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id, collaborationId: "collab", projectId: `project-${id}`, agentId: `agent-${id}`, role: "participant", status: "active", createdAt: new Date() })),
     projects: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `project-${id}`, name: `项目 ${id}` })),
     agents: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `agent-${id}`, status: "online", lastSeenAt: new Date() })),
-    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:8,supportsInformationLookup:true}})),
+    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:9,supportsInformationLookup:true}})),
     collaboration_lifecycles: [], lifecycle_revisions: [], lifecycle_contributions: [], messages: [], connector_jobs: [],
   };
   vi.clearAllMocks();
@@ -316,7 +316,7 @@ describe("管理员控制的共同开发生命周期", () => {
     expect(next.requirements).toContain("增加幂等重试与回归验证");
     expect(state.rows.lifecycle_revisions![0]!.report).toBe(reviewed.report);
     await approved(2); await report("00000000-0000-4000-8000-000000000001", 2); await report("00000000-0000-4000-8000-000000000002", 2); await joint(2);
-    expect((await terminateLifecycle("admin", "collab", { revision: 2 })).phase).toBe("terminated");
+    expect((await terminateLifecycle("admin", "collab", { revision: 2, decision:"accepted", reportHash:(await getLifecycleContext("collab"))!.reportHash })).phase).toBe("terminated");
     expect(state.rows.collaborations![0]!.status).toBe("completed");
   });
 
@@ -386,7 +386,7 @@ describe("管理员控制的共同开发生命周期", () => {
     await approveLifecycle("admin","collab",{revision:2,documentHash:ready.documentHash!});
     await report(a,2);await report(b,2);await joint(2);
     expect((await getLifecycleContext("collab"))!.phase).toBe("awaiting_review");
-    expect((await terminateLifecycle("admin","collab",{revision:2})).phase).toBe("terminated");
+    expect((await terminateLifecycle("admin","collab",{revision:2,decision:"accepted",reportHash:(await getLifecycleContext("collab"))!.reportHash})).phase).toBe("terminated");
   });
 
   it("修复草案不得删验收覆盖；管理员可以停止草案而不重新执行", async () => {
@@ -396,7 +396,7 @@ describe("管理员控制的共同开发生命周期", () => {
     await submit(a,2);await submit(b,2);
     const weakened=structuredClone(old.contract!.acceptanceCases);weakened[0]!.requiredAssertions=["health only"];
     await expect(compose(2,"",{acceptanceCases:weakened})).rejects.toMatchObject({status:422});
-    expect((await terminateLifecycle("admin","collab",{revision:2})).phase).toBe("terminated");
+    expect((await terminateLifecycle("admin","collab",{revision:2,decision:"stopped",reportHash:(await getLifecycleContext("collab"))!.reportHash})).phase).toBe("terminated");
     expect(state.rows.lifecycle_revisions![0]!.report).toContain("存在失败或未执行用例");
     expect(state.rows.lifecycle_revisions![1]!.report).toContain("没有重新实施或验证");
   });

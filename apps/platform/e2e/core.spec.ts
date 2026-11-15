@@ -1,3 +1,4 @@
+import { capturePublicScreenshot } from "../../../scripts/evidence/public_screenshot.mjs";
 import { test, expect, type Page } from "@playwright/test";
 
 const email = process.env.SEAM_E2E_EMAIL ?? process.env.SEAM_SIMULATION_EMAIL ?? "owner@seam.test";
@@ -23,7 +24,7 @@ test.beforeAll(async ({ request }) => {
   } else expect(response.ok()).toBeTruthy();
 });
 
-test("登录、创建项目与 Agent、发起协作", async ({ page }) => {
+test("登录、创建项目与 Agent、发起协作", async ({ page }, testInfo) => {
   await page.goto("/login");
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("密码").fill(password);
@@ -44,6 +45,8 @@ test("登录、创建项目与 Agent、发起协作", async ({ page }) => {
   await page.getByRole("button", { name: "生成 Connector 凭据" }).click();
   await expect(page.getByText("Agent Token 只显示这一次，请立即保存。")).toBeVisible();
   const { agent } = await (await agentResponse).json();
+  await expect(page.locator("[data-sensitive]")).toBeVisible();
+  await capturePublicScreenshot(page,testInfo.outputPath("credential-panel-masked.png"),{fullPage:true});
   const targetProjectResponse = await page.request.post("/api/projects", { data: { name: `浏览器对接项目 ${suffix}`, description: "独立的合成对端" } });
   expect(targetProjectResponse.ok()).toBeTruthy();
   const { project: targetProject } = await targetProjectResponse.json();
@@ -51,7 +54,7 @@ test("登录、创建项目与 Agent、发起协作", async ({ page }) => {
   expect(targetAgentResponse.ok()).toBeTruthy();
   const { agent: targetAgent } = await targetAgentResponse.json();
   for (const connected of [agent, targetAgent]) {
-    const heartbeat = await page.request.post("/api/connectors/heartbeat", { data: { agentId: connected.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 8 } }, headers: { authorization: `Bearer ${connected.token}` } });
+    const heartbeat = await page.request.post("/api/connectors/heartbeat", { data: { agentId: connected.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 9 } }, headers: { authorization: `Bearer ${connected.token}` } });
     expect(heartbeat.ok()).toBeTruthy();
   }
 

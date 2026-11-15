@@ -5,6 +5,7 @@ import {createServer} from 'node:http';
 import {mkdtemp,writeFile,readFile,mkdir,readdir} from 'node:fs/promises';
 import {join} from 'node:path';import {tmpdir}from'node:os';import{fileURLToPath}from'node:url';
 import{SimulationApi}from'./http.mjs';import{launchOwned,stopOwned,processMatches}from'./owned-processes.mjs';
+const publicJournal=entry=>{const {recoveryKey,...publicEntry}=entry;return {...publicEntry,recoveryKeyPresent:Boolean(recoveryKey)};};
 const api=new SimulationApi(),cases=[],delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(predicate,description){const deadline=Date.now()+30_000;while(Date.now()<deadline){const value=await predicate();if(value)return value;await delay(100);}throw Error(description);}
 async function journal(root,jobId){for(const directory of await readdir(join(root,'state')).catch(()=>[])){try{return JSON.parse(await readFile(join(root,'state',directory,jobId+'.json'),'utf8'));}catch{}}return null;}
@@ -12,7 +13,7 @@ await api.loginOwner();
 for(const boundary of ['before_commit','after_commit_before_ack']){
  const root=await mkdtemp(join(tmpdir(),'seam-receipt-boundary-')),peer=await api.register('receipt-'+boundary+'-'+Date.now(),'generic-cli');let worker,proxy,collaborationId;
  try{
-  await api.call('/api/connectors/heartbeat',{agentId:peer.agent.id,capabilities:{adapter:'generic-cli',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:8}},{token:peer.agent.token});
+  await api.call('/api/connectors/heartbeat',{agentId:peer.agent.id,capabilities:{adapter:'generic-cli',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:9}},{token:peer.agent.token});
   const created=await api.call('/api/collaborations',{projectId:peer.project.id,objective:'显式合成协议夹具：只验证回执提交边界，不代表真实业务或模型执行'});collaborationId=created.id;await api.call(`/api/collaborations/${collaborationId}/dispatch`,{autoAdvance:false});
   let intercepted=false,allowDelivery=false,upstreamCommitted=false,jobId;const observations=[];
   proxy=createServer(async(request,response)=>{
@@ -38,7 +39,7 @@ for(const boundary of ['before_commit','after_commit_before_ack']){
   const acknowledged=await until(async()=>{const row=await journal(root,jobId);return row?.state==='acknowledged'?row:null;},'pending receipt was not replayed after restart');
   const detail=await api.detail(collaborationId),artifact=detail.artifacts.find(row=>row.title==='回执边界合成产物');assert.ok(artifact);assert.equal(artifact.versions.length,1);assert.equal(artifact.currentVersion,1);
   const calls=await readFile(join(root,'fixture-calls.txt'),'utf8');assert.equal(calls,'call','fixture command must run exactly once');assert.equal(detail.jobs.find(job=>job.id===jobId).status,'completed');
-  cases.push({boundary,ok:true,collaborationId,jobId,connectorRestart:{oldPid:previousPid,newPid:worker.pid},runRoot:root,connectorLog:await readFile(join(root,'connector.log'),'utf8'),originalPending:pending,finalJournal:acknowledged,observations,pendingBeforeRestart:true,acknowledgedAfterRestart:acknowledged.state,fixtureCalls:1,artifactVersions:1,scope:'actual HTTP/MySQL/Connector process and persisted journal; explicit deterministic model fixture'});
+  cases.push({boundary,ok:true,collaborationId,jobId,connectorRestart:{oldPid:previousPid,newPid:worker.pid},runRoot:root,connectorLog:await readFile(join(root,'connector.log'),'utf8'),originalPending:publicJournal(pending),finalJournal:publicJournal(acknowledged),observations,pendingBeforeRestart:true,acknowledgedAfterRestart:acknowledged.state,fixtureCalls:1,artifactVersions:1,scope:'actual HTTP/MySQL/Connector process and persisted journal; explicit deterministic model fixture'});
  }finally{
   if(worker)await stopOwned(worker).catch(()=>{});
   if(proxy){proxy.closeAllConnections();await new Promise(resolve=>proxy.close(resolve));}

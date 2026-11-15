@@ -36,7 +36,7 @@ export async function heartbeat(agentId: string, capabilities?: {
   supportsInformationLookup?: boolean;
   protocolVersion?: number;
   build?: {kind:string;sourceId:string;files:number};
-}, activeJob?: { id: string; attempts: number; cancelled?: boolean }) {
+}, activeJob?: { id: string; attempts: number; cancelled?: boolean; recoveryKey?: string }) {
   await db.update(agents).set({ status: "online", lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(agents.id, agentId));
   if (capabilities) {
     const [latest] = await db.select({ metadata: auditEvents.metadata }).from(auditEvents).where(and(
@@ -53,14 +53,33 @@ export async function heartbeat(agentId: string, capabilities?: {
     const current = job && job.attempts === activeJob.attempts;
     if (activeJob.cancelled && current && job.status === "cancelled" && !job.cancellationAckAt) await db.update(connectorJobs).set({ cancellationAckAt: new Date(), updatedAt: new Date() }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.attempts, activeJob.attempts), isNull(connectorJobs.cancellationAckAt)));
     const valid = current && job.status === "running" && job.leaseUntil && job.leaseUntil.getTime() > Date.now();
-    if (valid) {
+    const recoveryKeyHash = activeJob.recoveryKey ? createHash("sha256").update(activeJob.recoveryKey).digest("hex") : null;
+    if (valid && (!job.recoveryKeyHash || job.recoveryKeyHash === recoveryKeyHash)) {
       const leaseUntil = new Date(Date.now() + 20 * 60 * 1000);
-      const [renewal] = await db.update(connectorJobs).set({ leaseUntil, updatedAt: new Date() }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, activeJob.attempts), gt(connectorJobs.leaseUntil, new Date())));
+      const [renewal] = await db.update(connectorJobs).set({ leaseUntil, ...(recoveryKeyHash ? {recoveryKeyHash} : {}), updatedAt: new Date() }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, activeJob.attempts), gt(connectorJobs.leaseUntil, new Date())));
       jobState = renewal.affectedRows === 1 ? { cancelRequested: false, leaseUntil: leaseUntil.toISOString() } : { cancelRequested: true };
     } else jobState = { cancelRequested: true, ...(activeJob.cancelled ? current && job.status === "cancelled" ? { cancellationAcknowledged: true } : { receiptRejected: true } : {}) };
   }
   await drainWorkflowWakeups({ agentId });
   return jobState;
+}
+
+/** The caller holds the local workspace lock; secret proof fences the previous attempt. */
+export async function recoverConnectorJob(agentId:string, jobId:string, attempts:number, recoveryKey:string) {
+  const [candidate] = await db.select().from(connectorJobs).where(and(eq(connectorJobs.id,jobId),eq(connectorJobs.agentId,agentId))).limit(1);
+  if (!candidate) throw new HttpError(404,"原执行任务不存在");
+  return withTransaction(async()=>{
+    if(candidate.collaborationId)await db.select().from(collaborations).where(eq(collaborations.id,candidate.collaborationId)).limit(1).for("update");
+    const [job]=await db.select().from(connectorJobs).where(and(eq(connectorJobs.id,jobId),eq(connectorJobs.agentId,agentId))).limit(1).for("update");
+    const proof=createHash("sha256").update(recoveryKey).digest("hex");
+    if(!job?.recoveryKeyHash || job.recoveryKeyHash!==proof)throw new HttpError(403,"恢复凭据不匹配，不能接管执行");
+    if(job.status!=="running"||job.attempts!==attempts)throw new HttpError(409,"原执行领取已变化，不得恢复旧轮次");
+    const payload=await refreshAgentJobContext(job);
+    const updated={...job,payload,attempts:attempts+1,leaseUntil:new Date(Date.now()+60_000),updatedAt:new Date()};
+    await db.update(connectorJobs).set({payload,attempts:updated.attempts,leaseUntil:updated.leaseUntil,updatedAt:updated.updatedAt}).where(eq(connectorJobs.id,jobId));
+    await db.insert(auditEvents).values({id:newId(),collaborationId:job.collaborationId,actorType:"connector",actorId:agentId,action:"connector.execution_recovery_claimed",metadata:{jobId,previousAttempt:attempts,attempts:updated.attempts}});
+    return updated;
+  });
 }
 
 export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false, protocolVersion = 1) {
@@ -83,7 +102,7 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
       const [claim] = await db.update(connectorJobs).set({
         // Delivery is not execution. A disconnected receiver must not hold a
         // 20-minute execution lease without acknowledging the claimed attempt.
-        status: "running", attempts: job.attempts + 1, leaseUntil: new Date(Date.now() + 60_000), updatedAt: new Date(),
+        status: "running", recoveryKeyHash:null, attempts: job.attempts + 1, leaseUntil: new Date(Date.now() + 60_000), updatedAt: new Date(),
       }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "pending"), eq(connectorJobs.attempts, job.attempts)));
       // Only the worker whose compare-and-set won may execute the task.
       if (claim.affectedRows === 1) {

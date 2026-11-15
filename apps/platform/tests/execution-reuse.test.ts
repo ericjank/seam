@@ -1,0 +1,10 @@
+import {expect,it}from"vitest";
+import{randomUUID}from"node:crypto";
+import{executionReuse}from"../src/lib/execution-reuse";
+import type{SharedContract}from"@seam/protocol";
+const a=randomUUID(),b=randomUUID(),files=[{path:"client.test.mjs",sha256:"c".repeat(64)}],workspace={head:"head",treeHash:"d".repeat(64),capturedAt:new Date().toISOString(),testFiles:files};
+const contract={responsibilities:[{participantId:a,mode:"verify_only",changes:"保留原实现与测试，核对指纹后重新联合验证。"}],acceptanceCases:[]}as unknown as SharedContract;
+const before=[{participantId:a,reportStatus:"passed",reportEvidence:{workspace:{after:workspace},testFiles:files}}];
+const previous={revision:1,documentHash:"a".repeat(64),report:"上一版原始报告",sharedContract:contract};
+it("仅验证复用需要双方当前代码和测试指纹与已完成实施一致",()=>{expect(executionReuse(contract,previous,before,[{participantId:a,workspaceBaseline:workspace}],true)).toHaveLength(1);expect(()=>executionReuse(contract,previous,before,[{participantId:a,workspaceBaseline:{...workspace,treeHash:"e".repeat(64)}}],true)).toThrow("同一代码及测试指纹");});
+it("没有新本地测试声明，测试变化和故障服务发布方不能继承成功",()=>{expect(()=>executionReuse({...contract,testChanges:[{participantId:a,path:files[0]!.path,reason:"修改测试的实际必要原因"}]},previous,before,[{participantId:a,workspaceBaseline:workspace}],true)).toThrow();const legacy={...contract,acceptanceCases:[{id:"case",runnerParticipantId:b,httpChecks:[{id:"check",publisherParticipantId:a}]}]}as SharedContract;expect(()=>executionReuse(contract,{...previous,sharedContract:legacy},[...before,{participantId:b,reportEvidence:{independentResults:[{status:"failed",caseId:"case",id:"check"}]}}],[{participantId:a,workspaceBaseline:workspace}],true)).toThrow();});

@@ -223,7 +223,7 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   await db.insert(messages).values({
     id: newId(), collaborationId: job.collaborationId, participantId: participant.id,
     authorType: "agent", authorName: detail.participants.find((row) => row.participant.id === participant.id)?.agent?.name ?? participant.id, kind: turn.kind, body: turn.message,
-    metadata: { jobId, needsHumanInput: turn.needsHumanInput, actionCount: turn.actions.length, workflowChanged: changed },
+    metadata: { jobId, needsHumanInput: turn.needsHumanInput, actionCount: turn.actions.length, workflowChanged: changed, ...(turn.actions.length && turn.actions.every(action=>action.type==="information.respond") ? {informationRequestIds:turn.actions.filter(action=>action.type==="information.respond").map(action=>action.requestId)} : {}) },
   });
   await db.update(collaborations).set({ updatedAt: new Date() }).where(eq(collaborations.id, job.collaborationId));
 }

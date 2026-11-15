@@ -50,13 +50,14 @@ createInterface({input: process.stdin}).on('line', line => {
  if (msg.method==='thread/start') {
   const id='thread-'+Object.keys(db).length; db[id]={turns:0}; save(); respond({thread:{id,status:{type:'idle'}}});
  }
+ if (msg.method==='thread/read') respond({thread:{id:msg.params.threadId,status:{type:'idle'},turns:db[msg.params.threadId]?.lastTurn?[db[msg.params.threadId].lastTurn]:[]}});
  if (msg.method==='thread/resume') {
   if (process.env.SEAM_FAKE_RESUME_FAIL) send({id:msg.id,error:{code:-32600,message:'private diagnostic'}});
   else respond({thread:{id:msg.params.threadId,status:{type:'idle'}}});
  }
  if (msg.method==='turn/start') {
   const threadId=msg.params.threadId; const current=db[threadId]; current.turns++; save();
-  const turnId='turn-'+current.turns; respond({turn:{id:turnId,status:'inProgress'}});
+  const turnId='turn-'+current.turns; current.lastTurn={id:turnId,status:'inProgress',items:[]};save();respond({turn:{id:turnId,status:'inProgress'}});
   if (process.env.SEAM_FAKE_HOLD) return;
   const finish=()=>setTimeout(()=>{
    const data={threadId,turnNumber:current.turns,sandbox:msg.params.sandboxPolicy,tokenPresent:Boolean(process.env.SEAM_AGENT_TOKEN)};
@@ -70,6 +71,7 @@ createInterface({input: process.stdin}).on('line', line => {
    const command={type:'commandExecution',id:'command',aggregatedOutput:process.env.SEAM_FAKE_TEST_COMMAND?'ok 1 - HTTP error':'private source',...(process.env.SEAM_FAKE_TEST_COMMAND?{command:'node --test joint.test.mjs',exitCode:0}:{})};
    if(!process.env.SEAM_FAKE_COMMAND_FINAL_ONLY)send({method:'item/completed',params:{threadId,turnId,item:command}});
    send({method:'item/completed',params:{threadId,turnId,item}});
+   current.lastTurn={id:turnId,status:process.env.SEAM_FAKE_FAIL?'failed':'completed',items:[command,item]};save();
    const completed={method:'turn/completed',params:{threadId,turn:{id:turnId,status:process.env.SEAM_FAKE_FAIL?'failed':'completed',items:[command,item]}}};
    if(process.env.SEAM_FAKE_USAGE){
     const n=process.env.SEAM_FAKE_USAGE_RESET?1:current.turns;
@@ -199,7 +201,7 @@ describe("Codex App Server 持久会话", () => {
     expect(nextPrompt).toContain(next.jobId);
     const [file] = await readdir(f.stateDir);
     const stored = JSON.parse(await readFile(join(f.stateDir, file!), "utf8"));
-    expect(stored.lastHandoff).toMatchObject({ version: 8, scope: `${value.collaborationId}:${value.participant.id}` });
+    expect(stored.lastHandoff).toMatchObject({ version: 9, scope: `${value.collaborationId}:${value.participant.id}` });
     expect(Object.values(stored.lastHandoff.sections).every((hash) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))).toBe(true);
     expect(JSON.stringify(stored.lastHandoff)).not.toContain(value.lifecycle.document);
   });
@@ -420,4 +422,24 @@ describe("Codex App Server 持久会话", () => {
     const confirmation = buildPrompt({ ...input, context: { ...value, lifecycle: { ...value.lifecycle!, phase: "plan_confirmation", documentHash: hash } } });
     expect(confirmation).toContain("完整文档");
   });
+});
+
+describe('原回合只读恢复',()=>{
+ it('已完成但尚未形成Connector回执时，读取原回复和命令，不再调用模型',async()=>{
+  const f=await fixture(),value=context();vi.stubEnv('SEAM_FAKE_TEST_COMMAND','1');
+  const original=await f.adapter().run({projectRoot:f.directory,context:value});const commands:unknown[]=[];
+  const recovered=await f.adapter().recover!({projectRoot:f.directory,context:value,onCommand:record=>commands.push(record)});
+  expect(recovered.state).toBe('completed');expect(recovered.result).toEqual(original);expect(commands).toHaveLength(1);expect((await f.calls()).filter((call:any)=>call.method==='turn/start')).toHaveLength(1);
+ });
+ it('执行中断后只核对已停止原回合，保留原会话并等待实施确认',async()=>{
+  const f=await fixture(),value=context(),controller=new AbortController();vi.stubEnv('SEAM_FAKE_HOLD','1');
+  const task=f.adapter().run({projectRoot:f.directory,context:value,signal:controller.signal});void task.catch(()=>{});
+  await vi.waitFor(async()=>expect((await f.calls()).filter((call:any)=>call.method==='turn/start')).toHaveLength(1));controller.abort();await expect(task).rejects.toThrow();
+  const recovered=await f.adapter().recover!({projectRoot:f.directory,context:value});expect(recovered.state).toBe('interrupted');expect(recovered.result).toBeUndefined();expect((await f.calls()).filter((call:any)=>call.method==='turn/start')).toHaveLength(1);
+  vi.stubEnv('SEAM_FAKE_HOLD','');const next=await f.adapter().run({projectRoot:f.directory,context:{...value,jobId:crypto.randomUUID()},resuming:true});expect(JSON.parse(next.message).threadId).toBe(recovered.threadId);
+ });
+ it('批准或任务身份变化时拒绝采用旧回合，且不发起模型调用',async()=>{
+  const f=await fixture(),value=context();await f.adapter().run({projectRoot:f.directory,context:value});
+  const recovered=await f.adapter().recover!({projectRoot:f.directory,context:{...value,jobId:crypto.randomUUID()}});expect(recovered.state).toBe('unresolved');expect((await f.calls()).filter((call:any)=>call.method==='turn/start')).toHaveLength(1);
+ });
 });

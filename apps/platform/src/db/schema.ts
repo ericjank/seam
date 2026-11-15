@@ -208,6 +208,7 @@ export const connectorJobs = mysqlTable("connector_jobs", {
   availableAt: timestamp("available_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
   leaseUntil: timestamp("lease_until", { fsp: 3 }),
   receiptHash: varchar("receipt_hash", { length: 64 }),
+  recoveryKeyHash: varchar("recovery_key_hash", { length: 64 }),
   cancellationAckAt: timestamp("cancellation_ack_at", { fsp: 3 }),
   ...timestamps,
 }, (table) => [index("connector_jobs_agent_status_idx").on(table.agentId, table.status, table.availableAt)]);
@@ -238,6 +239,7 @@ export const collaborationLifecycles = mysqlTable("collaboration_lifecycles", {
   approvedAt: timestamp("approved_at", { fsp: 3 }),
   terminatedById: varchar("terminated_by_id", { length: 36 }).references(() => users.id),
   terminatedAt: timestamp("terminated_at", { fsp: 3 }),
+  finalDecision: json("final_decision").$type<NonNullable<import("@seam/protocol").LifecycleContext["finalDecision"]>>(),
   ...timestamps,
 });
 

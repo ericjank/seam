@@ -7,7 +7,7 @@ export async function POST(request: Request) {
   try {
     const { agentId, capabilities, activeJob } = z.object({
       agentId: z.string().uuid(),
-      activeJob: z.object({ id: z.string().uuid(), attempts: z.number().int().positive(), cancelled: z.boolean().optional() }).optional(),
+      activeJob: z.object({ id: z.string().uuid(), attempts: z.number().int().positive(), cancelled: z.boolean().optional(), recoveryKey: z.string().min(32).max(100).optional() }).optional(),
       capabilities: z.object({
         adapter: z.enum(["codex", "codex-app-server", "claude-code", "generic-cli", "mock"]),
         executionMode: z.enum(["read-only", "workspace-write", "external"]), testConfigured: z.boolean(),

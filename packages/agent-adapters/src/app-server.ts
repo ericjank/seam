@@ -17,11 +17,14 @@ type Session = {
   version: 1; threadId: string; projectRoot: string; collaborationId: string; participantId: string;
   lastTurnId?: string; lastJobId?: string; lastResult?: AgentTurnResult;
   lastInputHash?: string;
+  lastAuthority?: string;
+  active?: { jobId:string; authority:string; turnId?:string; processPid?:number; handoff:HandoffCheckpoint; startedAt:string };
   lastHandoff?: HandoffCheckpoint;
   title?: string; runLabel?: string; usageTotal?: NonNullable<AdapterTelemetry["tokenUsage"]>["threadTotal"]; lastTelemetry?: AdapterTelemetry;
 };
 const queues = new Map<string, Promise<void>>();
 const isRecord = (value: unknown): value is RecordValue => value !== null && typeof value === "object" && !Array.isArray(value);
+const authority = (input:AgentRunInput) => createHash("sha256").update(JSON.stringify({jobId:input.context?.jobId,collaborationId:input.context?.collaborationId,participantId:input.context?.participant.id,revision:input.context?.lifecycle?.revision,phase:input.context?.lifecycle?.phase,documentHash:input.context?.lifecycle?.documentHash,approvedHash:input.context?.lifecycle?.approvedHash})).digest("hex");
 
 /** A dedicated stdio connection. It never connects to or restarts the user's app. */
 class AppServerConnection {
@@ -60,6 +63,8 @@ class AppServerConnection {
     this.process.on("error", () => this.fail(new Error("无法启动本机 Codex App Server，请检查 SEAM_CODEX_COMMAND")));
     this.process.on("exit", (code) => this.fail(new Error(`Codex App Server 已退出（${code ?? "signal"}）`)));
   }
+
+  get processPid() { return this.process.pid; }
 
   private send(value: RecordValue) {
     if (this.failed) throw this.failed;
@@ -144,7 +149,7 @@ class AppServerConnection {
     this.send({ method: "initialized", params: {} });
   }
 
-  async turn(threadId: string, params: RecordValue, signal?: AbortSignal, onCommand?: AgentRunInput["onCommand"]): Promise<{ text: string; turnId: string }> {
+  async turn(threadId: string, params: RecordValue, signal?: AbortSignal, onCommand?: AgentRunInput["onCommand"], onStarted?: (turnId:string)=>Promise<void>): Promise<{ text: string; turnId: string }> {
     this.trackedThreadId = threadId;
     let turnId: string | undefined;
     let cancellation: Promise<void> | undefined;
@@ -201,6 +206,7 @@ class AppServerConnection {
       const response = await this.request("turn/start", { ...params, threadId });
       if (!isRecord(response.turn) || typeof response.turn.id !== "string") throw new Error("Codex App Server 未返回轮次标识");
       turnId = response.turn.id;
+      await onStarted?.(turnId);
       if (cancelled) interrupt();
       return await done;
     } finally {
@@ -258,6 +264,43 @@ export class CodexAppServerAdapter implements AgentAdapter {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
+  }
+
+  async recover(input:AgentRunInput): Promise<{state:"completed"|"interrupted"|"unresolved";result?:AgentTurnResult;threadId?:string;turnId?:string;reason:string}> {
+    if(!input.context?.jobId)return {state:"unresolved",reason:"缺少原任务标识"};
+    const projectRoot=await realpath(input.projectRoot),identity={projectRoot,collaborationId:input.context.collaborationId,participantId:input.context.participant.id};
+    const directory=resolve(this.options.appServerStateDir??join(homedir(),".seam","threads")),key=createHash("sha256").update(JSON.stringify(identity)).digest("hex"),path=join(directory,`${key}.json`);
+    return serialize(`${directory}:${key}`,async()=>{
+      const unlock=await acquireSessionLock(path,input.signal);let connection:AppServerConnection|undefined;
+      try{
+        let session:Session;try{session=JSON.parse(await readFile(path,"utf8"));}catch{return {state:"unresolved",reason:"原会话映射不可读取"};}
+        if(session.projectRoot!==projectRoot||session.collaborationId!==identity.collaborationId||session.participantId!==identity.participantId)return {state:"unresolved",reason:"原会话归属不匹配"};
+        const signature=authority(input),saved=session.active;
+        if(session.lastJobId===input.context!.jobId&&session.lastAuthority===signature&&session.lastResult){
+          if(session.lastTelemetry)input.onTelemetry?.(session.lastTelemetry);
+          // Commands are re-read below when a journal receipt was never saved.
+        }else if(!saved||saved.jobId!==input.context!.jobId||saved.authority!==signature)return {state:"unresolved",threadId:session.threadId,reason:"原轮次的阶段或批准指纹不匹配"};
+        connection=new AppServerConnection(projectRoot,session.threadId);await connection.initialize();
+        const response=await connection.request("thread/read",{threadId:session.threadId,includeTurns:true},30000);
+        const thread=isRecord(response.thread)?response.thread:null;
+        if(!thread||thread.id!==session.threadId||!Array.isArray(thread.turns))return {state:"unresolved",threadId:session.threadId,reason:"不能完整读取原会话"};
+        const matches=thread.turns.filter(isRecord).filter(turn=>turn.id===(saved?.turnId??session.lastTurnId)||!saved?.turnId&&Array.isArray(turn.items)&&turn.items.filter(isRecord).some(item=>item.type==="userMessage"&&Array.isArray(item.content)&&item.content.filter(isRecord).some(part=>typeof part.text==="string"&&part.text.includes(`任务：${input.context!.jobId}`))));
+        if(matches.length!==1)return {state:"unresolved",threadId:session.threadId,reason:"不能唯一定位原执行回合"};
+        const turn=matches[0]!,turnId=String(turn.id),items=Array.isArray(turn.items)?turn.items.filter(isRecord):[];
+        let originalProcessExited=false; if(saved?.processPid)try{process.kill(saved.processPid,0);}catch(error){originalProcessExited=(error as NodeJS.ErrnoException).code==="ESRCH";}
+        const stoppedAfterCrash = turn.status==="inProgress" && originalProcessExited && (!isRecord(thread.status)||thread.status.type!=="active");
+        if(!["completed","interrupted","failed"].includes(String(turn.status)) && !stoppedAfterCrash)return {state:"unresolved",threadId:session.threadId,turnId,reason:"原回合仍在进行或停止状态未确认，保留人工关口"};
+        for(const item of items)if(item.type==="commandExecution"&&typeof item.command==="string"&&item.status!=="inProgress")input.onCommand?.({id:String(item.id),command:item.command,exitCode:typeof item.exitCode==="number"?item.exitCode:null,output:typeof item.aggregatedOutput==="string"?item.aggregatedOutput:""});
+        let result:AgentTurnResult|undefined;
+        if(turn.status==="completed"){
+          const text=items.filter(item=>item.type==="agentMessage"&&typeof item.text==="string").at(-1)?.text;
+          if(typeof text!=="string")return {state:"unresolved",threadId:session.threadId,turnId,reason:"原已完成回合缺少可验证回复"};
+          result=parseNativeAgentOutput(text,input);session.lastJobId=input.context!.jobId;session.lastAuthority=signature;session.lastResult=result;session.lastTurnId=turnId;session.lastHandoff=saved?.handoff;
+        }else{delete session.lastHandoff;delete session.usageTotal;}
+        delete session.active;const temporary=`${path}.${randomUUID()}.tmp`;await writeFile(temporary,JSON.stringify(session),{mode:0o600,flag:"wx"});await rename(temporary,path);
+        return {state:result?"completed":"interrupted",...(result?{result}:{}),threadId:session.threadId,turnId,reason:result?"已只读核对原回合完成结果与命令，未追加模型回合":"原回合已停止，保留部分修改；重新实施前等待管理员确认"};
+      }finally{try{await connection?.close();}finally{await unlock();}}
+    });
   }
 
   async run(input: AgentRunInput): Promise<AgentTurnResult> {
@@ -318,6 +361,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
         const prepared = await materializeHandoffResources(input, join(directory, "resources"), undefined, false);
         const handoff = buildNativeHandoff({ ...prepared, conversationMode: "persistent", localExecutionPolicy: `Codex App Server sandbox=${sandbox}，approval=never。当前策略由本地能力与平台批准的阶段交集决定；不得提升权限。` }, session?.lastHandoff);
         let commandOutputBytes = 0, resourceCommandOutputBytes = 0, resourceReadCommands = 0;
+        if(session && input.context?.jobId){session.active={jobId:input.context.jobId,authority:authority(input),handoff:handoff.checkpoint,processPid:connection.processPid,startedAt:new Date().toISOString()};await save();}
         attemptedTurn = true;
         const finished = await connection.turn(response.thread.id, {
           cwd: projectRoot, approvalPolicy: "never",
@@ -330,7 +374,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           const bytes = Buffer.byteLength(record.output); commandOutputBytes += bytes;
           if (readsHandoffResource(record.command, projectRoot, join(directory, "resources"))) { resourceReadCommands++; resourceCommandOutputBytes += bytes; }
           input.onCommand?.(record);
-        });
+        }, async turnId=>{if(session?.active){session.active.turnId=turnId;await save();}});
         const result = parseNativeAgentOutput(finished.text, input);
         const usage = connection.tokenUsageTurnId === finished.turnId ? connection.tokenUsage : null;
         if (usage && session?.usageTotal) {
@@ -348,7 +392,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
         await writeFile(join(telemetryDir, `${finished.turnId}.json`), JSON.stringify(telemetry), { mode: 0o600 });
         input.onTelemetry?.(telemetry);
         if (session) {
-          session.lastTurnId = finished.turnId; session.lastJobId = input.context?.jobId; session.lastInputHash = inputHash; session.lastResult = result;
+          session.lastTurnId = finished.turnId; session.lastJobId = input.context?.jobId; session.lastInputHash = inputHash; session.lastResult = result; session.lastAuthority = authority(input); delete session.active;
           session.lastTelemetry = telemetry;
           if (usage) session.usageTotal = usage.threadTotal; else delete session.usageTotal;
           // Compaction can replace exact shared facts with a summary. A later

@@ -19,7 +19,7 @@ export class PlatformClient {
   private attempts = new Map<string, number>();
   constructor(private config: ConnectorConfig) {}
 
-  async heartbeat(capabilities?: ConnectorCapabilities, signal = AbortSignal.timeout(15_000), activeJob?: { id: string; attempts: number; cancelled?: boolean }) {
+  async heartbeat(capabilities?: ConnectorCapabilities, signal = AbortSignal.timeout(15_000), activeJob?: { id: string; attempts: number; cancelled?: boolean; recoveryKey?: string }) {
     return this.request("/api/connectors/heartbeat", { agentId: this.config.agentId, capabilities, activeJob }, signal);
   }
 
@@ -28,6 +28,11 @@ export class PlatformClient {
     const job = response.job ? connectorJobSchema.parse(response.job) : null;
     if (job) this.attempts.set(job.id, job.attempts);
     return job;
+  }
+
+  async recover(jobId: string, attempts: number, recoveryKey: string): Promise<ConnectorJob> {
+    const response = await this.request("/api/connectors/recover", { agentId: this.config.agentId, jobId, attempts, recoveryKey }, AbortSignal.timeout(30_000));
+    const job = connectorJobSchema.parse(response.job); this.attempts.set(job.id, job.attempts); return job;
   }
 
   async complete(jobId: string, result: Record<string, unknown> | undefined, error?: string, attempts = this.attempts.get(jobId)) {

@@ -220,3 +220,9 @@ describe("Native human-readable handoff", () => {
     }
   });
 });
+
+it('事实已进入当前索引后省略机器查找消息，仍完整交接用户要求和未解决状态',()=>{
+ const value=context(),requestId=id(90);value.lifecycle!.facts=[{key:'quote.version',question:'公开版本',value:'v1',answer:'来源已核验',revision:1,status:'active',confirmedAt:'2026-11-15T00:00:00Z',validUntil:'2099-01-01T00:00:00Z',responses:[]}];value.lifecycle!.informationRequests=[{id:requestId,key:'quote.version',revision:1,phase:'planning',question:'公开版本',requestedByParticipantId:value.participant.id,targetParticipantIds:[],stage:'peer',status:'answered',answer:'v1',createdAt:'2026-11-15T00:00:00Z',responses:[]}];
+ const metadata={informationRequestIds:[requestId]};value.messages=[{...message(91,'RESOLVED_MACHINE_DUPLICATE'),authorType:'system',metadata},{...message(92,'USER_REQUIREMENT_MUST_STAY'),metadata},{...message(93,'UNRESOLVED_MACHINE_MUST_STAY'),authorType:'system',metadata:{informationRequestIds:[id(99)]}}];
+ const prompt=buildNativeHandoff(input(value)).prompt;expect(prompt).not.toContain('RESOLVED_MACHINE_DUPLICATE');expect(prompt).toContain('quote.version');expect(prompt).toContain('USER_REQUIREMENT_MUST_STAY');expect(prompt).toContain('UNRESOLVED_MACHINE_MUST_STAY');
+});
