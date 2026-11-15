@@ -156,8 +156,16 @@ export const acceptanceSubmitActionSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
 });
 
+export const CONNECTOR_PROTOCOL_VERSION = 6;
+export const testFileSchema = z.object({ path: z.string().min(1).max(1000), sha256: z.string().length(64) });
+export const httpCheckSchema = z.object({
+  id: z.string().min(1).max(100), publisherParticipantId: idSchema, serviceName: z.string().min(1).max(100),
+  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]), path: z.string().min(1).max(2000),
+  requestBody: z.string().max(65_536).nullable(), expectedStatus: z.number().int().min(100).max(599),
+  bodyChecks: z.array(z.object({ path: z.string().min(1).max(500), equals: z.union([z.string(), z.number(), z.boolean(), z.null()]) })).max(100),
+});
 export const workspaceBaselineSchema = z.object({
-  head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(),
+  head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(), testFiles: z.array(testFileSchema).max(500).optional(),
 });
 export const requirementSchema = z.object({ id: z.string().min(1).max(100), text: z.string().min(1).max(10_000) });
 export const serviceExpectationSchema = z.object({
@@ -177,35 +185,60 @@ export const sharedContractSchema = z.object({
     id: z.string().min(1).max(100), runnerParticipantId: idSchema,
     description: z.string().min(10).max(5000), command: z.string().min(1).max(2000), expectedResult: z.string().min(1).max(5000),
     requiredAssertions: z.array(z.string().min(1).max(500)).min(1).max(100).optional(),
+    httpChecks: z.array(httpCheckSchema).max(30).optional(),
   })).min(2).max(100),
   risks: z.string().min(1).max(10_000),
   changeSummary: z.string().min(10).max(10_000),
   impactedParticipantIds: z.array(idSchema).min(1).max(50),
   retainedDecisions: z.array(z.string().min(1).max(5000)).max(100).default([]),
+  testChanges: z.array(z.object({ participantId: idSchema, path: z.string().min(1).max(1000), reason: z.string().min(10).max(5000) })).max(500).optional(),
 });
 export type SharedContract = z.infer<typeof sharedContractSchema>;
+// A patch must preserve omitted fields; a full-contract default must never
+// turn an omitted list into an explicit replacement with an empty list.
+export const contractDeltaSchema = sharedContractSchema.omit({ effectiveRequirements: true, retiredRequirements: true, retainedDecisions: true })
+  .extend({ retainedDecisions: sharedContractSchema.shape.retainedDecisions.removeDefault() }).partial();
+export const independentResultSchema = z.object({
+  id: z.string(), caseId: z.string(), specHash: z.string().length(64), documentHash: z.string().length(64),
+  status: z.enum(["passed", "failed", "not_run"]), category: z.enum(["code", "environment", "authorization", "unknown"]),
+  summary: z.string().max(10_000), capturedAt: z.string(), actualStatus: z.number().nullable(),
+});
 export const commandEvidenceSchema = z.object({
   id: z.string().min(1).max(100), command: z.string().max(10_000), invocation: z.string().max(10_000).optional(), exitCode: z.number().int().nullable(),
   output: z.string().max(100_000), assertions: z.array(z.string().max(2000)).max(500),
-  source: z.enum(["codex-app-server", "local-test"]), capturedAt: z.string(),
+  source: z.enum(["codex-app-server", "local-test"]), capturedAt: z.string(), testFiles: z.array(testFileSchema).max(500).optional(),
 });
 export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
 export const informationSourceSchema = z.object({
   scope: z.enum(["local_project", "shared_context", "runtime"]),
   reference: z.string().min(1).max(1000), finding: z.string().min(1).max(2000),
+  contentHash: z.string().length(64).optional(), sourceVersion: z.string().max(200).nullish(),
 });
 export const informationResponseSchema = z.object({
   participantId: idSchema, mode: z.enum(["local", "peer"]), status: z.enum(["found", "unavailable"]),
   answer: z.string().min(1).max(10_000), sources: z.array(informationSourceSchema).min(1).max(20),
+  value: z.string().max(10_000).optional(), attempt: z.number().int().positive().optional(), validForSeconds: z.number().int().min(30).max(86400).optional(),
 });
 export const informationRequestSchema = z.object({
   id: idSchema, revision: z.number().int().positive(), phase: z.string(), question: z.string().min(1).max(5000),
   requestedByParticipantId: idSchema, targetParticipantIds: z.array(idSchema),
-  stage: z.enum(["local", "peer"]), status: z.enum(["pending", "answered", "needs_admin"]),
-  answer: z.string().nullable(), createdAt: z.string(), responses: z.array(informationResponseSchema).max(51),
+  stage: z.enum(["local", "peer", "reconcile", "verify"]), status: z.enum(["pending", "conflicted", "answered", "needs_admin"]),
+  answer: z.string().nullable(), createdAt: z.string(), responses: z.array(informationResponseSchema).max(500),
+  key: z.string().max(200).optional(), deadlineAt: z.string().optional(), retryAt: z.string().nullable().optional(),
+  attempt: z.number().int().positive().optional(), failureReason: z.string().optional(), cachedFactKey: z.string().optional(),
+  resumeRequiresReview: z.boolean().optional(),
+  reviewApprovedAt: z.string().optional(),
+  retryCount: z.number().int().nonnegative().optional(), peerParticipantIds: z.array(idSchema).optional(),
   administratorResolution: z.object({ answer: z.string(), providedAt: z.string() }).optional(),
 });
 export type InformationRequest = z.infer<typeof informationRequestSchema>;
+export const sharedFactSchema = z.object({
+  key: z.string().max(200), question: z.string(), value: z.string(), answer: z.string(), revision: z.number().int().positive(),
+  status: z.enum(["active", "stale", "conflicted"]), confirmedAt: z.string(), validUntil: z.string(),
+  authority: z.enum(["project", "administrator"]).optional(),
+  responses: z.array(informationResponseSchema).max(50),
+});
+export type SharedFact = z.infer<typeof sharedFactSchema>;
 export const repairContextSchema = z.object({
   sourceRevision: z.number().int().positive(), sourceDocumentHash: z.string().nullable(), sourceReportHash: z.string().length(64),
   cycle: z.number().int().positive(), failures: z.array(z.object({
@@ -216,7 +249,8 @@ export const repairContextSchema = z.object({
 export const workflowBlockSchema = z.object({
   kind: z.enum(["waiting_peer", "retryable", "needs_admin", "gathering_info"]), reason: z.string().min(10).max(5000),
   dependencyParticipantIds: z.array(idSchema).max(50).default([]), retryAfterSeconds: z.number().int().min(1).max(300).default(5),
-  requiresAuthorization: z.boolean().optional(),
+  requiresAuthorization: z.boolean().optional(), requiresReview: z.boolean().optional(),
+  category: z.enum(["code", "environment", "missing_information", "authorization", "unknown"]).optional(),
 });
 export const servicePublicationSchema = z.object({
   name: z.string().min(1).max(100), baseUrl: z.string().url().max(2000), healthPath: z.string().max(1000),
@@ -231,25 +265,29 @@ export const integrationCheckSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
   assertionNames: z.array(z.string().min(1).max(2000)).max(100).default([]),
   runIds: z.array(z.string().min(1).max(100)).max(100).default([]),
+  category: z.enum(["code", "environment", "missing_information", "authorization", "unknown"]).optional(),
 });
 export const lifecyclePhaseSchema = z.enum(["planning", "plan_synthesis", "plan_confirmation", "awaiting_approval", "executing", "joint_verifying", "awaiting_review", "terminated"]);
 export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("plan.submit"), revision: z.number().int().positive(), content: z.string().min(100).max(100_000), baseline: workspaceBaselineSchema.optional() }),
+  z.object({ type: z.literal("plan.amend"), revision: z.number().int().positive(), changes: z.string().min(20).max(20_000), baseline: workspaceBaselineSchema.optional() }),
+  z.object({ type: z.literal("plan.patch"), revision: z.number().int().positive(), baseDocumentHash: z.string().length(64), delta: contractDeltaSchema }),
   z.object({ type: z.literal("plan.compose"), revision: z.number().int().positive(), baseDocumentHash: z.string().length(64).nullable(), contract: sharedContractSchema }),
   z.object({ type: z.literal("plan.reject"), revision: z.number().int().positive(), documentHash: z.string().length(64), reason: z.string().min(10).max(10_000) }),
   z.object({ type: z.literal("plan.confirm"), revision: z.number().int().positive(), documentHash: z.string().length(64) }),
-  z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}), runs: z.array(commandEvidenceSchema).max(200).default([]) }),
-  z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100), runs: z.array(commandEvidenceSchema).max(200).default([]) }),
+  z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}), runs: z.array(commandEvidenceSchema).max(200).default([]), category: workflowBlockSchema.shape.category, testFiles: z.array(testFileSchema).max(500).optional() }),
+  z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100), runs: z.array(commandEvidenceSchema).max(200).default([]), independentResults: z.array(independentResultSchema).max(500).optional(), testFiles: z.array(testFileSchema).max(500).optional() }),
   z.object({ type: z.literal("workflow.blocked"), revision: z.number().int().positive(), ...workflowBlockSchema.shape }),
   z.object({ type: z.literal("service.publish"), revision: z.number().int().positive(), ...servicePublicationSchema.shape }),
-  z.object({ type: z.literal("information.request"), revision: z.number().int().positive(), question: z.string().min(10).max(5000), searched: z.array(informationSourceSchema).min(2).max(20) }),
+  z.object({ type: z.literal("information.request"), revision: z.number().int().positive(), question: z.string().min(10).max(5000), searched: z.array(informationSourceSchema).min(2).max(20), key: z.string().min(1).max(200).optional(), fresh: z.boolean().optional() }),
   z.object({ type: z.literal("information.respond"), revision: z.number().int().positive(), requestId: idSchema,
-    status: z.enum(["found", "unavailable"]), answer: z.string().min(1).max(10_000), sources: z.array(informationSourceSchema).min(1).max(20) }),
+    status: z.enum(["found", "unavailable"]), answer: z.string().min(1).max(10_000), sources: z.array(informationSourceSchema).min(1).max(20),
+    attempt: z.number().int().positive().optional(), value: z.string().max(10_000).optional(), validForSeconds: z.number().int().min(30).max(86400).optional() }),
 ]);
 export type LifecycleAgentAction = z.infer<typeof lifecycleAgentActionSchema>;
 export function lifecycleActions(phase: string, informationOnly = false): string[] {
   if (informationOnly) return ["information.respond"];
-  const actions: Record<string, string[]> = { planning: ["plan.submit"], plan_synthesis: ["plan.compose"], plan_confirmation: ["plan.confirm", "plan.reject", "plan.submit"],
+  const actions: Record<string, string[]> = { planning: ["plan.submit", "plan.amend"], plan_synthesis: ["plan.compose", "plan.patch"], plan_confirmation: ["plan.confirm", "plan.reject", "plan.submit"],
     executing: ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit", "service.publish"], joint_verifying: ["integration.report", "service.publish"] };
   return actions[phase] ? [...actions[phase]!, "workflow.blocked", "information.request"] : [];
 }
@@ -259,12 +297,14 @@ export const lifecycleContextSchema = z.object({
   requiredParticipantIds: z.array(idSchema),
   coordinatorParticipantId: idSchema.optional(), paused: z.boolean().default(false),
   changeRequest: z.string().nullable().optional(), contract: sharedContractSchema.nullable().optional(),
-  repair: repairContextSchema.nullish(), informationRequests: z.array(informationRequestSchema).max(150).default([]),
+  protocolVersion: z.number().int().positive().optional(),
+  attemptHistory: z.array(z.object({ id: z.string(), phase: z.string(), report: z.string(), createdAt: z.string(), approvedById: z.string() })).max(100).default([]),
+  repair: repairContextSchema.nullish(), informationRequests: z.array(informationRequestSchema).max(500).default([]), facts: z.array(sharedFactSchema).max(200).default([]),
   objections: z.array(z.object({ participantId: idSchema, documentHash: z.string(), reason: z.string() })).default([]),
   baseline: z.object({ revision: z.number(), documentHash: z.string().nullable(), document: z.string().nullable(), contract: sharedContractSchema.nullable(), report: z.string().nullable(), informationRequests: z.array(informationRequestSchema).optional() }).nullable().optional(),
   contributions: z.array(z.object({ participantId: idSchema, content: z.string(), baseline: workspaceBaselineSchema.nullable().optional() })),
   confirmations: z.array(idSchema),
-  reports: z.array(z.object({ participantId: idSchema, status: z.enum(["passed", "failed"]), summary: z.string(), evidence: z.record(z.string(), z.unknown()) })),
+  reports: z.array(z.object({ participantId: idSchema, status: z.enum(["passed", "failed"]), summary: z.string(), evidence: z.record(z.string(), z.unknown()), testFiles: z.array(testFileSchema).optional() })),
   integrationReports: z.array(z.object({ participantId: idSchema, checks: z.array(integrationCheckSchema) })).default([]),
   report: z.string().nullable(),
   blocks: z.array(workflowBlockSchema.extend({ participantId: idSchema, phase: z.string(), attempts: z.number(), retryAt: z.string().nullable(), informationRequestId: idSchema.optional() })).default([]),
@@ -277,9 +317,13 @@ export type LifecycleContext = z.infer<typeof lifecycleContextSchema>;
 export function informationTaskFor(lifecycle: LifecycleContext, participantId: string) {
   if (lifecycle.paused || lifecycle.phase === "terminated") return null;
   for (const request of lifecycle.informationRequests ?? []) {
-    if (request.status !== "pending" || request.revision !== lifecycle.revision || request.phase !== lifecycle.phase) continue;
-    if (request.stage === "local" && request.requestedByParticipantId === participantId && !request.responses.some(row => row.mode === "local")) return { requestId: request.id, mode: "local" as const };
-    if (request.stage === "peer" && request.targetParticipantIds.includes(participantId) && !request.responses.some(row => row.mode === "peer" && row.participantId === participantId)) return { requestId: request.id, mode: "peer" as const };
+    if (!["pending", "conflicted"].includes(request.status) || request.revision !== lifecycle.revision || request.phase !== lifecycle.phase || (request.retryAt && Date.parse(request.retryAt) > Date.now())) continue;
+    if (request.stage === "reconcile" || request.stage === "verify") {
+      if (request.targetParticipantIds.includes(participantId) && !request.responses.some(row => row.mode === "peer" && row.participantId === participantId && row.attempt === request.attempt)) return { requestId: request.id, mode: request.stage, attempt: request.attempt ?? 1 };
+      continue;
+    }
+    if (request.stage === "local" && request.requestedByParticipantId === participantId && !request.responses.some(row => row.mode === "local" && (row.attempt ?? 1) === (request.attempt ?? 1))) return { requestId: request.id, mode: "local" as const, ...(request.attempt ? { attempt: request.attempt } : {}) };
+    if (request.stage === "peer" && request.targetParticipantIds.includes(participantId) && !request.responses.some(row => row.mode === "peer" && row.participantId === participantId && (row.attempt ?? 1) === (request.attempt ?? 1))) return { requestId: request.id, mode: "peer" as const, ...(request.attempt ? { attempt: request.attempt } : {}) };
   }
   return null;
 }
@@ -322,7 +366,7 @@ export type AdapterTelemetry = z.infer<typeof adapterTelemetrySchema>;
 
 export const collaborationContextSchema = z.object({
   lifecycle: lifecycleContextSchema.nullish(),
-  informationTask: z.object({ requestId: idSchema, mode: z.enum(["local", "peer"]) }).nullish(),
+  informationTask: z.object({ requestId: idSchema, mode: z.enum(["local", "peer", "reconcile", "verify"]), attempt: z.number().int().positive().optional() }).nullish(),
   localDiscovery: z.object({ files: z.array(z.string()).max(100), testCommands: z.array(z.string()).max(20) }).optional(),
   jobId: idSchema.optional(),
   collaborationId: idSchema,

@@ -43,6 +43,13 @@
       "when": 1794590935994,
       "tag": "0005_even_lady_vermin",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1794736145580,
+      "tag": "0006_loud_shatterstar",
+      "breakpoints": true
     }
   ]
 }

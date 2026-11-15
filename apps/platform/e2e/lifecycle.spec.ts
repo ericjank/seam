@@ -19,6 +19,7 @@ test.afterEach(async ({ page }) => {
 });
 
 async function post(request: APIRequestContext, path: string, data: unknown, agent?: Agent) {
+  if (path == "/api/connectors/poll") data = { protocolVersion: 6, supportsInformationLookup: true, ...(data as object) };
   const response = await request.post(path, { data, ...(agent ? { headers: { authorization: `Bearer ${agent.token}` } } : {}) });
   expect(response.ok(), `${path}: ${await response.text()}`).toBeTruthy();
   return response.json();
@@ -41,7 +42,7 @@ async function preparePeers(request: APIRequestContext, onlineBoth = true): Prom
     peers.push({ project, agent });
   }
   for (const peer of onlineBoth ? peers : peers.slice(0, 1)) {
-    await post(request, "/api/connectors/heartbeat", { agentId: peer.agent.id }, peer.agent);
+    await post(request, "/api/connectors/heartbeat", { agentId: peer.agent.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 6 } }, peer.agent);
   }
   return peers;
 }
@@ -239,7 +240,7 @@ test("自动查找穷尽后才补充必要事实，保留项目与原修订",asy
   const panel=page.getByRole("region",{name:"自动对接流程"});await expect(panel.getByLabel("协作阻塞")).toContainText("查找后仍缺少事实",{timeout:15000});
   await expect(panel.getByRole("button",{name:"确认文档并执行"})).toHaveCount(0);
   await page.screenshot({path:testInfo.outputPath("necessary-fact-after-lookups.png"),fullPage:true});
-  await panel.getByLabel("补充阻塞所缺的事实").fill("本地使用动态端口，公开协议标记为public-quote-v1。");await panel.getByRole("button",{name:"补充事实并继续"}).click();
+  await panel.getByLabel("补充此问题的必要事实").fill("本地使用动态端口，公开协议标记为public-quote-v1。");await panel.getByRole("button",{name:"保存事实并继续"}).click();
   await expect(panel.getByLabel("协作阻塞")).toHaveCount(0,{timeout:15000});
   const detail=await(await page.request.get(`/api/collaborations/${id}`)).json();expect(detail.lifecycle.revision).toBe(1);expect(detail.lifecycle.phase).toBe("planning");expect(detail.lifecycle.informationRequests[0].administratorResolution.answer).toContain("public-quote-v1");
   await page.screenshot({path:testInfo.outputPath("necessary-fact-resolved.png"),fullPage:true});
@@ -253,7 +254,7 @@ test("失败自动起草修复方案，管理员真实点击确认后才能重�
   await expect.poll(async()=>(await(await page.request.get(`/api/collaborations/${id}`)).json()).lifecycle.phase).toBe("executing");
   for(const [index,peer] of peers.entries()){
     const {job}=await post(page.request,"/api/connectors/poll",{agentId:peer.agent.id,waitMs:0},peer.agent);
-    await post(page.request,"/api/connectors/complete",{agentId:peer.agent.id,jobId:job.id,attempts:job.attempts,status:"completed",result:{agentTurn:{message:"修复界面合成回执",actions:[{type:"execution.report",revision:1,status:index===0?"failed":"passed",summary:index===0?"合成失败证据：金额回归未通过":"合成实施完成",evidence:{synthetic:true}}]}}},peer.agent);
+    await post(page.request,"/api/connectors/complete",{agentId:peer.agent.id,jobId:job.id,attempts:job.attempts,status:"completed",result:{agentTurn:{message:"修复界面合成回执",actions:[{type:"execution.report",revision:1,status:index===0?"failed":"passed",category:"code",summary:index===0?"合成失败证据：金额回归未通过":"合成实施完成",evidence:{synthetic:true}}]}}},peer.agent);
   }
   await expect(panel.getByRole("heading",{name:"自动对接 · 第 2 轮"})).toBeVisible({timeout:15000});await expect(panel.getByLabel("修复方案")).toContainText("金额回归未通过");
   await expect(panel.getByRole("button",{name:"确认修复方案并重新实施"})).toHaveCount(0);await page.screenshot({path:testInfo.outputPath("repair-auto-drafted.png"),fullPage:true});

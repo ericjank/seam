@@ -13,13 +13,13 @@ export function providerAssertions(revision) {
     ...(revision === 5 ? ["real peer HTTP retired discount is rejected"] : [])];
 }
 /** Only the current approved revision is written to each generated script. */
-export function jointFixture({ liveURL, role, revision, businessRevision = revision, readinessFields = {} }) {
+export function jointFixture({ liveURL, role, revision, businessRevision = revision, readinessFields = {}, dynamicBindings = false }) {
   if (!Number.isInteger(revision) || revision < 1 || ![1, 2, 3, 4, 5].includes(businessRevision)) throw new Error("explicit approved fixture revision required");
   return `import assert from "node:assert/strict";
 import { test } from "node:test";
 ${role === "consumer" ? 'import { getQuote } from "./client.mjs";' : ''}
-const base = ${JSON.stringify(liveURL)};
-const revision = ${revision};
+const base = ${dynamicBindings ? 'process.env.SEAM_SERVICE_URL' : JSON.stringify(liveURL)};
+const revision = ${dynamicBindings ? 'Number(process.env.SEAM_REVISION)' : revision};
 const configuration = await fetch(base + "/health");
 assert.equal(configuration.status,200);
 assert.match(configuration.headers.get("content-type")??"",/^application\\/json\\b/);

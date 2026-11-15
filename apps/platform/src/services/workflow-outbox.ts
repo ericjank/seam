@@ -15,6 +15,8 @@ export async function drainWorkflowWakeups(scope: { agentId?: string; collaborat
   const eligible = scope.agentId ? await db.select({ collaborationId: participants.collaborationId }).from(participants)
     .where(and(eq(participants.agentId, scope.agentId), eq(participants.status, "active"))) : null;
   if (eligible && !eligible.length) return;
+  const { recoverInformationLookups } = await import("./lifecycle");
+  for (const id of scope.collaborationId ? [scope.collaborationId] : [...new Set(eligible?.map(row => row.collaborationId) ?? [])]) await recoverInformationLookups(id);
   const rows = await db.select().from(workflowWakeups).where(and(isNull(workflowWakeups.completedAt), lte(workflowWakeups.availableAt, new Date()),
     scope.collaborationId ? eq(workflowWakeups.collaborationId, scope.collaborationId) : undefined,
     eligible ? inArray(workflowWakeups.collaborationId, eligible.map((entry) => entry.collaborationId)) : undefined)).orderBy(asc(workflowWakeups.availableAt)).limit(100);

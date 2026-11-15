@@ -31,6 +31,7 @@ export async function dispatchAgentTurns(userId: string, collaborationId: string
     if (detail.lifecycle) {
       if (detail.lifecycle.paused || !["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(detail.lifecycle.phase)) throw new HttpError(409, "当前阶段等待管理员确认，不能继续派发实施");
       const eligible = lifecycleTargets(detail.lifecycle);
+      if (!eligible.length && options.autoAdvance) return [];
       participantIds = participantIds ? participantIds.filter((id) => eligible.includes(id)) : eligible;
     }
     const workflow: Workflow = {
@@ -142,8 +143,8 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
     if (!informationTask) turn = normalizeLifecycleOutcome(turn, lifecycle.revision);
     const allowed = lifecycleActions(lifecycle.phase, Boolean(informationTask));
     if (turn.actions.some((action) => !allowed.includes(action.type))) throw new HttpError(409, "动作不符合当前生命周期阶段");
-    if (informationTask && turn.actions.some(action => action.type !== "information.respond" || action.requestId !== informationTask.requestId)) throw new HttpError(409, "只读信息任务只能答复本次分配的问题");
-    if (turn.actions.filter((action) => ["plan.submit", "plan.compose", "plan.confirm", "plan.reject", "execution.report", "integration.report", "workflow.blocked", "information.request", "information.respond"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交一项当前阶段成果或明确阻塞");
+    if (informationTask && turn.actions.some(action => action.type !== "information.respond" || action.requestId !== informationTask.requestId || (action.attempt ?? 1) !== (informationTask.attempt ?? 1))) throw new HttpError(409, "只读信息任务只能答复本次分配的问题及查找轮次");
+    if (turn.actions.filter((action) => ["plan.submit", "plan.amend", "plan.patch", "plan.compose", "plan.confirm", "plan.reject", "execution.report", "integration.report", "workflow.blocked", "information.request", "information.respond"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交一项当前阶段成果或明确阻塞");
   }
   // Validate the entire batch before applying any action. An Agent can participate in
   // multiple collaborations, but IDs from one run must never affect another.
@@ -156,7 +157,7 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const actor = { kind: "participant" as const, id: participant.id };
   let changed = false;
   for (const action of turn.actions) {
-    if (action.type === "plan.submit" || action.type === "plan.compose" || action.type === "plan.reject" || action.type === "plan.confirm" || action.type === "execution.report" || action.type === "integration.report" || action.type === "workflow.blocked" || action.type === "service.publish" || action.type === "information.request" || action.type === "information.respond") {
+    if (action.type === "plan.submit" || action.type === "plan.amend" || action.type === "plan.patch" || action.type === "plan.compose" || action.type === "plan.reject" || action.type === "plan.confirm" || action.type === "execution.report" || action.type === "integration.report" || action.type === "workflow.blocked" || action.type === "service.publish" || action.type === "information.request" || action.type === "information.respond") {
       if (!lifecycle) throw new HttpError(409, "当前协作尚未启用管理员审批流程");
       const outcome = await applyLifecycleAction(actor, job.collaborationId, action);
       changed ||= outcome.changed;

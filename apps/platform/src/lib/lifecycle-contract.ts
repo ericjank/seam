@@ -1,7 +1,7 @@
 import type { LifecycleContext, SharedContract } from "@seam/protocol";
 import { HttpError } from "./http";
 
-export function validateSharedContract(contract: SharedContract, required: string[], previous?: SharedContract | null) {
+export function validateSharedContract(contract: SharedContract, required: string[], previous?: SharedContract | null, requireIndependent = false) {
   const unique = (values: string[]) => new Set(values).size === values.length;
   const owners = contract.responsibilities.map((item) => item.participantId);
   if (!unique(owners) || owners.length !== required.length || required.some((id) => !owners.includes(id))) throw new HttpError(422, "统一契约必须且只能包含每个指定参与方的一份责任划分");
@@ -18,6 +18,14 @@ export function validateSharedContract(contract: SharedContract, required: strin
   const services = contract.serviceExpectations ?? [];
   if (!unique(services.map((item) => `${item.publisherParticipantId}:${item.name}`)) || services.some((item) => !required.includes(item.publisherParticipantId)
     || !item.healthPath.startsWith("/") || item.healthPath.startsWith("//") || item.bodyChecks.some((check) => !/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(check.path)))) throw new HttpError(422, "服务就绪契约的归属、路径或检查字段无效");
+  for (const item of contract.acceptanceCases) {
+    if (!unique((item.httpChecks ?? []).map(row => row.id))) throw new HttpError(422, "同一用例的独立HTTP检查ID不得重复");
+    for (const check of item.httpChecks ?? []) if (!services.some(row => row.publisherParticipantId === check.publisherParticipantId && row.name === check.serviceName)
+      || !check.path.startsWith("/") || check.path.startsWith("//") || check.path.includes("\\") || (check.method === "GET" && check.requestBody !== null)
+      || check.bodyChecks.some(field => !/^(?:\$|\$text|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)$/.test(field.path))) throw new HttpError(422, "独立HTTP验收的发布方、服务、路径、GET正文或字段期望无效");
+  }
+  if (requireIndependent) for (const service of services) if (!contract.acceptanceCases.some(item => item.httpChecks?.some(check => check.publisherParticipantId === service.publisherParticipantId && check.serviceName === service.name && check.path !== service.healthPath && check.bodyChecks.length))) throw new HttpError(422, "每个共享API服务须至少声明一项带响应字段期望的独立业务HTTP检查，健康检查不能代替业务验收");
+  for (const change of contract.testChanges ?? []) if (!required.includes(change.participantId) || /^(?:\/|~|[A-Za-z]:)|(?:^|[\\/])\.\.(?:$|[\\/])/.test(change.path)) throw new HttpError(422, "测试变更只能声明本轮项目内的相对文件路径");
 }
 
 export function contractChanges(previous: SharedContract | null | undefined, current: SharedContract) {
@@ -51,10 +59,11 @@ export function renderSharedContract(input: {
     `## 实施范围\n\n${c.scope}`,
     `## 唯一接口契约\n\n${c.interfaces.map((item) => `### ${item.id}\n\n${item.definition}`).join("\n\n")}`,
     `## 项目责任与实施步骤\n\n${c.responsibilities.map((item) => `### ${name(item.participantId)}\n\n${item.changes}`).join("\n\n")}`,
-    `## 联合验收\n\n${c.acceptanceCases.map((item) => `### ${item.id} · ${name(item.runnerParticipantId)}\n\n${item.description}\n\n执行命令：${item.command}\n\n预期：${item.expectedResult}\n\n必需成功断言：${item.requiredAssertions?.join("；") ?? "历史文档未声明完整断言集"}`).join("\n\n")}\n\n命令由本机 Agent 按本地权限核对执行，平台不直接执行远程文本。`,
+    `## 联合验收\n\n${c.acceptanceCases.map((item) => `### ${item.id} · ${name(item.runnerParticipantId)}\n\n${item.description}\n\n执行命令：${item.command}\n\n预期：${item.expectedResult}\n\n必需成功断言：${item.requiredAssertions?.join("；") ?? "历史文档未声明完整断言集"}\n\n独立HTTP检查：${item.httpChecks?.length ? JSON.stringify(item.httpChecks, null, 2) : "未声明；该用例仅有命令证据"}`).join("\n\n")}\n\n命令由本机 Agent 按本地权限核对执行，平台不直接执行远程文本。独立检查由固定Connector执行批准请求及期望，$SEAM_REVISION绑定当前批准修订，不需为修订号修改测试逻辑。`,
     `## 服务就绪契约\n\n${c.serviceExpectations?.map((item) => `${name(item.publisherParticipantId)} / ${item.name}：${item.healthPath} HTTP ${item.status}；${item.bodyChecks.map((check) => `${check.path}=${JSON.stringify(check.equals)}`).join("；")}`).join("\n\n") || "未声明共享服务"}`,
     `## 风险与运行约束\n\n${c.risks}`,
-    `## 项目基线\n\n${input.baselines.map((item) => `${name(item.participantId)}：${item.baseline ? `HEAD=${item.baseline.head ?? "无 Git 提交"}；工作区指纹=${item.baseline.treeHash}` : "未提供本地工作区指纹"}`).join("\n\n")}`,
+    `## 项目基线与测试指纹\n\n${input.baselines.map((item) => `${name(item.participantId)}：${item.baseline ? `HEAD=${item.baseline.head ?? "无 Git 提交"}；工作区指纹=${item.baseline.treeHash}\n${item.baseline.testFiles?.map(file => `${file.path} SHA-256=${file.sha256}`).join("\n") || "尚无现有测试文件；实施完成后冻结首次测试指纹"}` : "未提供本地工作区指纹"}`).join("\n\n")}`,
+    `## 本版明确授权的测试文件变更\n\n${c.testChanges?.map(change => `${name(change.participantId)} / ${change.path}：${change.reason}`).join("\n\n") || "没有声明修改或删除现有测试文件；仅可按批准验收增加测试。"}`,
     "## 执行与验收边界\n\n双方须审阅并确认同一份文档。管理员批准本版内容后方可实施；实施、本地测试、真实联合验证与管理员最终验收分别记录。新增要求不继承旧版批准。",
   ].join("\n\n");
 }

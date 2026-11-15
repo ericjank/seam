@@ -29,11 +29,22 @@ function inspectStrictObjects(value: unknown) {
 }
 
 describe("Native response schema", () => {
+  it("修复只提交差异，nullable未变字段不会覆盖完整契约，结构仍全部required和closed", () => {
+    const value=input();
+    value.context!.lifecycle!.repair={sourceRevision:3,sourceDocumentHash:"b".repeat(64),sourceReportHash:"c".repeat(64),cycle:1,failures:[{participantId:value.context!.participant.id,stage:"joint_verifying",caseId:"amount",status:"failed",summary:"真实金额错误"}]};
+    value.context!.lifecycle!.baseline={revision:3,document:"完整原方案",documentHash:"b".repeat(64),contract:null,report:"真实失败"};
+    inspectStrictObjects(buildNativeOutputSchema(value));
+    expect(parse([{type:"plan.amend",revision:4,changes:"仅修正金额计算的额外加1回归，保留完整原验收规则与测试文件。"}],value).actions[0]!.type).toBe("plan.amend");
+    value.context!.lifecycle!.phase="plan_synthesis";inspectStrictObjects(buildNativeOutputSchema(value));
+    const delta={scope:null,interfaces:null,responsibilities:null,acceptanceCases:null,serviceExpectations:null,risks:null,changeSummary:"只修正金额计算回归，保留完整业务范围与断言",impactedParticipantIds:[value.context!.participant.id],retainedDecisions:null,testChanges:null};
+    const result=parse([{type:"plan.patch",revision:4,baseDocumentHash:"a".repeat(64),delta}],value);
+    expect((result.actions[0] as any).delta).toEqual({changeSummary:delta.changeSummary,impactedParticipantIds:delta.impactedParticipantIds});
+  });
   it("信息任务只有绑定requestId的答复动作，即使当前实施已获批准也不得提交实施或服务发布", () => {
     const value=input("executing"),requestId=crypto.randomUUID();
     value.context!.lifecycle!.approvedHash=value.context!.lifecycle!.documentHash;
     value.context!.informationTask={requestId,mode:"peer"};
-    const response={type:"information.respond",revision:4,requestId,status:"found",answer:"从本方协议查到所需事实",sources:[{scope:"local_project",reference:"docs/api.md",finding:"明确规定接口字段"}]};
+    const response={type:"information.respond",revision:4,requestId,attempt:1,value:"v1",validForSeconds:3600,status:"found",answer:"从本方协议查到所需事实",sources:[{scope:"local_project",reference:"docs/api.md",finding:"明确规定接口字段",sourceVersion:null}]};
     expect(parse([response],value).actions).toEqual([response]);
     expect(()=>parse([{...response,requestId:crypto.randomUUID()}],value)).toThrow("当前阶段");
     const schema=buildNativeOutputSchema(value);inspectStrictObjects(schema);
@@ -72,7 +83,7 @@ describe("Native response schema", () => {
     for (const text of ["全部完成", `\`\`\`json\n${JSON.stringify(reply())}\n\`\`\``, JSON.stringify({ message: "字段不完整" })]) {
       expect(() => parseNativeAgentOutput(text, input())).toThrow("未发布本轮结果");
     }
-    const report = { type: "execution.report", revision: 4, status: "passed", summary: "已测试", evidence: { details: "node --test: exit 0" } };
+    const report = { type: "execution.report", revision: 4, status: "passed", category: "code", summary: "已测试", evidence: { details: "node --test: exit 0" } };
     expect(() => parse([report])).toThrow("当前阶段");
     for (const phase of ["awaiting_approval", "awaiting_review", "terminated"]) {
       expect(parse([], input(phase)).actions).toEqual([]);
@@ -82,7 +93,7 @@ describe("Native response schema", () => {
 
   it("执行辅助动作nullable仅用于缺省ID，evidence固定details并兼容公共协议", () => {
     const actions = [
-      { type: "execution.report", revision: 4, status: "failed", summary: "实际受本地策略阻塞", evidence: { details: "未执行测试；仍缺本机写入授权。" } },
+      { type: "execution.report", revision: 4, status: "failed", category: "authorization", summary: "实际受本地策略阻塞", evidence: { details: "未执行测试；仍缺本机写入授权。" } },
       { type: "artifact.upsert", artifactId: null, title: "结果", artifactType: "test-report", content: "实际证据摘要" },
       { type: "work.update", workItemId: crypto.randomUUID(), status: null, summary: null },
       { type: "acceptance.submit", workItemId: null, artifactId: null, status: "failed", summary: "尚未验收", evidence: { details: "本次未运行。" } },

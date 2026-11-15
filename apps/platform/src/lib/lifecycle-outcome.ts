@@ -6,7 +6,7 @@ export function normalizeLifecycleOutcome(turn: AgentTurnResult, revision: numbe
     || action.type === "integration.report" && action.checks.some(check => check.status === "failed"));
   if (failed.length) return { ...turn, needsHumanInput: false, actions: turn.actions.filter(action => failed.includes(action) || action.type === "service.publish") };
   if (turn.actions.some(action => action.type === "information.request")) return { ...turn, needsHumanInput: false };
-  const authorization = turn.actions.find(action => action.type === "workflow.blocked" && action.requiresAuthorization);
+  const authorization = turn.actions.find(action => action.type === "workflow.blocked" && (action.requiresAuthorization || action.requiresReview));
   if (authorization) return { ...turn, actions: [authorization], needsHumanInput: true };
   if (turn.needsHumanInput || turn.actions.length === 0) return { ...turn, actions: [{
     type: "workflow.blocked", revision, kind: turn.needsHumanInput ? "needs_admin" : "retryable",

@@ -12,6 +12,7 @@ vi.mock("@/db", () => ({ db: {
   update: (table: any) => ({ set: (value: any) => ({ where: async () => { Object.assign(state.rows[table[Symbol.for("drizzle:Name")]]![0], value); } }) }),
 } }));
 vi.mock("@/services/agent-engine", () => ({ advanceAgentWorkflow: vi.fn(), dispatchAgentTurns: vi.fn() }));
+vi.mock("@/services/lifecycle", () => ({ recoverInformationLookups: vi.fn() }));
 import { advanceAgentWorkflow, dispatchAgentTurns } from "../src/services/agent-engine";
 import { drainWorkflowWakeups, queueWorkflowWakeup } from "../src/services/workflow-outbox";
 

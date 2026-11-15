@@ -11,6 +11,8 @@ import { assertOutboundPolicy } from "./outbound-policy.js";
 import { runLocalTest } from "./local-test.js";
 import { attachCommandEvidence, captureCommand, probeServices, ServiceReadinessError } from "./evidence.js";
 import { discoverProject } from "./discovery.js";
+import { collectTestFiles, checkPinnedTests, fingerprintInformation, verifyCachedFact } from "./integrity.js";
+import { runIndependentChecks, buildConfiguredIntegrationReport } from "./independent-checks.js";
 
 export async function runConnector(config: ConnectorConfig) {
   const adapter = createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox, appServerStateDir: config.appServerStateDir, codexNetworkAccess: config.codexNetworkAccess });
@@ -42,6 +44,7 @@ export async function runConnector(config: ConnectorConfig) {
     executionMode: config.adapter === "codex" || config.adapter === "codex-app-server" ? config.codexSandbox ?? "read-only" : "external" as const,
     testConfigured: Boolean(process.env.SEAM_TEST_COMMAND),
     supportsInformationLookup: true,
+    protocolVersion: 6,
   };
   const deliverControl = async (entry: ControlReceipt) => {
     const response = await client.heartbeat(capabilities, AbortSignal.timeout(15_000), { id: entry.jobId, attempts: entry.attempts, cancelled: true });
@@ -118,7 +121,7 @@ export async function runConnector(config: ConnectorConfig) {
             const same = (a: typeof before | undefined, b: typeof before | undefined) => Boolean(a && b && a.head === b.head && a.treeHash === b.treeHash);
             const resuming = Boolean(saved?.state === "recoverable" && saved.revision === context.lifecycle?.revision && saved.approvedHash === context.lifecycle?.approvedHash && same(saved.approvedBaseline, planned) && same(saved.current, before));
             if (!context.informationTask && context.lifecycle?.phase === "executing" && planned && !same(planned, before) && !resuming) {
-              result = { agentTurn: { message: "工作区基线已变化或无法核对，已停止实施，请核对基线并重新批准。", actions: [{ type: "execution.report", revision: context.lifecycle.revision, status: "failed", summary: before ? "批准文档对应的代码基线已变化，未执行代码修改。" : "当前工作区基线无法读取，不能核对已批准版本，未执行代码修改。", evidence: { planned, current: before } }] } };
+              result = { agentTurn: { message: "工作区基线已变化或无法核对，已停止实施，请核对基线并重新批准。", actions: [{ type: "execution.report", revision: context.lifecycle.revision, status: "failed", category: "code", summary: before ? "批准文档对应的代码基线已变化，未执行代码修改。" : "当前工作区基线无法读取，不能核对已批准版本，未执行代码修改。", evidence: { planned, current: before } }] } };
               return;
             }
             if (!context.informationTask && context.lifecycle?.phase === "executing" && context.lifecycle.approvedHash && before && planned) {
@@ -127,14 +130,39 @@ export async function runConnector(config: ConnectorConfig) {
             }
             const runs: import("@seam/protocol").CommandEvidence[] = [];
             const collect = (record: Parameters<typeof captureCommand>[0], source: import("@seam/protocol").CommandEvidence["source"]) => { const run = captureCommand(record, config.projectRoot, source); if (run) runs.push(run); };
-            if (!context.informationTask && context.lifecycle?.phase === "joint_verifying" && process.env.SEAM_TEST_COMMAND) {
+            let testFiles: Awaited<ReturnType<typeof collectTestFiles>> | undefined;
+            if (!context.informationTask && context.lifecycle?.phase === "joint_verifying") {
+              testFiles = await collectTestFiles(config.projectRoot);
+              try { checkPinnedTests(context.lifecycle.reports.find(row => row.participantId === context.participant.id)?.testFiles, testFiles, context); }
+              catch (error) { result = { agentTurn: { message: (error as Error).message, kind: "status", actions: [{ type: "workflow.blocked", revision: context.lifecycle.revision, kind: "needs_admin", requiresReview: true, category: "code", reason: (error as Error).message }] } }; return; }
+            }
+            const independentResults = await runIndependentChecks(context, config.codexNetworkAccess === true || !["codex", "codex-app-server"].includes(config.adapter), controller.signal);
+            if (!context.informationTask && !context.lifecycle?.paused && context.lifecycle?.phase === "joint_verifying" && process.env.SEAM_TEST_COMMAND && !independentResults.some(row => row.status === "not_run")) {
               await runLocalTest(config.projectRoot, controller.signal, { SEAM_SERVICE_URL: context.lifecycle.services[0]?.baseUrl ?? "", SEAM_REVISION: String(context.lifecycle.revision) }, (record) => collect(record, "local-test"));
               context.lifecycle.evidenceRuns.push(...runs.map((run) => ({ ...run, participantId: context.participant.id })));
             }
             let telemetry: import("@seam/protocol").AdapterTelemetry | undefined;
             const input = { context, signal: controller.signal, projectRoot: config.projectRoot, resuming, onCommand: (record: Parameters<typeof captureCommand>[0]) => collect(record, "codex-app-server"),
               onTelemetry: (record: import("@seam/protocol").AdapterTelemetry) => { telemetry = record; }, jobPayloadHash: createHash("sha256").update(JSON.stringify(job.payload)).digest("hex") };
-            const agentTurn = assertOutboundPolicy(await adapter.run(input), config.projectRoot);
+            const automatic = await verifyCachedFact(context, config.projectRoot)
+              ?? (!context.informationTask && context.lifecycle?.phase === "joint_verifying" ? buildConfiguredIntegrationReport(context, process.env.SEAM_TEST_COMMAND, runs, independentResults) : null);
+            const agentTurn = assertOutboundPolicy(automatic ?? await adapter.run(input), config.projectRoot);
+            await fingerprintInformation(agentTurn, config.projectRoot);
+            for (const action of agentTurn.actions) {
+              if (action.type === "execution.report" || action.type === "integration.report") {
+                const after = await collectTestFiles(config.projectRoot);
+                try {
+                  checkPinnedTests(action.type === "integration.report" ? testFiles : planned?.testFiles, after, context, action.type === "execution.report");
+                  action.testFiles = after;
+                  for (const run of runs) run.testFiles = after;
+                  if (action.type === "integration.report") action.independentResults = independentResults;
+                } catch (error) {
+                  agentTurn.message = (error as Error).message;
+                  agentTurn.actions = [{ type: "workflow.blocked", revision: context.lifecycle!.revision, kind: "needs_admin", requiresReview: true, category: "code", reason: (error as Error).message, dependencyParticipantIds: [], retryAfterSeconds: 5 }];
+                  break;
+                }
+              }
+            }
             attachCommandEvidence(agentTurn, context, runs);
             try { await probeServices(agentTurn, controller.signal, context); }
             catch (error) {
@@ -142,10 +170,10 @@ export async function runConnector(config: ConnectorConfig) {
               agentTurn.actions = [{ type: "workflow.blocked", revision: context.lifecycle.revision, kind: "retryable", reason: error.message, dependencyParticipantIds: [], retryAfterSeconds: 5 }];
               agentTurn.message = error.message;
             }
-            for (const action of agentTurn.actions) if (action.type === "plan.submit" && before) action.baseline = before;
+            for (const action of agentTurn.actions) if ((action.type === "plan.submit" || action.type === "plan.amend") && before) action.baseline = { ...before, testFiles: await collectTestFiles(config.projectRoot) };
             const conversation = await adapter.getConversation?.(input);
             result = { agentTurn, ...(conversation ? { conversation } : {}), ...(telemetry ? { telemetry } : {}) };
-            finished = !agentTurn.needsHumanInput && agentTurn.actions.some((action) => action.type === "execution.report");
+            finished = !agentTurn.needsHumanInput && agentTurn.actions.some((action) => action.type === "execution.report" && action.status === "passed");
           } else if (job.kind === "a2a.message") {
             const response = await a2a.transport.handle(job.payload.request);
             if (Symbol.asyncIterator in Object(response)) throw new Error("Connector 不支持流式 A2A 请求");
@@ -162,6 +190,12 @@ export async function runConnector(config: ConnectorConfig) {
             const turn = result.agentTurn as { actions?: import("@seam/protocol").AgentAction[] } | undefined;
             for (const action of turn?.actions ?? []) {
               if (action.type === "execution.report") action.evidence = { ...action.evidence, workspace };
+            }
+            if ((job.payload.context as { lifecycle?: { phase?: string }; informationTask?: unknown } | undefined)?.lifecycle?.phase === "joint_verifying"
+              && !(job.payload.context as { informationTask?: unknown }).informationTask && workspace.before && workspace.after
+              && (workspace.before.head !== workspace.after.head || workspace.before.treeHash !== workspace.after.treeHash)) {
+              result.agentTurn = { message: "联合验收期间工作区发生变化，已丢弃本次通过结论，请先核对差异并重新起草、批准。", kind: "status", actions: [{ type: "workflow.blocked", revision: (job.payload.context as { lifecycle: { revision: number } }).lifecycle.revision,
+                kind: "needs_admin", requiresReview: true, category: "code", reason: "联合验收期间工作区指纹变化；当前命令和独立HTTP结果不能证明最终代码版本，未发布通过结论。", dependencyParticipantIds: [], retryAfterSeconds: 5 }] };
             }
           }
           } finally {

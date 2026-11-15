@@ -4,7 +4,7 @@ import { requireCollaborationAccess } from "@/lib/access";
 import { requireUser } from "@/lib/auth";
 import { handleApiError } from "@/lib/http";
 import { drainWorkflowWakeups } from "@/services/workflow-outbox";
-import { appendLifecycleRequirements, approveLifecycle, getLifecycleContext, pauseLifecycle, startLifecycle, terminateLifecycle } from "@/services/lifecycle";
+import { appendLifecycleRequirements, approveLifecycle, getLifecycleContext, pauseLifecycle, startLifecycle, terminateLifecycle, retryInformationLookup, retryLifecycleValidation, resolveInformation } from "@/services/lifecycle";
 
 const inputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("start") }),
@@ -13,6 +13,9 @@ const inputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("terminate"), revision: z.number().int().positive().optional() }),
   z.object({ action: z.literal("pause") }),
   z.object({ action: z.literal("resume"), resolution: z.string().trim().min(1).max(5000).optional() }),
+  z.object({ action: z.literal("retry-information"), requestId: z.string().uuid() }),
+  z.object({ action: z.literal("resolve-information"), requestId: z.string().uuid(), resolution: z.string().trim().min(1).max(5000) }),
+  z.object({ action: z.literal("retry-validation"), revision: z.number().int().positive(), documentHash: z.string().regex(/^[a-f0-9]{64}$/) }),
 ]);
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -30,6 +33,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const { id } = await params;
     const input = inputSchema.parse(await request.json());
     const lifecycle = input.action === "start" ? await startLifecycle(user.id, id)
+      : input.action === "retry-information" ? await retryInformationLookup(user.id, id, input.requestId)
+      : input.action === "resolve-information" ? await resolveInformation(user.id, id, input.requestId, input.resolution)
+      : input.action === "retry-validation" ? await retryLifecycleValidation(user.id, id, input)
       : input.action === "approve" ? await approveLifecycle(user.id, id, input)
         : input.action === "append" ? await appendLifecycleRequirements(user.id, id, input)
           : input.action === "pause" || input.action === "resume" ? await pauseLifecycle(user.id, id, input.action === "pause", input.action === "resume" ? input.resolution : undefined)

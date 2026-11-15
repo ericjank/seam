@@ -45,11 +45,11 @@ async function login(email: string, password: string) {
 }
 async function register(label: string): Promise<Local> {
   const { project } = await api("/api/projects", { name: `lifecycle-negative-${label}-${suffix}`, description: "确定性生命周期负例测试" });
-  const { agent } = await api("/api/agents", { projectId: project.id, name: `fixture-${label}`, adapter: "generic-cli" });
+  const { agent } = await api("/api/agents", { projectId: project.id, name: `fixture-${label}`, adapter: "mock" });
   return { projectId: project.id, agentId: agent.id, token: agent.token };
 }
 async function claim(local: Local): Promise<Claimed> {
-  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0 }, { token: local.token });
+  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: 6, supportsInformationLookup: true }, { token: local.token });
   assert.ok(result.job, "the platform must automatically enqueue the expected turn");
   return result.job;
 }
@@ -79,7 +79,7 @@ async function main() {
   await expected("/api/collaborations", create, 409);
   const listed = await api("/api/collaborations", undefined, { method: "GET" });
   assert.ok(!listed.collaborations.some((row: any) => row.collaboration.title === create.title));
-  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId }, { token: local.token });
+  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 6 } }, { token: local.token });
   const created = await api("/api/collaborations", create);
   const path = `/api/collaborations/${created.id}`;
   const detail = () => api(path, undefined, { method: "GET" });
@@ -188,14 +188,20 @@ async function main() {
     await complete(local, job, jointAction(job, status));
   }
   const reviewed = await detail();
-  assert.equal(reviewed.lifecycle.phase, "planning"); assert.equal(reviewed.lifecycle.revision, 3);
-  assert.ok(reviewed.lifecycle.baseline.report.includes("未执行用例"));assert.equal(reviewed.lifecycle.repair.sourceRevision,2);assert.equal(reviewed.lifecycle.approvedHash,null);
-  assert.equal(reviewed.collaboration.status, "negotiating");
-  await expected(`${path}/lifecycle`, { action: "terminate", revision: 3 }, 403, { session: memberCookie });
-  await lifecycle({ action: "terminate", revision: 3 });
+  assert.equal(reviewed.lifecycle.phase, "joint_verifying"); assert.equal(reviewed.lifecycle.revision, 2);
+  assert.ok(reviewed.lifecycle.report.includes("未执行用例")); assert.equal(reviewed.lifecycle.repair, null);
+  assert.equal(reviewed.lifecycle.blocks.some((row: any) => row.requiresReview), true);
+  await expected(`${path}/lifecycle`, { action: "retry-validation", revision: 2, documentHash: verifying.documentHash }, 403, { session: memberCookie });
+  await lifecycle({ action: "retry-validation", revision: 2, documentHash: verifying.documentHash });
+  const retried = await detail();
+  assert.equal(retried.lifecycle.attemptHistory.length, 1); assert.ok(retried.lifecycle.attemptHistory[0].report.includes("未执行用例"));
+  for (const local of [first]) { const job = await claim(local); await complete(local, job, jointAction(job, "passed")); }
+  assert.equal((await detail()).lifecycle.phase, "awaiting_review");
+  await expected(`${path}/lifecycle`, { action: "terminate", revision: 2 }, 403, { session: memberCookie });
+  await lifecycle({ action: "terminate", revision: 2 });
   await expected(`${path}/dispatch`, { autoAdvance: true }, 409);
   assert.equal((await detail()).collaboration.status, "completed");
-  checks.push("联测未执行保留原失败报告并自动起草修复版；不继承批准；管理员可终止未执行修复草案，终止后不再派发");
+  checks.push("未执行留在原修订，普通成员不能批准重试；管理员确认后只重跑受影响一方，失败报告完整归档，手动终止后不派发");
   console.log(JSON.stringify({ status: "passed", collaborationId: created.id, scope: "真实HTTP协议与权限验证，Agent结果为明确标注的合成回执", checks }, null, 2));
 }
 

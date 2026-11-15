@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { gt, and, asc, desc, eq, lte, isNull } from "drizzle-orm";
+import { gt, and, asc, desc, eq, lte, isNull, sql } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
 import { agents, collaborations, connectorJobs, auditEvents } from "@/db/schema";
 import { hashToken, newId } from "@/lib/ids";
@@ -34,6 +34,7 @@ export async function heartbeat(agentId: string, capabilities?: {
   executionMode: "read-only" | "workspace-write" | "external";
   testConfigured: boolean;
   supportsInformationLookup?: boolean;
+  protocolVersion?: number;
 }, activeJob?: { id: string; attempts: number; cancelled?: boolean }) {
   await db.update(agents).set({ status: "online", lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(agents.id, agentId));
   if (capabilities) {
@@ -41,7 +42,7 @@ export async function heartbeat(agentId: string, capabilities?: {
       eq(auditEvents.actorId, agentId), eq(auditEvents.action, "connector.capabilities"),
     )).orderBy(desc(auditEvents.sequence)).limit(1);
     const previous = latest?.metadata as typeof capabilities | undefined;
-    if (!previous || previous.adapter !== capabilities.adapter || previous.executionMode !== capabilities.executionMode || previous.testConfigured !== capabilities.testConfigured || previous.supportsInformationLookup !== capabilities.supportsInformationLookup) {
+    if (!previous || previous.adapter !== capabilities.adapter || previous.executionMode !== capabilities.executionMode || previous.testConfigured !== capabilities.testConfigured || previous.supportsInformationLookup !== capabilities.supportsInformationLookup || previous.protocolVersion !== capabilities.protocolVersion) {
       await db.insert(auditEvents).values({ id: newId(), actorType: "connector", actorId: agentId, action: "connector.capabilities", metadata: capabilities });
     }
   }
@@ -61,17 +62,20 @@ export async function heartbeat(agentId: string, capabilities?: {
   return jobState;
 }
 
-export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false) {
+export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false, protocolVersion = 1) {
   const informationOnly = (payload: unknown) => Boolean((payload as { context?: { informationTask?: unknown } } | null)?.context?.informationTask);
   if (signal?.aborted) return null;
   await heartbeat(agentId);
   await db.update(connectorJobs).set({ status: "pending", leaseUntil: null, updatedAt: new Date() })
     .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "running"), lte(connectorJobs.leaseUntil, new Date())));
   const deadline = Date.now() + Math.min(Math.max(waitMs, 0), 20000);
-  do {
+  let skipped = 0;
+  for (;;) {
     if (signal?.aborted) return null;
     const [job] = await db.select().from(connectorJobs)
-      .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, new Date())))
+      .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, new Date()),
+        sql`COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.lifecycle.protocolVersion')) AS UNSIGNED), 1) <= ${protocolVersion}`,
+        supportsInformationLookup ? undefined : sql`(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask') IS NULL OR JSON_TYPE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask')) = 'NULL')`))
       .orderBy(asc(connectorJobs.sequence)).limit(1);
     if (job && (supportsInformationLookup || !informationOnly(job.payload))) {
       if (signal?.aborted) return null;
@@ -95,7 +99,8 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
             ));
             // Old Connectors strip unknown context fields and could otherwise
             // execute normal approved work while assigned a read-only lookup.
-            if (!supportsInformationLookup && informationOnly(payload)) { await release(); return null; }
+            const minimum = (payload as { context?: { lifecycle?: { protocolVersion?: number } } })?.context?.lifecycle?.protocolVersion ?? 1;
+            if ((!supportsInformationLookup && informationOnly(payload)) || minimum > protocolVersion) { await release(); if (++skipped < 20) continue; return null; }
             return { ...claimed, payload };
           } catch (error) {
             if (signal?.aborted) { await release(); return null; }
@@ -110,12 +115,12 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
         }
       }
     }
-    if (Date.now() < deadline) await new Promise<void>((resolve) => {
+    if (Date.now() >= deadline) return null;
+    await new Promise<void>((resolve) => {
       const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
       const timer = setTimeout(done, 500); signal?.addEventListener("abort", done, { once: true }); if (signal?.aborted) done();
     });
-  } while (Date.now() < deadline);
-  return null;
+  }
 }
 
 export async function completeConnectorJob(agentId: string, input: {

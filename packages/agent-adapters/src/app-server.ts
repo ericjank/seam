@@ -10,6 +10,7 @@ import { parseNativeAgentOutput } from "./response-schema.js";
 import { codexNetworkForTurn, codexSandboxForTurn } from "./policy.js";
 import type { AdapterOptions, AgentAdapter, AgentRunInput } from "./types.js";
 import { acquireSessionLock } from "./session-lock.js";
+import { readsHandoffResource } from "./resource-usage.js";
 
 type RecordValue = Record<string, unknown>;
 type Session = {
@@ -327,7 +328,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           outputSchema: handoff.outputSchema,
         }, input.signal, (record) => {
           const bytes = Buffer.byteLength(record.output); commandOutputBytes += bytes;
-          if (record.command.includes(join(directory, "resources"))) { resourceReadCommands++; resourceCommandOutputBytes += bytes; }
+          if (readsHandoffResource(record.command, projectRoot, join(directory, "resources"))) { resourceReadCommands++; resourceCommandOutputBytes += bytes; }
           input.onCommand?.(record);
         });
         const result = parseNativeAgentOutput(finished.text, input);

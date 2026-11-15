@@ -178,7 +178,9 @@ Use `--adapter codex-app-server` with a local `SEAM_CODEX_SANDBOX=workspace-writ
 
 Durable local receipts and database scheduling records recover after delivery or dispatch failures. Project workspaces serialize competing tasks; administrators can pause and resume execution. See [the execution architecture upgrade](docs/协作执行架构升级.md).
 
-Missing facts are searched locally and in shared materials before a peer is asked automatically. Sources and replies remain visible, and a resolved lookup resumes the original stage. Lookup turns stay read-only and do not run implementation or verification commands. Only exhausted lookups or actual authorization gaps require administrator input. Upgrade both Connectors; see [repair approvals and automatic fact lookup](docs/修复审批与自动资料获取.md).
+See [protocol 6 reliability and lightweight repair](docs/协作可靠性与轻量修复.md) for bounded lookup recovery, versioned facts, failure classification, pinned tests, independent HTTP checks and delta repair plans. Rebuild and restart both local Connectors for new managed tasks.
+
+Missing facts are searched locally and in shared materials before a peer is asked automatically. Sources and replies remain visible, and a resolved lookup resumes the original stage. Lookup turns stay read-only and do not run implementation or verification commands. Exhausted lookups require administrator facts or a lookup retry. Failed environment/permission/information verification requires explicit administrator confirmation before implementation or verification resumes. Upgrade both Connectors; see [repair approvals and automatic fact lookup](docs/修复审批与自动资料获取.md).
 
 See [local Docker simulation with real Codex](docs/端到端模拟验证.md) for the five-revision scenario (new goals, replacement, restoration and retirement), [six-improvement acceptance results](docs/验收测试记录-2026-11-13-六项优化.md) for the measured results and evidence boundaries, and [earlier workflow analysis](docs/AI协作改进.md) for the original dialogue-chain findings.
 

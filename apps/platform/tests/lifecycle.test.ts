@@ -91,12 +91,13 @@ vi.mock("@/services/actor", () => ({ authorizeActor: vi.fn(async (actor) => acto
 import {
   appendLifecycleRequirements, applyLifecycleAction, approveLifecycle, assertLifecycleJobCurrent,
   getLifecycleContext, getLifecycleSnapshot, pauseLifecycle, startLifecycle, terminateLifecycle,
+  recoverInformationLookups, retryInformationLookup, retryLifecycleValidation, resolveInformation,
 } from "../src/services/lifecycle";
 
 const actor = (id: string) => ({ kind: "participant" as const, id });
 const plan = (side: string) => `## ${side} 实施方案\n\n${"检查仓库现状，确认接口责任、开发步骤、测试与实际证据；未经管理员确认不得执行修改。".repeat(4)}`;
 const submit = (id: string, revision = 1, content = plan(id)) => applyLifecycleAction(actor(id), "collab", { type: "plan.submit", revision, content });
-const report = (id: string, revision = 1, status: "passed" | "failed" = "passed") => applyLifecycleAction(actor(id), "collab", { type: "execution.report", revision, status, summary: `${id} 完成代码和测试；${status}`, evidence: { tests: status, commands: ["pnpm test"] } });
+const report = (id: string, revision = 1, status: "passed" | "failed" = "passed") => applyLifecycleAction(actor(id), "collab", { type: "execution.report", revision, status, category:"code", summary: `${id} 完成代码和测试；${status}`, evidence: { tests: status, commands: ["pnpm test"] } });
 async function compose(revision = 1, extra = "", overrides: Partial<SharedContract> = {}) {
   const context = (await getLifecycleContext("collab"))!;
   const ids = context.requiredParticipantIds;
@@ -116,7 +117,7 @@ async function joint(revision = 1, status: "passed" | "failed" | "not_run" = "pa
   const context = (await getLifecycleContext("collab"))!;
   for (const id of context.requiredParticipantIds) await applyLifecycleAction(actor(id), "collab", { type: "integration.report", revision, documentHash: context.documentHash!,
     runs: [{ id: `fixture-${id}-${revision}`, command: "node --test joint.test.mjs", exitCode: 0, output: "Synthetic unit fixture, no real execution", assertions: ["real HTTP error"], source: "local-test", capturedAt: new Date().toISOString() }],
-    checks: context.contract!.acceptanceCases.filter((item) => item.runnerParticipantId === id).map((item) => ({ caseId: item.id, status, command: item.command, summary: `合成联测回执 ${status}`, evidence: { fixture: true }, assertionNames: ["real HTTP error"], runIds: [`fixture-${id}-${revision}`] })),
+    checks: context.contract!.acceptanceCases.filter((item) => item.runnerParticipantId === id).map((item) => ({ caseId: item.id, status, category:status==="not_run"?"environment":"code", command: item.command, summary: `合成联测回执 ${status}`, evidence: { fixture: true }, assertionNames: ["real HTTP error"], runIds: [`fixture-${id}-${revision}`] })),
   });
 }
 async function agreed(revision = 1, overrides: Partial<SharedContract> = {}) {
@@ -137,12 +138,64 @@ beforeEach(() => {
     participants: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id, collaborationId: "collab", projectId: `project-${id}`, agentId: `agent-${id}`, role: "participant", status: "active", createdAt: new Date() })),
     projects: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `project-${id}`, name: `项目 ${id}` })),
     agents: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `agent-${id}`, status: "online", lastSeenAt: new Date() })),
+    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:6,supportsInformationLookup:true}})),
     collaboration_lifecycles: [], lifecycle_revisions: [], lifecycle_contributions: [], messages: [], connector_jobs: [],
   };
   vi.clearAllMocks();
 });
 
 describe("管理员控制的共同开发生命周期", () => {
+  it("在线旧Connector缺少协议能力时在创建阶段明确拒绝，不留下半成品生命周期", async()=>{
+    state.rows.audit_events![0]!.metadata.protocolVersion=5;
+    await expect(startLifecycle("admin","collab")).rejects.toMatchObject({status:409,message:expect.stringContaining("升级并重启Connector")});
+    expect(state.rows.collaboration_lifecycles).toHaveLength(0);
+  });
+  it("四个不同事实自动解决后跨修订保留索引，来源验证失败使缓存失效",async()=>{
+    await startLifecycle("admin","collab");const ids=(await getLifecycleContext("collab"))!.requiredParticipantIds,[a,b]=ids as [string,string];
+    const searched=[{scope:"local_project" as const,reference:"README.md",finding:"本地尚无对端公开事实"},{scope:"shared_context" as const,reference:"共同契约",finding:"共享尚无该事实"}];
+    for(let i=0;i<4;i++){
+      await applyLifecycleAction(actor(a),"collab",{type:"information.request",revision:1,key:`quote.fact${i}`,question:`需要核对对端第${i}项必要公开事实`,searched});
+      const request=(await getLifecycleContext("collab"))!.informationRequests.at(-1)!;
+      await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:1,status:"found",value:`value-${i}`,answer:`当前事实值为value-${i}`,sources:[{scope:"local_project",reference:"docs/protocol.md",finding:"公开规则",contentHash:"a".repeat(64)}]});
+    }
+    let context=(await getLifecycleContext("collab"))!;expect(context.facts).toHaveLength(4);expect(context.blocks).toHaveLength(0);
+    await agreed();await appendLifecycleRequirements("admin","collab",{requirements:"追加一项兼容边界，复用原公开事实"});
+    await applyLifecycleAction(actor(a),"collab",{type:"information.request",revision:2,key:"quote.fact0",question:"再次核对第0项事实的当前来源",searched});
+    context=(await getLifecycleContext("collab"))!;expect(context.facts).toHaveLength(4);const request=context.informationRequests[0]!;expect(request.stage).toBe("verify");
+    await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:2,requestId:request.id,attempt:1,status:"unavailable",answer:"真实源文件指纹已变化，旧值不能复用",sources:searched});
+    context=(await getLifecycleContext("collab"))!;expect(context.facts.find(row=>row.key==="quote.fact0")!.status).toBe("stale");expect(context.informationRequests[0]!.stage).toBe("local");
+  });
+  it("查找超时取消旧任务并退避，穷尽后可明确重查且拒绝迟到答复",async()=>{
+    await startLifecycle("admin","collab");const [a,b]=(await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string];
+    const sources=[{scope:"local_project" as const,reference:"README.md",finding:"本地缺少字段"},{scope:"shared_context" as const,reference:"契约",finding:"共享缺少字段"}];
+    await applyLifecycleAction(actor(a),"collab",{type:"information.request",revision:1,key:"quote.version",question:"需要对端当前公开协议的精确版本值",searched:sources});
+    const request=state.rows.lifecycle_revisions![0]!.informationRequests[0];
+    state.rows.connector_jobs!.push({id:"lookup-old",collaborationId:"collab",agentId:`agent-${b}`,status:"running",payload:{context:{informationTask:{requestId:request.id,attempt:1}}}});
+    for(let i=0;i<3;i++){state.rows.lifecycle_revisions![0]!.informationRequests[0].deadlineAt=new Date(0).toISOString();await recoverInformationLookups("collab");}
+    let context=(await getLifecycleContext("collab"))!;expect(context.informationRequests[0]!.status).toBe("needs_admin");expect(state.rows.connector_jobs![0]!.status).toBe("cancelled");
+    await retryInformationLookup("admin","collab",request.id);context=(await getLifecycleContext("collab"))!;expect(context.informationRequests[0]!.attempt).toBe(4);
+    await expect(applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:1,status:"found",answer:"迟到的旧答案",sources})).rejects.toMatchObject({status:409});
+    await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,attempt:4,status:"found",value:"v1",answer:"本轮已重新确认v1",sources});
+    expect((await getLifecycleContext("collab"))!.blocks).toHaveLength(0);
+  });
+  it("管理员按单一问题补事实并形成可跨修订复用的权威记录，不能解决其他问题",async()=>{
+    await startLifecycle("admin","collab");const [a,b]=(await getLifecycleContext("collab"))!.requiredParticipantIds as [string,string];
+    const sources=[{scope:"local_project" as const,reference:"README.md",finding:"没有给定业务值"},{scope:"shared_context" as const,reference:"契约",finding:"没有给定业务值"}];
+    const ids:string[]=[];
+    for(const key of ["tax","currency"]){await applyLifecycleAction(actor(a),"collab",{type:"information.request",revision:1,key,question:`缺少本次报价${key}的必要事实`,searched:sources});const request=(await getLifecycleContext("collab"))!.informationRequests.at(-1)!;ids.push(request.id);await applyLifecycleAction(actor(b),"collab",{type:"information.respond",revision:1,requestId:request.id,status:"unavailable",answer:"已查本方资料仍无该事实",sources});}
+    await expect(pauseLifecycle("admin","collab",false,"只给一个答案不能覆盖两个问题")).rejects.toMatchObject({status:422});
+    await resolveInformation("admin","collab",ids[0]!,"税率由管理员确认6%");const context=(await getLifecycleContext("collab"))!;
+    expect(context.informationRequests[0]!.status).toBe("answered");expect(context.informationRequests[1]!.status).toBe("needs_admin");expect(context.facts[0]!.authority).toBe("administrator");expect(context.blocks).toHaveLength(1);
+  });
+  it("修复差异拼接完整契约，双方确认后仍没有执行授权",async()=>{
+    await startLifecycle("admin","collab");const old=await approved(),[a,b]=old.requiredParticipantIds as [string,string];await report(a,1,"failed");await report(b);
+    await applyLifecycleAction(actor(a),"collab",{type:"plan.amend",revision:2,changes:"定位真实金额计算错误，仅修正本方分支并保持原测试覆盖不变。"});
+    await applyLifecycleAction(actor(b),"collab",{type:"plan.amend",revision:2,changes:"本方接口及测试保持不变，仅参与当前修复文档审阅与后续真实联合验证。"});
+    await applyLifecycleAction(actor(a),"collab",{type:"plan.patch",revision:2,baseDocumentHash:old.documentHash!,delta:{changeSummary:"仅修复金额错误，原接口、有效要求和全部验收覆盖保持不变",impactedParticipantIds:[a]}});
+    const context=(await getLifecycleContext("collab"))!;expect(context.contract!.acceptanceCases).toEqual(old.contract!.acceptanceCases);expect(context.document).toContain("实施范围");expect(context.document).toContain("仅修复金额错误");
+    for(const id of [a,b])await applyLifecycleAction(actor(id),"collab",{type:"plan.confirm",revision:2,documentHash:context.documentHash!});
+    expect((await getLifecycleContext("collab"))!.approvedHash).toBeNull();await expect(report(a,2)).rejects.toMatchObject({status:409});
+  });
   it("旧文档没有有效要求清单时，增量升级仍提供完整上版原文，不能丢掉历史要求来源", async () => {
     await startLifecycle("admin", "collab"); await agreed();
     const legacy=state.rows.lifecycle_revisions![0]!; delete legacy.sharedContract.effectiveRequirements;
@@ -311,8 +364,14 @@ describe("管理员控制的共同开发生命周期", () => {
     const c = (await getLifecycleContext("collab"))!;
     await expect(applyLifecycleAction(actor("00000000-0000-4000-8000-000000000001"), "collab", { type: "integration.report", revision: 1, documentHash: c.documentHash!, checks: [{ caseId: "joint-1", status: "passed", command: "node test", summary: "跨方伪造", evidence: { fixture: true } }] })).rejects.toMatchObject({ status: 422 });
     await joint(1, "not_run");
-    expect((await getLifecycleContext("collab"))!.baseline!.report).toContain("未执行用例");
-    expect((await getLifecycleContext("collab"))!.repair!.failures.every(row=>row.status==="not_run")).toBe(true);
+    const waiting=(await getLifecycleContext("collab"))!;
+    expect(waiting.revision).toBe(1);expect(waiting.phase).toBe("joint_verifying");expect(waiting.repair).toBeNull();
+    expect(waiting.report).toContain("未执行用例");expect(waiting.blocks.every(row=>row.requiresReview)).toBe(true);
+    await pauseLifecycle("admin","collab",false,"环境已恢复，仅补充事实并不代替确认重试");
+    expect((await getLifecycleContext("collab"))!.blocks.every(row=>row.requiresReview)).toBe(true);
+    await retryLifecycleValidation("admin","collab",{revision:1,documentHash:waiting.documentHash!});
+    const retried=(await getLifecycleContext("collab"))!;expect(retried.integrationReports).toEqual([]);expect(retried.attemptHistory[0]!.report).toContain("未执行用例");
+    await joint();expect((await getLifecycleContext("collab"))!.phase).toBe("awaiting_review");
   });
 
   it("暂停取消在途工作，恢复保留批准但旧任务不能回传", async () => {

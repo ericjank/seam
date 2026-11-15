@@ -33,9 +33,12 @@ if (!lifecycle) {
   const request=lifecycle.informationRequests.find(row=>row.id===context.informationTask.requestId);assert.ok(request);
   if(repairInformation){
     const facts=JSON.parse(await readFile("docs/integration-facts.json","utf8"));
-    actions.push({type:"information.respond",revision:lifecycle.revision,requestId:request.id,status:"found",answer:"本方现有公开就绪协议要求contractVersion="+facts.contractVersion,sources:[{scope:"local_project",reference:"docs/integration-facts.json",finding:"当前服务公开的contractVersion必须匹配该值："+facts.contractVersion}]});
+    actions.push({type:"information.respond",revision:lifecycle.revision,requestId:request.id,attempt:context.informationTask.attempt??1,value:repairInformation?readinessFields.contractVersion:"",validForSeconds:3600,status:"found",answer:"本方现有公开就绪协议要求contractVersion="+facts.contractVersion,sources:[{scope:"local_project",reference:"docs/integration-facts.json",finding:"当前服务公开的contractVersion必须匹配该值："+facts.contractVersion,sourceVersion:facts.contractVersion}]});
     message="已读取本方项目协议文件并答复对端，未实施或运行测试。";
-  }else actions.push({type:"information.respond",revision:lifecycle.revision,requestId:request.id,status:"unavailable",answer:"已检查本方README与现有接口，未找到所问事实。",sources:[{scope:"local_project",reference:"README.md",finding:"已检查本方接口说明"},{scope:"shared_context",reference:"当前共同文档",finding:"没有可核对的新增事实"}]});
+  }else actions.push({type:"information.respond",revision:lifecycle.revision,requestId:request.id,attempt:context.informationTask.attempt??1,value:repairInformation?readinessFields.contractVersion:"",validForSeconds:3600,status:"unavailable",answer:"已检查本方README与现有接口，未找到所问事实。",sources:[{scope:"local_project",reference:"README.md",finding:"已检查本方接口说明"},{scope:"shared_context",reference:"当前共同文档",finding:"没有可核对的新增事实"}]});
+} else if (lifecycle.phase === "planning" && lifecycle.repair && !lifecycle.contributions.some(item=>item.participantId===context.participant.id)) {
+  actions.push({type:"plan.amend",revision:lifecycle.revision,changes:"只修正server.mjs的HTTP金额额外加1回归；保留业务规则、全部验收断言和joint.test.mjs内容。服务健康版本动态绑定当前修订，原批准的测试不修改。管理员重新批准前只读。"});
+  message="提供方只提交本次修复差异，原共同文档由平台复用。";
 } else if (lifecycle.phase === "planning" && !lifecycle.contributions.some((item) => item.participantId === context.participant.id)) {
   actions.push({ type: "plan.submit", revision: lifecycle.revision, content: `# 提供方完整实施方案（修订${lifecycle.revision}）
 
@@ -63,11 +66,12 @@ ${lifecycle.repair ? "修复诊断：已核对HTTP层server.mjs和原始联合�
   const ids = lifecycle.requiredParticipantIds;
   actions.push({ type: "plan.compose", revision: lifecycle.revision, baseDocumentHash: lifecycle.documentHash, contract: {
     effectiveRequirements: [{id:"quote-base",text:"当前批准的基础报价接口及边界"}], retiredRequirements: [],
+    testChanges: [],
     serviceExpectations: [{name:"quote",publisherParticipantId:context.participant.id,healthPath:"/health",status:200,bodyChecks:[{path:"ready",equals:true},{path:"revision",equals:lifecycle.revision}]}],
     scope: "在合成项目中实现并真实联合验证报价 HTTP 契约；服务代码由各端负责，服务进程由提供方实施并发布，缺失联合脚本由双方各自创建。",
     interfaces: [{ id: "quote", definition: "POST /quote 使用 JSON。SKU-001 单价12000分，SKU-002单价4500分；quantity为1到100整数，非法请求返回400。响应保留sku、quantity、subtotal和CNY币种。" + (lifecycle.revision >= 2 ? "discountPercent为0到100整数，省略默认0，null和布尔非法；discount向下取整，total=subtotal-discount。" : "") }],
     responsibilities: ids.map((participantId) => ({ participantId, changes: "读取本项目README并完成本方业务导出和Node单元测试；批准后实施，在批准后分别创建各自缺失的joint.test.mjs，再对提供方发布的就绪服务执行真实联合验证。" })),
-    acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index+1}`, runnerParticipantId, description: "运行本项目真实HTTP联合用例，验证正常报价及非法数量和本修订边界", command: "node --test joint.test.mjs", expectedResult: "退出码0，金额正确，非法输入HTTP400", requiredAssertions: providerAssertions(businessRevision) })),
+    acceptanceCases: ids.map((runnerParticipantId, index) => ({ id: `joint-${index+1}`, runnerParticipantId, description: "运行本项目真实HTTP联合用例，验证正常报价及非法数量和本修订边界", command: "node --test joint.test.mjs", expectedResult: "退出码0，金额正确，非法输入HTTP400", requiredAssertions: providerAssertions(businessRevision), httpChecks: [{id:"quote-amount",publisherParticipantId:context.participant.id,serviceName:"quote",method:"POST",path:"/quote",requestBody:JSON.stringify({sku:"SKU-001",quantity:2}),expectedStatus:200,bodyChecks:[{path:"subtotal",equals:24000},{path:"currency",equals:"CNY"}]}] })),
     risks: "仅本地合成项目；网络不可用如实报告未执行，不部署，不安装依赖。", changeSummary: lifecycle.revision >= 2 ? "保留基础报价，增量增加折扣字段和兼容验证。" : "首次统一字段、错误语义、双方职责及真实联合验收。", impactedParticipantIds: ids, retainedDecisions: lifecycle.revision >= 2 ? ["保留报价路径、SKU单价和数量校验"] : [],
   } });
   message = "虚拟协调方汇总统一契约，等待双方审阅。";
@@ -129,7 +133,7 @@ ${supportsDiscount ? `test("discount boundaries and validation", () => {
     const child=spawn(process.execPath,["server.mjs",statePath],{cwd:process.cwd(),detached:true,stdio:"ignore"}); child.unref();
     for(let attempt=0;attempt<50;attempt++) {try {const state=JSON.parse(await readFile(statePath,"utf8"));if(state.revision===lifecycle.revision){serviceState=state;break;}} catch {} await new Promise(resolve=>setTimeout(resolve,50));}
     assert.equal(serviceState?.revision,lifecycle.revision,"owned server must publish its actual address");
-    await writeFile("joint.test.mjs",jointFixture({liveURL:serviceState.baseUrl,role:"provider",revision:lifecycle.revision,businessRevision,readinessFields}));
+    await writeFile("joint.test.mjs",jointFixture({liveURL:serviceState.baseUrl,role:"provider",revision:lifecycle.revision,businessRevision,readinessFields,dynamicBindings:repairInformation}));
     actions.push({type:"workflow.blocked",revision:lifecycle.revision,kind:"retryable",reason:"本方实施已落盘，真实服务进程正在延迟启动，等待实际健康探测通过后发布；不重复创建服务。",dependencyParticipantIds:[],retryAfterSeconds:5});
     message="提供方保留已完成修改，等待本机服务就绪后续接同一批准版本。";
   } else {
@@ -142,7 +146,7 @@ ${supportsDiscount ? `test("discount boundaries and validation", () => {
   const health=await fetch(serviceState.baseUrl+"/health"); assert.equal(health.status,200);
   assert.deepEqual(await health.json(),{ready:true,revision:lifecycle.revision,...readinessFields});
   actions.push({type:"service.publish",revision:lifecycle.revision,name:"quote",baseUrl:serviceState.baseUrl,healthPath:"/health",ttlSeconds:3600});
-  actions.push({ type: "execution.report", revision: lifecycle.revision, status,
+  actions.push({ type: "execution.report", revision: lifecycle.revision, status, category:"code",
     summary: `提供方修订${lifecycle.revision}代码已落盘，Node合成测试${status === "passed" ? "通过" : "失败"}；未部署。`,
     evidence: { command: "node --test service.test.mjs", exitCode, durationMs: Date.now() - started,
       changedFiles: ["service.mjs", "service.test.mjs"], outputTail: `${output.stdout ?? ""}\n${output.stderr ?? ""}`.replaceAll(process.cwd(), "[project]").slice(-3000) },

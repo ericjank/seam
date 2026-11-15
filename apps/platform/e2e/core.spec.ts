@@ -51,7 +51,7 @@ test("登录、创建项目与 Agent、发起协作", async ({ page }) => {
   expect(targetAgentResponse.ok()).toBeTruthy();
   const { agent: targetAgent } = await targetAgentResponse.json();
   for (const connected of [agent, targetAgent]) {
-    const heartbeat = await page.request.post("/api/connectors/heartbeat", { data: { agentId: connected.id }, headers: { authorization: `Bearer ${connected.token}` } });
+    const heartbeat = await page.request.post("/api/connectors/heartbeat", { data: { agentId: connected.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 6 } }, headers: { authorization: `Bearer ${connected.token}` } });
     expect(heartbeat.ok()).toBeTruthy();
   }
 

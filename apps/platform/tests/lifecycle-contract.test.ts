@@ -4,6 +4,17 @@ import { fixtureContract } from "./fixtures/shared-contract";
 
 const ids = [crypto.randomUUID(), crypto.randomUUID()];
 describe("统一契约与增量审阅", () => {
+  it("API服务的独立验收必须有业务期望，拒绝跨方服务、越界路径及未授权测试变更", () => {
+    const contract=fixtureContract(ids,1);
+    contract.serviceExpectations=[{name:"quote",publisherParticipantId:ids[0]!,healthPath:"/health",status:200,bodyChecks:[]}];
+    expect(()=>validateSharedContract(contract,ids,null,true)).toThrow("独立业务HTTP检查");
+    const check={id:"amount",publisherParticipantId:ids[0]!,serviceName:"quote",method:"POST" as const,path:"/quote",requestBody:'{"quantity":2}',expectedStatus:200,bodyChecks:[{path:"subtotal",equals:24000}]};
+    contract.acceptanceCases[0]!.httpChecks=[check];expect(()=>validateSharedContract(contract,ids,null,true)).not.toThrow();
+    for(const invalid of [{...check,path:"//outside.invalid"},{...check,publisherParticipantId:ids[1]!},{...check,method:"GET" as const},{...check,bodyChecks:[{path:"x[0]",equals:1}]}]) {
+      contract.acceptanceCases[0]!.httpChecks=[invalid];expect(()=>validateSharedContract(contract,ids,null,true)).toThrow("独立HTTP验收");
+    }
+    contract.acceptanceCases[0]!.httpChecks=[check];contract.testChanges=[{participantId:ids[0]!,path:"../outside.test.mjs",reason:"bad"}];expect(()=>validateSharedContract(contract,ids)).toThrow("相对文件路径");
+  });
   it("五轮替换、恢复及撤销保留有效清单，遗漏旧要求必须明确撤销且不能撤销未知ID", () => {
     let previous = fixtureContract(ids, 1);
     previous.effectiveRequirements = [{ id: "quantity", text: "1到100" }, { id: "compatibility", text: "保留四字段" }];

@@ -2,6 +2,7 @@
 
 import { formatDateTime } from "@/lib/date-time";
 import { dispatchRecipient } from "@/lib/dispatch-message";
+import { CONNECTOR_PROTOCOL_VERSION } from "@seam/protocol";
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
@@ -60,7 +61,7 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
         <p className="small muted">{row.participant.role} · {row.agent ? `${row.agent.name}（${row.agent.status}）` : "未绑定 Agent"}</p>
         {(() => {
           const capability = data.connectorCapabilities.find((item) => item.agentId === row.participant.agentId);
-          return <div className="small muted">{capability ? `本机执行能力：${capability.adapter} · ${capability.executionMode === "workspace-write" ? "项目内可写" : capability.executionMode === "read-only" ? "只读，实施前需本机配置写入" : "权限由本地工具管理"} · ${capability.testConfigured ? "已配置本地测试" : "未配置本地测试命令"}` : "尚未上报执行能力，请在本机运行 Connector --doctor 并更新 Connector"}</div>;
+          return <div className="small muted">{capability ? `本机执行能力：${capability.adapter} · ${capability.executionMode === "workspace-write" ? "项目内可写" : capability.executionMode === "read-only" ? "只读，实施前需本机配置写入" : "权限由本地工具管理"} · ${capability.testConfigured ? "已配置本地测试" : "未配置本地测试命令"} · ${(capability.protocolVersion ?? 1) >= CONNECTOR_PROTOCOL_VERSION && capability.supportsInformationLookup ? `协议v${capability.protocolVersion}，支持自动资料查找与验收指纹` : `需升级并重启Connector至协议v${CONNECTOR_PROTOCOL_VERSION}；在线状态不能代替能力`}` : "尚未上报执行能力，请在本机运行 Connector --doctor 并更新 Connector"}</div>;
         })()}
         {data.jobs.find((job) => job.agentId === row.participant.agentId && job.conversation)?.conversation && <a className="btn btn-secondary btn-small" href={`codex://threads/${data.jobs.find((job) => job.agentId === row.participant.agentId && job.conversation)!.conversation!.threadId}`}>打开本机 Codex 对话</a>}
         <details className="small muted"><summary>参与方标识</summary>{row.participant.id}</details>

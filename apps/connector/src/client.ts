@@ -1,4 +1,4 @@
-import { connectorJobSchema, type ConnectorJob } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, connectorJobSchema, type ConnectorJob } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
 
 export interface ConnectorCapabilities {
@@ -6,6 +6,7 @@ export interface ConnectorCapabilities {
   executionMode: "read-only" | "workspace-write" | "external";
   testConfigured: boolean;
   supportsInformationLookup?: boolean;
+  protocolVersion?: number;
 }
 
 export class PlatformError extends Error {
@@ -22,7 +23,7 @@ export class PlatformClient {
   }
 
   async poll(): Promise<ConnectorJob | null> {
-    const response = await this.request("/api/connectors/poll", { agentId: this.config.agentId, waitMs: 0, supportsInformationLookup: true }, AbortSignal.timeout(15_000));
+    const response = await this.request("/api/connectors/poll", { agentId: this.config.agentId, waitMs: 0, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION }, AbortSignal.timeout(15_000));
     const job = response.job ? connectorJobSchema.parse(response.job) : null;
     if (job) this.attempts.set(job.id, job.attempts);
     return job;

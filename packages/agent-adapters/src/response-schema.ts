@@ -8,6 +8,18 @@ const summary = z.string().min(1).max(20_000);
 const evidence = z.object({
   details: z.string().min(1).max(100_000).describe("Markdown evidence with actual test commands, results, changed relative paths and remaining limitations. Never include credentials or full source files."),
 }).strict();
+const category = z.enum(["code", "environment", "missing_information", "authorization", "unknown"]);
+const nativeSource = informationSourceSchema.omit({ contentHash: true, sourceVersion: true }).extend({ sourceVersion: z.string().max(200).nullable() }).strict();
+const nativeCases = z.array(sharedContractSchema.shape.acceptanceCases.element.required()).min(2).max(100);
+const nativeContract = sharedContractSchema.extend({ acceptanceCases: nativeCases }).required();
+const nativeDelta = z.object({
+  scope: sharedContractSchema.shape.scope.nullable(), interfaces: sharedContractSchema.shape.interfaces.nullable(),
+  responsibilities: sharedContractSchema.shape.responsibilities.nullable(), acceptanceCases: nativeCases.nullable(),
+  serviceExpectations: sharedContractSchema.shape.serviceExpectations.unwrap().nullable(),
+  risks: sharedContractSchema.shape.risks.nullable(), changeSummary: sharedContractSchema.shape.changeSummary,
+  impactedParticipantIds: sharedContractSchema.shape.impactedParticipantIds, retainedDecisions: z.array(z.string().min(1).max(5000)).max(100).nullable(),
+  testChanges: sharedContractSchema.shape.testChanges.unwrap().nullable(),
+}).strict();
 
 // Native Structured Outputs require every property to be required and every
 // object to be closed. Nullable placeholders model protocol optional fields;
@@ -28,15 +40,19 @@ function nativeResponseSchema(input: AgentRunInput) {
   if (!lifecycle) actions = Object.values(auxiliaryActions);
   else if (input.context?.informationTask && !lifecycle.paused) {
     actions = [z.object({ type: z.literal("information.respond"), revision: z.literal(lifecycle.revision), requestId: z.literal(input.context.informationTask.requestId),
-      status: z.enum(["found", "unavailable"]), answer: z.string().min(1).max(10_000), sources: z.array(informationSourceSchema).min(1).max(20) }).strict()];
+      attempt: z.literal(input.context.informationTask.attempt ?? 1), value: z.string().max(10_000), validForSeconds: z.number().int().min(30).max(86400),
+      status: z.enum(["found", "unavailable"]), answer: z.string().min(1).max(10_000), sources: z.array(nativeSource).min(1).max(20) }).strict()];
   }
   else {
-    const blocked = z.object({ type: z.literal("workflow.blocked"), revision: z.literal(lifecycle.revision), kind: z.enum(["waiting_peer", "retryable", "needs_admin"]), reason: z.string().min(10).max(5000), dependencyParticipantIds: z.array(id).max(50), retryAfterSeconds: z.number().int().min(1).max(300), requiresAuthorization: z.boolean() }).strict();
+    const blocked = z.object({ type: z.literal("workflow.blocked"), revision: z.literal(lifecycle.revision), kind: z.enum(["waiting_peer", "retryable", "needs_admin"]), reason: z.string().min(10).max(5000), dependencyParticipantIds: z.array(id).max(50), retryAfterSeconds: z.number().int().min(1).max(300), requiresAuthorization: z.boolean(), requiresReview: z.boolean(), category }).strict();
     const publish = z.object({ type: z.literal("service.publish"), revision: z.literal(lifecycle.revision), name: z.string().min(1).max(100), baseUrl: z.string().url().max(2000), healthPath: z.string().max(1000), ttlSeconds: z.number().int().min(30).max(3600) }).strict();
     const submit = z.object({ type: z.literal("plan.submit"), revision: z.literal(lifecycle.revision), content: z.string().min(100).max(100_000) }).strict();
     switch (lifecycle.paused ? "paused" : lifecycle.phase) {
-      case "planning": actions = [submit]; break;
-      case "plan_synthesis": actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: sharedContractSchema.extend({ acceptanceCases: z.array(sharedContractSchema.shape.acceptanceCases.element.required()).min(2).max(100) }).required() }).strict()]; break;
+      case "planning": actions = [submit]; if (lifecycle.repair) actions.unshift(z.object({ type: z.literal("plan.amend"), revision: z.literal(lifecycle.revision), changes: z.string().min(20).max(20_000) }).strict()); break;
+      case "plan_synthesis":
+        actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: nativeContract }).strict()];
+        if (lifecycle.repair && lifecycle.baseline?.documentHash) actions.unshift(z.object({ type: z.literal("plan.patch"), revision: z.literal(lifecycle.revision), baseDocumentHash: z.literal(lifecycle.documentHash ?? lifecycle.baseline.documentHash), delta: nativeDelta }).strict());
+        break;
       case "plan_confirmation":
         actions = [submit];
         // A missing/invalid snapshot cannot be confirmed, even by a response
@@ -47,16 +63,16 @@ function nativeResponseSchema(input: AgentRunInput) {
         );
         break;
       case "executing": actions = [
-        z.object({ type: z.literal("execution.report"), revision: z.literal(lifecycle.revision), status: z.enum(["passed", "failed"]), summary, evidence }).strict(),
+        z.object({ type: z.literal("execution.report"), revision: z.literal(lifecycle.revision), status: z.enum(["passed", "failed"]), summary, evidence, category }).strict(),
         auxiliaryActions["artifact.upsert"], auxiliaryActions["work.create"], auxiliaryActions["work.update"], auxiliaryActions["acceptance.submit"],
         publish,
       ]; break;
       case "joint_verifying": actions = [z.object({ type: z.literal("integration.report"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash), checks: z.array(z.object({
-        caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]), command: z.string().max(2000), summary: z.string().min(1).max(10_000), assertionNames: z.array(z.string().min(1).max(2000)).max(100), evidence,
+        caseId: z.string().min(1).max(100), status: z.enum(["passed", "failed", "not_run"]), command: z.string().max(2000), summary: z.string().min(1).max(10_000), assertionNames: z.array(z.string().min(1).max(2000)).max(100), evidence, category,
       }).strict()).min(1).max(100) }).strict(), publish]; break;
       default: actions = [];
     }
-    if (actions.length) actions.push(blocked, z.object({ type: z.literal("information.request"), revision: z.literal(lifecycle.revision), question: z.string().min(10).max(5000), searched: z.array(informationSourceSchema).min(2).max(20) }).strict());
+    if (actions.length) actions.push(blocked, z.object({ type: z.literal("information.request"), revision: z.literal(lifecycle.revision), question: z.string().min(10).max(5000), searched: z.array(nativeSource).min(2).max(20), key: z.string().min(1).max(200).nullable(), fresh: z.boolean() }).strict());
   }
   const item = actions.length === 0 ? z.object({}).strict()
     : actions.length === 1 ? actions[0]!
@@ -107,6 +123,8 @@ export function parseNativeAgentOutput(raw: string, input: AgentRunInput): Agent
     actions: parsed.data.actions.map((action) => {
       const result = { ...(action as Record<string, unknown>) };
       for (const field of optionalFields[String(result.type)] ?? []) if (result[field] === null) delete result[field];
+      if (result.type === "information.request" && result.key === null) delete result.key;
+      if (result.type === "plan.patch") result.delta = Object.fromEntries(Object.entries(result.delta as Record<string, unknown>).filter(([, value]) => value !== null));
       return result;
     }),
   };

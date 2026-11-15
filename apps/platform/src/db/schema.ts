@@ -227,6 +227,8 @@ export const auditEvents = mysqlTable("audit_events", {
 export const collaborationLifecycles = mysqlTable("collaboration_lifecycles", {
   collaborationId: varchar("collaboration_id", { length: 36 }).primaryKey().references(() => collaborations.id, { onDelete: "cascade" }),
   revision: int("revision").notNull().default(1),
+  protocolVersion: int("protocol_version").notNull().default(1),
+  facts: json("shared_facts").$type<import("@seam/protocol").SharedFact[]>(),
   phase: mysqlEnum("phase", ["planning", "plan_synthesis", "plan_confirmation", "awaiting_approval", "executing", "joint_verifying", "awaiting_review", "terminated"]).notNull().default("planning"),
   pausedAt: timestamp("paused_at", { fsp: 3 }),
   requiredParticipantIds: json("required_participant_ids").$type<string[]>().notNull(),
@@ -248,6 +250,7 @@ export const lifecycleRevisions = mysqlTable("lifecycle_revisions", {
   sharedContract: json("shared_contract").$type<import("@seam/protocol").SharedContract>(),
   repair: json("repair_context").$type<import("@seam/protocol").LifecycleContext["repair"]>(),
   informationRequests: json("information_requests").$type<import("@seam/protocol").InformationRequest[]>(),
+  attemptHistory: json("attempt_history").$type<import("@seam/protocol").LifecycleContext["attemptHistory"]>(),
   objections: json("objections").$type<{ participantId: string; documentHash: string; reason: string }[]>(),
   document: longtext("document"),
   documentHash: varchar("document_hash", { length: 64 }),
