@@ -1,5 +1,5 @@
 "use client";
-import { expandSharedContract } from "@seam/protocol";
+import { expandSharedContract, objectionTargetLabel } from "@seam/protocol";
 
 import type { CollaborationData, ActionRunner } from "./detail-types";
 import { contractChanges } from "@/lib/contract-diff";
@@ -24,10 +24,14 @@ export function LifecyclePanel({ data, run, busy }: { data: CollaborationData; r
   const codeReview = lifecycle.blocks.some(block => block.requiresReview && block.category === "code");
   const changes = lifecycle.baseline?.contract && lifecycle.contract ? contractChanges(lifecycle.baseline.contract, lifecycle.contract) : [];
   const name = (id: string) => data.participants.find((row) => row.participant.id === id)?.project.name ?? id;
+  const outstanding = (lifecycle.planObjections ?? []).filter(item => item.state !== "addressed");
+  const synthesisStatus = outstanding.some(item => item.state === "open") ? "责任方正在逐项处理契约异议。对应修改或证据收齐后，双方将重新确认。"
+    : outstanding.length ? "共同文档等待所列异议的修改或依据。每项的责任方和恢复条件见下方。"
+    : "协调方 AI 正在汇总或修订统一契约、责任划分和联合验收用例。";
   return <section className="card stack" aria-label="自动对接流程">
     <div className="row-between"><h2>自动对接 · 第 {lifecycle.revision} 轮</h2><span className="badge badge-blue">{lifecycle.paused ? "已暂停" : budgetStops.length ? "等待重试授权" : phases.find(([phase]) => phase === lifecycle.phase)?.[1]}</span></div>
     <div className="row">{phases.map(([phase, label], index) => <span className={`badge ${phase === lifecycle.phase ? "badge-blue" : ""}`} key={phase}>{index + 1}. {label}</span>)}</div>
-    <p className="muted">{lifecycle.paused ? "协作已暂停，执行端停止状态见最近执行记录。已产生的文件修改保留，恢复后会核对现状继续。" : lifecycle.phase === "planning" ? "两端 AI 正在分析各自项目与本轮变化，复用既有资料。此阶段为只读。" : lifecycle.phase === "plan_synthesis" ? "协调方 AI 正在汇总唯一接口契约、责任划分和联合验收用例；双方异议会反馈给协调方修订。" : lifecycle.phase === "plan_confirmation" ? "完整文档已生成，两端 AI 正在核对并确认同一版本。" : lifecycle.phase === "awaiting_approval" ? "双方已确认下方文档，等待管理员批准。批准后两端自动实施，无需逐项填写任务。" : lifecycle.phase === "executing" ? "两端正在按已批准文档修改各自项目并运行测试，完成后自动汇总报告。" : lifecycle.phase === "joint_verifying" ? "双方正在按批准的用例真实调用并验证对方接口，逐项归档本轮命令和结果。" : lifecycle.phase === "awaiting_review" ? "实施及联合验证结果已汇总。可补充要求重新起草下一轮文档；满意后手动终止任务。" : "管理员已终止此任务，文档、报告和对话记录已保留。"}</p>
+    <p className="muted">{lifecycle.paused ? "协作已暂停，执行端停止状态见最近执行记录。已产生的文件修改保留，恢复后会核对现状继续。" : lifecycle.phase === "planning" ? "两端 AI 正在分析各自项目与本轮变化，复用既有资料。此阶段为只读。" : lifecycle.phase === "plan_synthesis" ? synthesisStatus : lifecycle.phase === "plan_confirmation" ? "完整文档已生成，两端 AI 正在核对并确认同一版本。" : lifecycle.phase === "awaiting_approval" ? "双方已确认下方文档，等待管理员批准。批准后两端自动实施，无需逐项填写任务。" : lifecycle.phase === "executing" ? "两端正在按已批准文档修改各自项目并运行测试，完成后自动汇总报告。" : lifecycle.phase === "joint_verifying" ? "双方正在按批准的用例真实调用并验证对方接口，逐项归档本轮命令和结果。" : lifecycle.phase === "awaiting_review" ? "实施及联合验证结果已汇总。可补充要求重新起草下一轮文档；满意后手动终止任务。" : "管理员已终止此任务，文档、报告和对话记录已保留。"}</p>
     <div className="small muted">计划 {lifecycle.contributions.length}/{lifecycle.requiredParticipantIds.length} · 确认 {lifecycle.confirmations.length}/{lifecycle.requiredParticipantIds.length} · 实施回执 {lifecycle.reports.length}/{lifecycle.requiredParticipantIds.length} · 联合验收回执 {lifecycle.integrationReports.length}/{lifecycle.requiredParticipantIds.length}</div>
     {lifecycle.repair && <div className="notice" aria-label="修复方案"><strong>修复来源：第 {lifecycle.repair.sourceRevision} 轮未通过</strong><p>两端先只读分析失败证据并形成共同修复文档。重新实施和验证须经管理员批准本版；原失败报告与测试记录保留。</p>{lifecycle.repair.failures.map((failure, index) => <p key={index}>{name(failure.participantId)} · {failure.caseId ?? "本方实施"}：{failure.summary}</p>)}{lifecycle.baseline?.report && <details><summary>查看原始失败报告</summary><pre className="message-text" style={{ maxHeight: 600, overflow: "auto", whiteSpace: "pre-wrap" }}>{lifecycle.baseline.report}</pre></details>}</div>}
     {lifecycle.approvalPending && <div className="notice" aria-label="批准前事实核验">管理员已确认本文档，正在自动复核引用事实。只有文档及来源指纹仍一致才续接执行；来源变化会作废本次确认并重新起草。</div>}
@@ -35,6 +39,30 @@ export function LifecyclePanel({ data, run, busy }: { data: CollaborationData; r
     {lifecycle.finalDecision && <div className="notice" aria-label="管理员最终验收决定"><strong>{lifecycle.finalDecision.outcome === "accepted" ? "管理员已确认满意验收" : "管理员已停止任务，未确认满意验收"}</strong><p>第 {lifecycle.finalDecision.revision} 版 · {lifecycle.finalDecision.decidedAt} · 审阅报告 {lifecycle.finalDecision.reviewedReportHash ?? "尚无实施报告"}</p></div>}
     {budgetStops.length > 0 && <div className="notice" aria-label="自动重试预算"><h3>自动推进预算已耗尽</h3>{budgetStops.map(stop => <div key={`${stop.participantId}:${stop.generation}`}><strong>{name(stop.participantId)} / {data.participants.find(row => row.participant.id === stop.participantId)?.agent?.name ?? "未绑定Agent"}</strong><p>{stop.reason}</p>{data.canAdminister && !lifecycle.paused && lifecycle.phase !== "terminated" && <form className="stack" onSubmit={async event => { event.preventDefault(); const form = event.currentTarget; try { await run(path, {action:"grant-retry-budget",revision:lifecycle.revision,phase:lifecycle.phase,participantId:stop.participantId,generation:stop.generation,reason:new FormData(form).get("reason")}); } catch {} }}><label>恢复重试的原因<textarea name="reason" required minLength={10} maxLength={1000} defaultValue="已核对停止原因和现有记录，继续原批准范围内的剩余工作。" /></label><button className="btn" disabled={busy}>授权该Agent新一轮有界重试</button></form>}</div>)}</div>}
     <InformationPanel lifecycle={lifecycle} name={name} busy={busy} onRetry={data.canAdminister && !lifecycle.paused && lifecycle.phase !== "terminated" ? id => { void run(path, { action: "retry-information", requestId: id }).catch(() => undefined); } : undefined} onResolve={data.canAdminister && !lifecycle.paused && lifecycle.phase !== "terminated" ? (id, answer) => run(path, { action: "resolve-information", requestId: id, resolution: answer }) : undefined} />
+    {!!lifecycle.planObjections?.length && <section className="stack" aria-label="契约异议">
+      <h3>契约异议</h3>
+      {lifecycle.planObjections.map(item => <div className="list-item stack" key={item.id}>
+        <strong>{objectionTargetLabel(item.target)} · {item.state === "paused" ? "此异议已停派" : item.state === "addressed" ? "已提交处理结果" : "待处理"}</strong>
+        <p className="small muted">提出方 {name(item.participantId)} · 责任方 {publisher(item.responsibleParticipantId)}</p>
+        <p>{item.reason}</p>
+        <p><strong>恢复条件</strong> {item.resolutionCondition}</p>
+        {item.lastAttempt && item.state !== "addressed" && <p className="small muted">连续 {item.noProgressRounds} 轮无进展 · {item.lastAttempt}</p>}
+        {item.response && <p className="message-text">{item.response.detail}</p>}
+        {data.canAdminister && !lifecycle.paused && lifecycle.phase === "plan_synthesis" && item.state === "paused" &&
+          <form className="stack" onSubmit={async event => {
+            event.preventDefault();
+            const form = event.currentTarget;
+            const evidence = new FormData(form).get("evidence");
+            try {
+              await run(path, { action: "resolve-objection", revision: lifecycle.revision, objectionId: item.id, attempts: item.attempts, evidence });
+              form.reset();
+            } catch {}
+          }}>
+            <label>新证据或业务决定<textarea name="evidence" required minLength={10} maxLength={5000} placeholder="写明满足恢复条件的证据、来源或决定" /></label>
+            <button className="btn btn-secondary" disabled={busy}>提交此异议的依据</button>
+          </form>}
+      </div>)}
+    </section>}
     <div className="notice" aria-label="审阅摘要"><strong>审阅摘要</strong><p>{lifecycle.contract?.scope ?? lifecycle.requirements}</p><p>验收用例 {lifecycle.contract?.acceptanceCases.length ?? 0} · 报告通过 {checks.filter((check) => check.status === "passed").length} · 未通过 {checks.filter((check) => check.status === "failed").length} · 未执行 {checks.filter((check) => check.status === "not_run").length} · 关联命令证据 {checks.filter((check) => check.runIds.length > 0).length}</p>{lifecycle.reports.map((report) => <p key={report.participantId}>{name(report.participantId)} · {report.status}：{report.summary}</p>)}</div>
     {lifecycle.blocks.length > 0 && <div className="notice" aria-label="协作阻塞"><h3>协作阻塞</h3>{lifecycle.blocks.map((block) => <p key={block.participantId}>{name(block.participantId)} · {block.requiresReview ? "等待管理员确认重试" : block.kind === "needs_admin" ? (block.requiresAuthorization ? "需要本机授权" : "查找后仍缺少事实") : block.kind === "gathering_info" ? "自动查找信息中" : block.kind === "waiting_peer" ? "等待对端" : `退避重试 ${block.attempts}/3`}：{block.reason}{block.dependencyParticipantIds.length > 0 && `；等待 ${block.dependencyParticipantIds.map(name).join("、")}`}</p>)}{data.canAdminister && lifecycle.blocks.some((block) => block.kind === "needs_admin" && !block.requiresReview && !block.informationRequestId) && <form className="stack" onSubmit={async (event) => { event.preventDefault(); const form = event.currentTarget; try { await run(path, { action: "resume", resolution: new FormData(form).get("resolution") }); form.reset(); } catch {} }}><label>补充阻塞所缺的事实<textarea name="resolution" required maxLength={5000} placeholder="仅补充事实；修改实施目标请使用补充要求重新起草。" /></label><button className="btn" disabled={busy}>补充事实并继续</button></form>}</div>}
     {data.canAdminister && !lifecycle.paused && review && !codeReview && !lifecycle.blocks.some(block => block.kind === "gathering_info") && <button className="btn" disabled={busy} onClick={() => void run(path, { action: "retry-validation", revision: lifecycle.revision, documentHash: lifecycle.documentHash }).catch(() => undefined)}>确认处理完成并{lifecycle.phase === "executing" ? "重试实施" : "重新验证"}</button>}

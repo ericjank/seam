@@ -1,10 +1,11 @@
 #!/usr/bin/env node
+import { CONNECTOR_PROTOCOL_VERSION } from "../../packages/protocol/dist/index.js";
 import assert from 'node:assert/strict';import {randomUUID}from'node:crypto';import {createRequire}from'node:module';import{SimulationApi}from'./http.mjs';
 assert.equal(process.env.DB_HOST,'mysql');assert.equal(process.env.DB_DATABASE,'seam_simulation_test');assert.equal(process.env.SEAM_HARDENING_PROJECT,'seam-six-hardening');
 const require=createRequire('/app/apps/platform/package.json'),mysql=require('mysql2/promise'),api=new SimulationApi('http://127.0.0.1:3000'),suffix=randomUUID().slice(0,8),checks=[],records=[];let id,uiId;
-const caps={adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:9};
+const caps={adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion: CONNECTOR_PROTOCOL_VERSION};
 async function peers(label){const result=[];for(const side of ['a','b']){const p=await api.register(`hardening-${label}-${side}-${suffix}`,'mock');await api.call('/api/connectors/heartbeat',{agentId:p.agent.id,capabilities:caps},{token:p.agent.token});result.push(p);}return result;}
-const claim=async p=>(await api.call('/api/connectors/poll',{agentId:p.agent.id,waitMs:0,protocolVersion:9,supportsInformationLookup:true},{token:p.agent.token})).job;
+const claim=async p=>(await api.call('/api/connectors/poll',{agentId:p.agent.id,waitMs:0,protocolVersion: CONNECTOR_PROTOCOL_VERSION,supportsInformationLookup:true},{token:p.agent.token})).job;
 const complete=(p,j,actions=[])=>api.call('/api/connectors/complete',{agentId:p.agent.id,jobId:j.id,attempts:j.attempts,status:'completed',result:{agentTurn:{message:'明确合成协议夹具，不代表真实业务或模型执行',actions,kind:'status',notifyParticipantIds:[],needsHumanInput:false}}},{token:p.agent.token});
 const content='只验证隔离协议状态及重试授权，不执行任何业务实现，不声明真实测试通过。'.repeat(5);
 function contract(ids){return {effectiveRequirements:[{id:'fixture',text:'只验证合成协议',verification:'review'}],retiredRequirements:[],factRefs:[],serviceExpectations:[],scope:content,interfaces:[{id:'fixture',definition:content}],responsibilities:ids.map(participantId=>({participantId,changes:content})),acceptanceCases:ids.map((runnerParticipantId,i)=>({id:`fixture-${i}`,runnerParticipantId,description:content,command:'node --test fixture.test.mjs',expectedResult:'只验证协议，不声明实际执行',requiredAssertions:['synthetic only']})),risks:'仅隔离数据库，自有任务，所有回执明确合成',changeSummary:'验证管理员新预算，文档与批准指纹不变',impactedParticipantIds:ids,retainedDecisions:[]};}

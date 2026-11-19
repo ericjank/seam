@@ -4,7 +4,7 @@ import { requireCollaborationAccess } from "@/lib/access";
 import { requireUser } from "@/lib/auth";
 import { handleApiError } from "@/lib/http";
 import { drainWorkflowWakeups } from "@/services/workflow-outbox";
-import { appendLifecycleRequirements, approveLifecycle, getLifecycleContext, pauseLifecycle, startLifecycle, terminateLifecycle, retryInformationLookup, retryLifecycleValidation, resolveInformation, grantRetryBudget } from "@/services/lifecycle";
+import { appendLifecycleRequirements, approveLifecycle, getLifecycleContext, pauseLifecycle, startLifecycle, terminateLifecycle, retryInformationLookup, retryLifecycleValidation, resolveInformation, grantRetryBudget, resolvePausedObjection } from "@/services/lifecycle";
 
 const inputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("grant-retry-budget"), revision: z.number().int().positive(), phase: z.string(), participantId: z.string().uuid(), generation: z.number().int().nonnegative(), reason: z.string().trim().min(10).max(1000) }),
@@ -16,6 +16,8 @@ const inputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("resume"), resolution: z.string().trim().min(1).max(5000).optional() }),
   z.object({ action: z.literal("retry-information"), requestId: z.string().uuid() }),
   z.object({ action: z.literal("resolve-information"), requestId: z.string().uuid(), resolution: z.string().trim().min(1).max(5000) }),
+  z.object({ action: z.literal("resolve-objection"), revision: z.number().int().positive(), objectionId: z.string().uuid(),
+    attempts: z.number().int().nonnegative(), evidence: z.string().trim().min(10).max(5000) }),
   z.object({ action: z.literal("retry-validation"), revision: z.number().int().positive(), documentHash: z.string().regex(/^[a-f0-9]{64}$/) }),
 ]);
 
@@ -37,6 +39,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       : input.action === "grant-retry-budget" ? await grantRetryBudget(user.id, id, input)
       : input.action === "retry-information" ? await retryInformationLookup(user.id, id, input.requestId)
       : input.action === "resolve-information" ? await resolveInformation(user.id, id, input.requestId, input.resolution)
+      : input.action === "resolve-objection" ? await resolvePausedObjection(user.id, id, input)
       : input.action === "retry-validation" ? await retryLifecycleValidation(user.id, id, input)
       : input.action === "approve" ? await approveLifecycle(user.id, id, input)
         : input.action === "append" ? await appendLifecycleRequirements(user.id, id, input)

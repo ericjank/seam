@@ -156,7 +156,8 @@ export const acceptanceSubmitActionSchema = z.object({
   evidence: z.record(z.string(), z.unknown()).default({}),
 });
 
-export const CONNECTOR_PROTOCOL_VERSION = 9;
+export const PLAN_OBJECTION_PROTOCOL_VERSION = 10;
+export const CONNECTOR_PROTOCOL_VERSION = 10;
 export const testFileSchema = z.object({ path: z.string().min(1).max(1000), sha256: z.string().length(64) });
 export const httpCheckSchema = z.object({
   requirementIds: z.array(z.string().min(1).max(100)).min(1).max(200).optional(),
@@ -177,6 +178,10 @@ export const workspaceBaselineSchema = z.object({
   head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(), testFiles: z.array(testFileSchema).max(500).optional(),
 });
 export const requirementSchema = z.object({ id: z.string().min(1).max(100), text: z.string().min(1).max(10_000), verification: z.enum(["http", "command", "review"]).optional() });
+export const interfaceFieldSchema = z.object({
+  path: z.string().trim().min(1).max(200).regex(/^[\w$-]+(?:\.[\w$-]+)*$/),
+  definition: z.string().trim().min(1).max(5000),
+});
 export const factBindingSchema = z.object({ key: z.string().max(200), value: z.string(), sourceHash: z.string().length(64) });
 export const serviceExpectationSchema = z.object({
   name: z.string().min(1).max(100), publisherParticipantId: idSchema,
@@ -190,7 +195,10 @@ export const sharedContractSchema = z.object({
   retiredRequirements: z.array(z.object({ id: z.string().min(1).max(100), reason: z.string().min(1).max(5000) })).max(200).optional(),
   serviceExpectations: z.array(serviceExpectationSchema).max(30).optional(),
   scope: z.string().min(20).max(20_000),
-  interfaces: z.array(z.object({ id: z.string().min(1).max(100), definition: z.string().min(20).max(20_000) })).min(1).max(30),
+  interfaces: z.array(z.object({
+    id: z.string().min(1).max(100), definition: z.string().min(20).max(20_000),
+    fields: z.array(interfaceFieldSchema).max(100).optional(),
+  })).min(1).max(30),
   responsibilities: z.array(z.object({ participantId: idSchema, changes: z.string().min(20).max(20_000), mode: z.enum(["implement", "verify_only"]).optional() })).min(2).max(50),
   httpDefinitions: z.array(httpCheckSchema).max(3000).optional(),
   acceptanceCases: z.array(z.object({
@@ -318,12 +326,51 @@ export const integrationCheckSchema = z.object({
   category: z.enum(["code", "environment", "missing_information", "authorization", "unknown"]).optional(),
 });
 export const lifecyclePhaseSchema = z.enum(["planning", "plan_synthesis", "plan_confirmation", "awaiting_approval", "executing", "joint_verifying", "awaiting_review", "terminated"]);
+
+const contractItemId = z.string().trim().min(1).max(100);
+export const planObjectionTargetSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("requirement"), id: contractItemId }),
+  z.object({ kind: z.literal("interface_field"), id: contractItemId, path: interfaceFieldSchema.shape.path }),
+  z.object({ kind: z.literal("acceptance_case"), id: contractItemId }),
+]);
+export const planObjectionIssueSchema = z.object({
+  target: planObjectionTargetSchema, responsibleParticipantId: idSchema,
+  reason: z.string().trim().min(10).max(5000), resolutionCondition: z.string().trim().min(10).max(5000),
+});
+export const planObjectionTaskSchema = z.object({ objectionId: idSchema, attempt: z.number().int().positive() });
+export const planObjectionChangeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("requirement"), requirement: requirementSchema }),
+  z.object({ kind: z.literal("interface_field"), field: interfaceFieldSchema }),
+  z.object({ kind: z.literal("acceptance_case"), acceptanceCase: sharedContractSchema.shape.acceptanceCases.element }),
+]);
+export const planObjectionEvidenceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("project_file"), path: z.string().trim().min(1).max(1000), finding: z.string().trim().min(10).max(5000), contentHash: z.string().regex(/^[a-f0-9]{64}$/).optional() }),
+  z.object({ kind: z.literal("shared_fact"), key: z.string().trim().min(1).max(200) }),
+]);
+export const planObjectionSchema = planObjectionIssueSchema.extend({
+  id: idSchema, participantId: idSchema, documentHash: z.string().length(64),
+  state: z.enum(["open", "paused", "addressed"]),
+  attempts: z.number().int().nonnegative(), noProgressRounds: z.number().int().nonnegative(),
+  lastAttempt: z.string().max(5000).optional(),
+  response: z.object({
+    kind: z.enum(["change", "project_file", "shared_fact", "administrator"]),
+    detail: z.string().max(12_000),
+  }).optional(),
+});
+export type PlanObjection = z.infer<typeof planObjectionSchema>;
+export type PlanObjectionTask = z.infer<typeof planObjectionTaskSchema>;
+export type PlanObjectionChange = z.infer<typeof planObjectionChangeSchema>;
+export type PlanObjectionEvidence = z.infer<typeof planObjectionEvidenceSchema>;
+
 export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("plan.submit"), revision: z.number().int().positive(), content: z.string().min(100).max(100_000), baseline: workspaceBaselineSchema.optional(), factRefs: z.array(z.string().min(1).max(200)).max(200).optional() }),
   z.object({ type: z.literal("plan.amend"), revision: z.number().int().positive(), changes: z.string().min(20).max(20_000), baseline: workspaceBaselineSchema.optional(), factRefs: z.array(z.string().min(1).max(200)).max(200).optional() }),
   z.object({ type: z.literal("plan.patch"), revision: z.number().int().positive(), baseDocumentHash: z.string().length(64), delta: contractDeltaSchema }),
   z.object({ type: z.literal("plan.compose"), revision: z.number().int().positive(), baseDocumentHash: z.string().length(64).nullable(), contract: sharedContractSchema }),
-  z.object({ type: z.literal("plan.reject"), revision: z.number().int().positive(), documentHash: z.string().length(64), reason: z.string().min(10).max(10_000) }),
+  z.object({ type: z.literal("plan.reject"), revision: z.number().int().positive(), documentHash: z.string().length(64), reason: z.string().min(10).max(10_000),
+    objections: z.array(planObjectionIssueSchema).min(1).max(20).optional() }),
+  z.object({ type: z.literal("plan.resolve"), revision: z.number().int().positive(), ...planObjectionTaskSchema.shape,
+    change: planObjectionChangeSchema.nullable(), evidence: planObjectionEvidenceSchema.nullable(), summary: z.string().trim().min(1).max(2000) }),
   z.object({ type: z.literal("plan.confirm"), revision: z.number().int().positive(), documentHash: z.string().length(64) }),
   z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}), runs: z.array(commandEvidenceSchema).max(200).default([]), category: workflowBlockSchema.shape.category, testFiles: z.array(testFileSchema).max(500).optional() }),
   z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100), runs: z.array(commandEvidenceSchema).max(200).default([]), independentResults: z.array(independentResultSchema).max(500).optional(), testFiles: z.array(testFileSchema).max(500).optional() }),
@@ -335,10 +382,13 @@ export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
     attempt: z.number().int().positive().optional(), value: z.string().max(10_000).optional(), validForSeconds: z.number().int().min(30).max(86400).optional() }),
 ]);
 export type LifecycleAgentAction = z.infer<typeof lifecycleAgentActionSchema>;
-export function lifecycleActions(phase: string, informationOnly = false): string[] {
+export function lifecycleActions(phase: string, informationOnly = false, objectionOnly = false, protocolVersion = 1): string[] {
+  if (phase === "paused") return [];
   if (informationOnly) return ["information.respond"];
+  if (objectionOnly) return ["plan.resolve"];
   const actions: Record<string, string[]> = { planning: ["plan.submit", "plan.amend"], plan_synthesis: ["plan.compose", "plan.patch"], plan_confirmation: ["plan.confirm", "plan.reject", "plan.submit"],
     executing: ["execution.report", "artifact.upsert", "work.create", "work.update", "acceptance.submit", "service.publish"], joint_verifying: ["integration.report", "service.publish"] };
+  if (phase === "plan_confirmation" && protocolVersion >= PLAN_OBJECTION_PROTOCOL_VERSION) actions.plan_confirmation = ["plan.confirm", "plan.reject"];
   return actions[phase] ? [...actions[phase]!, "workflow.blocked", "information.request"] : [];
 }
 export const lifecycleContextSchema = z.object({
@@ -357,6 +407,8 @@ export const lifecycleContextSchema = z.object({
   attemptHistory: z.array(z.object({ id: z.string(), phase: z.string(), report: z.string(), createdAt: z.string(), approvedById: z.string() })).max(100).default([]),
   repair: repairContextSchema.nullish(), informationRequests: z.array(informationRequestSchema).max(500).default([]), facts: z.array(sharedFactSchema).max(200).default([]),
   objections: z.array(z.object({ participantId: idSchema, documentHash: z.string(), reason: z.string() })).default([]),
+  planObjections: z.array(planObjectionSchema).max(200).optional(),
+  objectionDraft: sharedContractSchema.nullish(),
   baseline: z.object({ revision: z.number(), documentHash: z.string().nullable(), document: z.string().nullable(), contract: sharedContractSchema.nullable(), report: z.string().nullable(), informationRequests: z.array(informationRequestSchema).optional(), failureDigest: z.array(z.object({ participantId: idSchema, summary: z.string(), checks: z.array(z.object({ caseId:z.string(),status:z.string(),summary:z.string() })), independentResults:z.array(independentResultSchema), runs:z.array(z.object({id:z.string(),command:z.string(),exitCode:z.number().nullable()})) })).optional() }).nullable().optional(),
   contributions: z.array(z.object({ participantId: idSchema, content: z.string(), baseline: workspaceBaselineSchema.nullable().optional(), factRefs: z.array(z.string()).optional() })),
   confirmations: z.array(idSchema),
@@ -368,6 +420,32 @@ export const lifecycleContextSchema = z.object({
   evidenceRuns: z.array(commandEvidenceSchema.extend({ participantId: idSchema })).default([]),
 });
 export type LifecycleContext = z.infer<typeof lifecycleContextSchema>;
+
+export function objectionTargetKey(target: PlanObjection["target"]) {
+  return JSON.stringify([target.kind, target.id, target.kind === "interface_field" ? target.path : null]);
+}
+
+export function objectionTargetLabel(target: PlanObjection["target"]) {
+  if (target.kind === "interface_field") return `接口 ${target.id} / ${target.path}`;
+  return `${target.kind === "requirement" ? "需求" : "验收用例"} ${target.id}`;
+}
+
+export function currentObjectionReviewers(lifecycle: Pick<LifecycleContext, "documentHash" | "planObjections">) {
+  return new Set((lifecycle.planObjections ?? []).filter(row => row.state === "open" && row.documentHash === lifecycle.documentHash).map(row => row.participantId));
+}
+
+export function planObjectionTaskFor(lifecycle: LifecycleContext, participantId: string): PlanObjectionTask | null {
+  if (lifecycle.paused || lifecycle.phase !== "plan_synthesis" || !lifecycle.documentHash) return null;
+  const open = (lifecycle.planObjections ?? []).filter(row => row.state === "open");
+  const targets = new Set<string>();
+  for (const row of open.sort((a, b) => a.noProgressRounds - b.noProgressRounds)) {
+    const target = objectionTargetKey(row.target);
+    if (targets.has(target)) continue;
+    targets.add(target);
+    if (row.responsibleParticipantId === participantId) return { objectionId: row.id, attempt: row.attempts + 1 };
+  }
+  return null;
+}
 
 /** A fact lookup is always a separate, read-only turn, including during execution. */
 export function informationTaskFor(lifecycle: LifecycleContext, participantId: string) {
@@ -423,6 +501,7 @@ export type AdapterTelemetry = z.infer<typeof adapterTelemetrySchema>;
 export const collaborationContextSchema = z.object({
   lifecycle: lifecycleContextSchema.nullish(),
   informationTask: z.object({ requestId: idSchema, mode: z.enum(["local", "peer", "reconcile", "verify"]), attempt: z.number().int().positive().optional() }).nullish(),
+  planObjectionTask: planObjectionTaskSchema.nullish(),
   localDiscovery: z.object({ files: z.array(z.string()).max(100), testCommands: z.array(z.string()).max(20) }).optional(),
   jobId: idSchema.optional(),
   collaborationId: idSchema,

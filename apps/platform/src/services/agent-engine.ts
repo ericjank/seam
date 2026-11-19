@@ -1,7 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
 import { collaborations, connectorJobs, messages, participants } from "@/db/schema";
-import { agentTurnResultSchema, informationTaskFor, lifecycleActions, type CollaborationContext, type Participant } from "@seam/protocol";
+import { agentTurnResultSchema, currentObjectionReviewers, informationTaskFor, lifecycleActions, planObjectionTaskFor, type CollaborationContext, type Participant } from "@seam/protocol";
 import { newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
 import { normalizeLifecycleOutcome } from "@/lib/lifecycle-outcome";
@@ -15,7 +15,7 @@ import { createProposal, decideProposal } from "./proposals";
 import { createWorkItem, updateWorkItem } from "./work-items";
 import { requestCredential } from "./credentials";
 import { submitAcceptance } from "./acceptance";
-import { applyLifecycleAction, assertLifecycleJobCurrent, getLifecycleContext, recordRetryBudgetStop, type LifecycleSnapshot } from "./lifecycle";
+import { applyLifecycleAction, assertLifecycleJobCurrent, getLifecycleContext, recordFailedObjectionTurn, recordRetryBudgetStop, type LifecycleSnapshot } from "./lifecycle";
 
 export async function dispatchAgentTurns(userId: string, collaborationId: string, participantIds?: string[], options: { autoAdvance?: boolean } = {}) {
   await requireCollaborationAccess(userId, collaborationId, true);
@@ -49,8 +49,17 @@ async function enqueueManaged(detail:Awaited<ReturnType<typeof getCollaborationD
       participantIds=[];
       for(const id of eligibleIds) {
         const info=informationTaskFor(lifecycle,id),agentId=detail.participants.find(row=>row.participant.id===id)?.participant.agentId;
+        const objection = !info && planObjectionTaskFor(lifecycle, id);
+        if (objection) {
+          const recorded = history.some(job => {
+            const scope = (job.payload as { context?: CollaborationContext }).context?.planObjectionTask;
+            return scope?.objectionId === objection.objectionId && scope.attempt === objection.attempt;
+          });
+          if (!recorded) participantIds.push(id);
+          continue;
+        }
         const grant=lifecycle.retryBudget?.grants.filter(row=>row.participantId===id&&row.phase===lifecycle.phase).at(-1);
-        const count=history.filter(job=>{const context=(job.payload as {context?:CollaborationContext}).context;return (!grant||job.sequence>grant.afterSequence)&&["completed","failed"].includes(job.status)&&job.agentId===agentId&&context?.lifecycle?.revision===lifecycle!.revision&&context.lifecycle.phase===lifecycle!.phase&&!context.informationTask;}).length;
+        const count=history.filter(job=>{const context=(job.payload as {context?:CollaborationContext}).context;return (!grant||job.sequence>grant.afterSequence)&&["completed","failed"].includes(job.status)&&job.agentId===agentId&&context?.lifecycle?.revision===lifecycle!.revision&&context.lifecycle.phase===lifecycle!.phase&&!context.informationTask&&!context.planObjectionTask;}).length;
         if(info||count<Math.min(detail.collaboration.maxNegotiationRounds??12,12))participantIds.push(id);
         else {
           const key=`${lifecycle.revision}:${lifecycle.phase}:${id}:${grant?.generation??0}`;
@@ -113,9 +122,11 @@ export function buildContext(detail: Awaited<ReturnType<typeof getCollaborationD
     body: `上次交接未被平台接受，修改已回滚。请修正以下问题后重新提交：${lastReceipt.error.slice(0, 2000)}`,
     metadata: { rejectedJobId: lastReceipt.id }, createdAt: lastReceipt.updatedAt.toISOString(),
   }] : [];
+  const informationTask = detail.lifecycle ? informationTaskFor(detail.lifecycle, participantId) : null;
   return {
     lifecycle: detail.lifecycle,
-    informationTask: detail.lifecycle ? informationTaskFor(detail.lifecycle, participantId) : null,
+    informationTask,
+    planObjectionTask: detail.lifecycle && !informationTask ? planObjectionTaskFor(detail.lifecycle, participantId) : null,
     jobId, collaborationId: detail.collaboration.id, title: detail.collaboration.title,
     type: detail.collaboration.type, status: detail.collaboration.status, objective: detail.collaboration.objective,
     participant, participants: participantRows,
@@ -147,12 +158,23 @@ export function buildContext(detail: Awaited<ReturnType<typeof getCollaborationD
 // Refresh at claim time, rather than making a queued agent act on an obsolete snapshot.
 export async function refreshAgentJobContext(job: { id: string; kind: string; agentId: string; collaborationId: string | null; payload: unknown }) {
   if (job.kind !== "collaboration.turn" || !job.collaborationId) return job.payload;
-  await assertLifecycleJobCurrent(job.collaborationId, (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot);
+  const payload = job.payload as { lifecycleSnapshot?: LifecycleSnapshot; context?: CollaborationContext };
+  await assertLifecycleJobCurrent(job.collaborationId, payload.lifecycleSnapshot);
   const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId)).limit(1);
   const [participant] = await db.select().from(participants).where(and(eq(participants.agentId, job.agentId), eq(participants.collaborationId, job.collaborationId))).limit(1);
   if (!collaboration || participant?.status !== "active") throw new HttpError(409, "协作或有效参与方已不存在");
   const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
-  return { ...(job.payload as Record<string, unknown>), context: buildContext(detail, participant.id, job.id) };
+  const context = buildContext(detail, participant.id, job.id);
+  const assigned = payload.context?.planObjectionTask;
+  if (assigned) {
+    const item = context.lifecycle?.planObjections?.find(row => row.id === assigned.objectionId);
+    if (!item || item.state !== "open" || item.responsibleParticipantId !== participant.id || item.attempts + 1 !== assigned.attempt) throw new HttpError(409, "异议派发已失效");
+    context.planObjectionTask = assigned;
+    context.informationTask = null;
+  } else if (context.planObjectionTask) {
+    throw new HttpError(409, "请领取当前单独派发的异议任务");
+  }
+  return { ...payload, context };
 }
 
 export async function completeAgentTurn(jobId: string, result: unknown) {
@@ -167,12 +189,16 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
   const lifecycle = await assertLifecycleJobCurrent(collaboration.id, (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot);
   if (lifecycle) {
-    const informationTask = (job.payload as { context?: CollaborationContext }).context?.informationTask;
-    if (!informationTask) turn = normalizeLifecycleOutcome(turn, lifecycle.revision);
-    const allowed = lifecycleActions(lifecycle.phase, Boolean(informationTask));
+    const { informationTask, planObjectionTask } = (job.payload as { context?: CollaborationContext }).context ?? {};
+    if (planObjectionTask && turn.actions.length === 0) turn = { ...turn, actions: [{ type: "plan.resolve", revision: lifecycle.revision,
+      ...planObjectionTask, summary: turn.message.slice(0, 2000), change: null, evidence: null }] };
+    else if (!informationTask && !planObjectionTask) turn = normalizeLifecycleOutcome(turn, lifecycle.revision);
+    const phase = (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot?.phase ?? lifecycle.phase;
+    const allowed = lifecycleActions(phase, Boolean(informationTask), Boolean(planObjectionTask), lifecycle.protocolVersion);
     if (turn.actions.some((action) => !allowed.includes(action.type))) throw new HttpError(409, "动作不符合当前生命周期阶段");
     if (informationTask && turn.actions.some(action => action.type !== "information.respond" || action.requestId !== informationTask.requestId || (action.attempt ?? 1) !== (informationTask.attempt ?? 1))) throw new HttpError(409, "只读信息任务只能答复本次分配的问题及查找轮次");
-    if (turn.actions.filter((action) => ["plan.submit", "plan.amend", "plan.patch", "plan.compose", "plan.confirm", "plan.reject", "execution.report", "integration.report", "workflow.blocked", "information.request", "information.respond"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交一项当前阶段成果或明确阻塞");
+    if (planObjectionTask && turn.actions.some(action => action.type !== "plan.resolve" || action.objectionId !== planObjectionTask.objectionId || action.attempt !== planObjectionTask.attempt)) throw new HttpError(409, "本轮仅可提交已派发异议的处理结果");
+    if (turn.actions.filter((action) => ["plan.submit", "plan.amend", "plan.patch", "plan.compose", "plan.confirm", "plan.reject", "plan.resolve", "execution.report", "integration.report", "workflow.blocked", "information.request", "information.respond"].includes(action.type)).length !== 1) throw new HttpError(422, "每轮必须提交一项当前阶段成果或明确阻塞");
   }
   // Validate the entire batch before applying any action. An Agent can participate in
   // multiple collaborations, but IDs from one run must never affect another.
@@ -185,7 +211,7 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
   const actor = { kind: "participant" as const, id: participant.id };
   let changed = false;
   for (const action of turn.actions) {
-    if (action.type === "plan.submit" || action.type === "plan.amend" || action.type === "plan.patch" || action.type === "plan.compose" || action.type === "plan.reject" || action.type === "plan.confirm" || action.type === "execution.report" || action.type === "integration.report" || action.type === "workflow.blocked" || action.type === "service.publish" || action.type === "information.request" || action.type === "information.respond") {
+    if (action.type === "plan.submit" || action.type === "plan.amend" || action.type === "plan.patch" || action.type === "plan.compose" || action.type === "plan.reject" || action.type === "plan.confirm" || action.type === "plan.resolve" || action.type === "execution.report" || action.type === "integration.report" || action.type === "workflow.blocked" || action.type === "service.publish" || action.type === "information.request" || action.type === "information.respond") {
       if (!lifecycle) throw new HttpError(409, "当前协作尚未启用管理员审批流程");
       const outcome = await applyLifecycleAction(actor, job.collaborationId, action);
       changed ||= outcome.changed;
@@ -236,13 +262,18 @@ export async function advanceAgentWorkflow(jobId: string) {
     const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId!)).limit(1).for("update");
     if (!collaboration) return;
     const allJobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, collaboration.id), eq(connectorJobs.kind, "collaboration.turn")));
-    const detail=await getCollaborationDetail(collaboration.createdById,collaboration.id);
+    let detail=await getCollaborationDetail(collaboration.createdById,collaboration.id);
     if(detail.lifecycle) {
       const snapshot=(job.payload as {lifecycleSnapshot?:LifecycleSnapshot}).lifecycleSnapshot;
       if(!snapshot||snapshot.revision!==detail.lifecycle.revision)return;
       const transitions:Record<string,string[]>={planning:["planning","plan_synthesis"],plan_synthesis:["plan_synthesis","plan_confirmation"],plan_confirmation:["plan_confirmation","plan_synthesis"],executing:["executing","joint_verifying"],joint_verifying:["joint_verifying","planning"]};
       if(!transitions[snapshot.phase]?.includes(detail.lifecycle.phase))return;
       if(detail.lifecycle.paused||detail.lifecycle.phase==="terminated"||!["planning","plan_synthesis","plan_confirmation","executing","joint_verifying"].includes(detail.lifecycle.phase)&&!detail.lifecycle.requiredParticipantIds.some(id=>informationTaskFor(detail.lifecycle!,id)))return;
+      const scope = (job.payload as { context?: CollaborationContext }).context?.planObjectionTask;
+      if (job.status === "failed" && scope) {
+        await recordFailedObjectionTurn(collaboration.id, snapshot, scope, job.error ?? "责任方未提交此异议的修改或证据");
+        detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
+      }
       await enqueueManaged(detail,allJobs.filter(row=>["pending","running"].includes(row.status)),undefined,{autoAdvance:true});return;
     }
     const runJobs = allJobs.filter((j) => (j.payload as { workflow?: Workflow }).workflow?.id === workflow.id);
@@ -293,10 +324,14 @@ function lifecycleTargets(lifecycle: NonNullable<Awaited<ReturnType<typeof getLi
   if (lifecycle.paused) return [];
   const informationTargets = lifecycle.requiredParticipantIds.filter(id => informationTaskFor(lifecycle, id));
   if (informationTargets.length) return informationTargets;
+  if (lifecycle.phase === "plan_synthesis" && lifecycle.documentHash && lifecycle.planObjections?.some(row => row.state !== "addressed")) {
+    return lifecycle.requiredParticipantIds.filter(id => planObjectionTaskFor(lifecycle, id));
+  }
   if (lifecycle.blocks?.some((block) => block.kind === "needs_admin")) return [];
+  const objectors = currentObjectionReviewers(lifecycle);
   const eligible = lifecycle.phase === "plan_synthesis" ? [lifecycle.coordinatorParticipantId ?? lifecycle.requiredParticipantIds[0]!] : lifecycle.requiredParticipantIds.filter((id) => lifecycle.phase === "planning"
     ? !lifecycle.contributions.some((entry) => entry.participantId === id)
-    : lifecycle.phase === "plan_confirmation" ? !lifecycle.confirmations.includes(id)
+    : lifecycle.phase === "plan_confirmation" ? !lifecycle.confirmations.includes(id) && !objectors.has(id)
     : lifecycle.phase === "executing" ? !lifecycle.reports.some((entry) => entry.participantId === id)
     : lifecycle.phase === "joint_verifying" ? !lifecycle.integrationReports.some((entry) => entry.participantId === id) : false);
   return eligible.filter((id) => {

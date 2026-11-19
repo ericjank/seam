@@ -1,3 +1,4 @@
+import { CONNECTOR_PROTOCOL_VERSION } from "@seam/protocol";
 import { capturePublicScreenshot } from "../../../scripts/evidence/public_screenshot.mjs";
 import { fixtureContract, fixtureRuns } from "../tests/fixtures/shared-contract";
 import { randomUUID } from "node:crypto";
@@ -20,7 +21,7 @@ test.afterEach(async ({ page }) => {
 });
 
 async function post(request: APIRequestContext, path: string, data: unknown, agent?: Agent) {
-  if (path == "/api/connectors/poll") data = { protocolVersion: 9, supportsInformationLookup: true, ...(data as object) };
+  if (path == "/api/connectors/poll") data = { protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true, ...(data as object) };
   const response = await request.post(path, { data, ...(agent ? { headers: { authorization: `Bearer ${agent.token}` } } : {}) });
   expect(response.ok(), `${path}: ${await response.text()}`).toBeTruthy();
   return response.json();
@@ -43,7 +44,7 @@ async function preparePeers(request: APIRequestContext, onlineBoth = true): Prom
     peers.push({ project, agent });
   }
   for (const peer of onlineBoth ? peers : peers.slice(0, 1)) {
-    await post(request, "/api/connectors/heartbeat", { agentId: peer.agent.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 9 } }, peer.agent);
+    await post(request, "/api/connectors/heartbeat", { agentId: peer.agent.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION } }, peer.agent);
   }
   return peers;
 }

@@ -1,3 +1,4 @@
+import { CONNECTOR_PROTOCOL_VERSION, type PlanObjectionTask } from "@seam/protocol";
 import { fixtureContract, fixtureRuns } from "./fixtures/shared-contract";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -13,7 +14,7 @@ let cookie = "";
 let memberCookie = "";
 const checks: string[] = [];
 type Local = { projectId: string; agentId: string; token: string };
-type Claimed = { id: string; attempts: number; payload: { context: { participant: { id: string }; lifecycle: { revision: number; documentHash: string } } } };
+type Claimed = { id: string; attempts: number; payload: { context: { participant: { id: string }; lifecycle: { revision: number; documentHash: string }; planObjectionTask?: PlanObjectionTask } } };
 
 async function raw(path: string, body?: unknown, options: { token?: string; session?: string; method?: string } = {}) {
   const response = await fetch(`${base}${path}`, {
@@ -49,7 +50,7 @@ async function register(label: string): Promise<Local> {
   return { projectId: project.id, agentId: agent.id, token: agent.token };
 }
 async function claim(local: Local): Promise<Claimed> {
-  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: 9, supportsInformationLookup: true }, { token: local.token });
+  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true }, { token: local.token });
   assert.ok(result.job, "the platform must automatically enqueue the expected turn");
   return result.job;
 }
@@ -79,7 +80,7 @@ async function main() {
   await expected("/api/collaborations", create, 409);
   const listed = await api("/api/collaborations", undefined, { method: "GET" });
   assert.ok(!listed.collaborations.some((row: any) => row.collaboration.title === create.title));
-  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 9 } }, { token: local.token });
+  for (const local of [first, second]) await api("/api/connectors/heartbeat", { agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION } }, { token: local.token });
   const created = await api("/api/collaborations", create);
   const path = `/api/collaborations/${created.id}`;
   const detail = () => api(path, undefined, { method: "GET" });
@@ -116,13 +117,46 @@ async function main() {
   await compose();
   const beforeEdit = (await detail()).lifecycle;
   const aConfirm = await claim(first), bConfirm = await claim(second);
+  const [a, b] = [aConfirm.payload.context.participant.id, bConfirm.payload.context.participant.id];
+  const acceptanceCase = beforeEdit.contract.acceptanceCases.find((row: { runnerParticipantId: string }) => row.runnerParticipantId === b);
+  await complete(second, bConfirm, { type: "plan.reject", revision: 1, documentHash: beforeEdit.documentHash, reason: "错误状态和对端验收结果需要明确约定",
+    objections: [
+      { target: { kind: "interface_field", id: "quote", path: "response.status" }, responsibleParticipantId: a,
+        reason: "无效数量的接口状态码缺少字段级约定", resolutionCondition: "明确无效数量的状态码并拿到对应依据" },
+      { target: { kind: "acceptance_case", id: acceptanceCase.id }, responsibleParticipantId: b,
+        reason: "验收预期需进一步明确失败时的客户端行为", resolutionCondition: "在目标用例写明客户端将错误传回调用方" },
+    ],
+  });
+  assert.equal((await detail()).lifecycle.phase, "plan_confirmation", "the other review can finish");
   await confirm(first, aConfirm);
-  await complete(second, bConfirm, { type: "plan.reject", revision: 1, documentHash: beforeEdit.documentHash, reason: "请在共同范围中明确本轮错误边界与测试责任" });
   const rejected = (await detail()).lifecycle;
-  assert.deepEqual(rejected.confirmations, []); assert.equal(rejected.objections.length, 1);
-  await compose("本次明确错误边界及双方测试责任。");
+  assert.equal(rejected.phase, "plan_synthesis");
+  assert.equal(rejected.planObjections.length, 2);
+  const scopeA = rejected.planObjections.find((row: { responsibleParticipantId: string }) => row.responsibleParticipantId === a);
+  for (const attempt of [1, 2]) {
+    const job = await claim(first);
+    assert.deepEqual(job.payload.context.planObjectionTask, { objectionId: scopeA.id, attempt });
+    await complete(first, job, []);
+  }
+  const paused = (await detail()).lifecycle;
+  assert.equal(paused.documentHash, beforeEdit.documentHash);
+  assert.equal(paused.planObjections.find((row: { id: string }) => row.id === scopeA.id).state, "paused");
+  await api(`${path}/dispatch`, { autoAdvance: true });
+  const noDispatch = await api("/api/connectors/poll", { agentId: first.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true }, { token: first.token });
+  assert.equal(noDispatch.job, null);
+  const bResolve = await claim(second);
+  assert.ok(bResolve.payload.context.planObjectionTask);
+  await complete(second, bResolve, { ...bResolve.payload.context.planObjectionTask, type: "plan.resolve", revision: 1, evidence: null,
+    summary: "仅在目标用例明确客户端错误传递", change: { kind: "acceptance_case", acceptanceCase: {
+      ...acceptanceCase, httpCheckRefs: undefined, httpChecks: [], expectedResult: `${acceptanceCase.expectedResult}，且客户端将错误传回调用方`,
+    } },
+  });
+  assert.equal((await detail()).lifecycle.documentHash, beforeEdit.documentHash);
+  await lifecycle({ action: "resolve-objection", revision: 1, objectionId: scopeA.id, attempts: 2, evidence: "公开兼容用例记录无效数量返回 HTTP 400，保留既有状态码。" });
   const afterEdit = (await detail()).lifecycle;
   assert.notEqual(afterEdit.documentHash, beforeEdit.documentHash);
+  assert.ok(afterEdit.document.includes("客户端将错误传回调用方"));
+  assert.equal(afterEdit.planObjections.every((row: { state: string }) => row.state === "addressed"), true);
   const staleHash = await claim(first);
   await complete(first, staleHash, { type: "plan.confirm", revision: 1, documentHash: beforeEdit.documentHash }, 409);
   await confirm(second); await confirm(first);
@@ -131,7 +165,7 @@ async function main() {
   assert.ok(ready.document.includes("唯一接口契约")); assert.ok(ready.document.includes("联合验收"));
   await expected(`${path}/lifecycle`, { action: "approve", revision: 1, documentHash: "0".repeat(64) }, 409);
   await expected(`${path}/lifecycle`, { action: "terminate", revision: 1 }, 409);
-  checks.push("统一契约仅协调方汇总；异议作废双方确认；修订后拒绝旧hash；管理员批准前禁止实施");
+  checks.push("两轮无进展仅停派对应字段异议；其他用例异议继续；补证后重新确认；修订后拒绝旧hash");
 
   const memberEmail = `lifecycle-negative-${suffix}@seam.test`, memberPassword = `Fixture-${suffix}`;
   await api("/api/users", { name: "生命周期普通成员", email: memberEmail, password: memberPassword, role: "member" });

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { CONNECTOR_PROTOCOL_VERSION } from "../../packages/protocol/dist/index.js";
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -9,9 +10,9 @@ assert.equal(process.env.DB_HOST,'mysql');assert.equal(process.env.DB_DATABASE,'
 const require=createRequire('/app/apps/platform/package.json'),mysql=require('mysql2/promise');
 const db=await mysql.createConnection({host:'mysql',user:process.env.DB_USERNAME,password:process.env.DB_PASSWORD,database:process.env.DB_DATABASE,timezone:'Z'});
 const api=new SimulationApi('http://127.0.0.1:3000'),checks=[],observations=[],suffix=randomUUID().slice(0,8);
-const caps={adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:9};
+const caps={adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion: CONNECTOR_PROTOCOL_VERSION};
 const heartbeat=(peer,version=9)=>api.call('/api/connectors/heartbeat',{agentId:peer.agent.id,capabilities:{...caps,protocolVersion:version}},{token:peer.agent.token});
-const claim=async(peer,extra={})=>(await api.call('/api/connectors/poll',{agentId:peer.agent.id,waitMs:0,supportsInformationLookup:true,protocolVersion:9,...extra},{token:peer.agent.token})).job;
+const claim=async(peer,extra={})=>(await api.call('/api/connectors/poll',{agentId:peer.agent.id,waitMs:0,supportsInformationLookup:true,protocolVersion: CONNECTOR_PROTOCOL_VERSION,...extra},{token:peer.agent.token})).job;
 const complete=(peer,job,actions)=>api.call('/api/connectors/complete',{agentId:peer.agent.id,jobId:job.id,attempts:job.attempts,status:'completed',result:{agentTurn:{message:'明确标注的协议测试夹具，无真实模型执行',actions,kind:'status',notifyParticipantIds:[],needsHumanInput:false}}},{token:peer.agent.token});
 let id;
 try {

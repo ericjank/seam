@@ -1,0 +1,1 @@
+ALTER TABLE `lifecycle_revisions` ADD `objection_state` json;

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { audit } from "../src/lib/audit";
-import { canonicalJson, type SharedContract } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, canonicalJson, planObjectionTaskFor, type SharedContract } from "@seam/protocol";
 import { createHash } from "node:crypto";
 
 const state = vi.hoisted(() => ({ rows: {} as Record<string, Record<string, any>[]>, role: "owner" }));
@@ -93,7 +93,7 @@ import {
   recordRetryBudgetStop, grantRetryBudget,
   appendLifecycleRequirements, applyLifecycleAction, approveLifecycle, assertLifecycleJobCurrent,
   getLifecycleContext, getLifecycleSnapshot, pauseLifecycle, startLifecycle, terminateLifecycle,
-  recoverInformationLookups, retryInformationLookup, retryLifecycleValidation, resolveInformation,
+  recoverInformationLookups, retryInformationLookup, retryLifecycleValidation, resolveInformation, resolvePausedObjection, recordFailedObjectionTurn,
 } from "../src/services/lifecycle";
 
 const actor = (id: string) => ({ kind: "participant" as const, id });
@@ -147,7 +147,7 @@ beforeEach(() => {
     participants: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id, collaborationId: "collab", projectId: `project-${id}`, agentId: `agent-${id}`, role: "participant", status: "active", createdAt: new Date() })),
     projects: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `project-${id}`, name: `项目 ${id}` })),
     agents: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map((id) => ({ id: `agent-${id}`, status: "online", lastSeenAt: new Date() })),
-    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion:9,supportsInformationLookup:true}})),
+    audit_events: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"].map(id=>({actorId:`agent-${id}`,action:"connector.capabilities",metadata:{protocolVersion: CONNECTOR_PROTOCOL_VERSION,supportsInformationLookup:true}})),
     collaboration_lifecycles: [], lifecycle_revisions: [], lifecycle_contributions: [], messages: [], connector_jobs: [],
   };
   vi.clearAllMocks();
@@ -337,8 +337,9 @@ describe("管理员控制的共同开发生命周期", () => {
     expect((await getLifecycleContext("collab"))!.phase).toBe("awaiting_approval");
   });
 
-  it("协商中修改方案会作废旧内容确认，旧任务及旧 hash 被拒绝", async () => {
+  it("旧协议协商中修改方案会作废旧内容确认，旧任务及旧 hash 被拒绝", async () => {
     await startLifecycle("admin", "collab");
+    state.rows.collaboration_lifecycles![0]!.protocolVersion = 9;
     await submit("00000000-0000-4000-8000-000000000001"); await submit("00000000-0000-4000-8000-000000000002"); await compose();
     const before = (await getLifecycleContext("collab"))!;
     const snapshot = await getLifecycleSnapshot("collab");
@@ -409,8 +410,9 @@ describe("管理员控制的共同开发生命周期", () => {
     state.role = "member";
     await expect(startLifecycle("member", "collab")).rejects.toMatchObject({ status: 403 });
   });
-  it("统一契约由协调方汇总，异议使所有确认失效，不能重交被拒绝的相同契约", async () => {
+  it("旧协议统一契约由协调方汇总，异议使确认失效且不能重交相同文档", async () => {
     await startLifecycle("admin", "collab"); await submit("00000000-0000-4000-8000-000000000001"); await submit("00000000-0000-4000-8000-000000000002");
+    state.rows.collaboration_lifecycles![0]!.protocolVersion = 9;
     expect((await getLifecycleContext("collab"))!.phase).toBe("plan_synthesis");
     await compose();
     const before = (await getLifecycleContext("collab"))!;
@@ -424,6 +426,93 @@ describe("管理员控制的共同开发生命周期", () => {
     await compose(1, "明确无效数量返回400");
     expect((await getLifecycleContext("collab"))!.documentHash).not.toBe(before.documentHash);
     expect((await getLifecycleContext("collab"))!.objections).toHaveLength(1);
+  });
+
+  it("停派一条异议后，另一条可继续；补证后才发布新文档并重收确认", async () => {
+    const started = await startLifecycle("admin", "collab");
+    const [a, b] = started.requiredParticipantIds as [string, string];
+    await submit(a); await submit(b); await compose();
+    const before = (await getLifecycleContext("collab"))!;
+    const reject = { type: "plan.reject" as const, revision: 1, documentHash: before.documentHash!, reason: "有两个具体协作边界需要补齐后确认" };
+    const field = { target: { kind: "interface_field" as const, id: "quote", path: "response.status" }, responsibleParticipantId: a,
+      reason: "报价异常状态码缺少独立字段约定", resolutionCondition: "拿到旧客户端依赖并明确无效数量的状态码" };
+    const requirement = { target: { kind: "requirement" as const, id: "quote" }, responsibleParticipantId: b,
+      reason: "报价有效要求缺少数量上界", resolutionCondition: "在报价要求中补充最大合法数量" };
+    await expect(applyLifecycleAction(actor(b), "collab", reject)).rejects.toMatchObject({ status: 422 });
+    await expect(applyLifecycleAction(actor(b), "collab", { ...reject, objections: [{ ...field, target: { ...field.target, id: "nonexistent" } }] })).rejects.toMatchObject({ status: 422 });
+    await applyLifecycleAction(actor(b), "collab", { ...reject, objections: [field, requirement] });
+    expect((await getLifecycleContext("collab"))!.phase).toBe("plan_confirmation");
+    await applyLifecycleAction(actor(a), "collab", { type: "plan.confirm", revision: 1, documentHash: before.documentHash! });
+    let current = (await getLifecycleContext("collab"))!;
+    expect(current.phase).toBe("plan_synthesis");
+    await expect(compose(1, "只改风险或范围说明")).rejects.toMatchObject({ status: 409 });
+    const taskA = planObjectionTaskFor(current, a)!, taskB = planObjectionTaskFor(current, b)!;
+    const attemptA = { ...taskA, type: "plan.resolve" as const, revision: 1, summary: "仅修改了与当前异议无关的字段",
+      change: { kind: "interface_field" as const, field: { path: "response.body.currency", definition: "总是 CNY" } }, evidence: null };
+    await expect(applyLifecycleAction(actor(b), "collab", attemptA)).rejects.toMatchObject({ status: 403 });
+    await applyLifecycleAction(actor(a), "collab", attemptA);
+    const nextScope = { ...taskA, attempt: 2 };
+    const snapshot = (await getLifecycleSnapshot("collab"))!;
+    await recordFailedObjectionTurn("collab", snapshot, nextScope, "本轮未提交与该状态码相关的修改或证据");
+    await recordFailedObjectionTurn("collab", snapshot, nextScope, "重复失败回执");
+
+    current = (await getLifecycleContext("collab"))!;
+    expect(current.planObjections?.[0]).toMatchObject({ state: "paused", noProgressRounds: 2, attempts: 2 });
+    expect(planObjectionTaskFor(current, a)).toBeNull();
+    expect(planObjectionTaskFor(current, b)).toEqual(taskB);
+    await applyLifecycleAction(actor(b), "collab", { ...taskB, type: "plan.resolve", revision: 1, summary: "补充指定的报价数量上限",
+      change: { kind: "requirement", requirement: { id: "quote", text: "实现报价接口，数量最多为 100", verification: "command" } }, evidence: null });
+    current = (await getLifecycleContext("collab"))!;
+    expect(current.documentHash).toBe(before.documentHash);
+    expect(current.planObjections?.[1]?.state).toBe("addressed");
+    expect(current.objectionDraft?.effectiveRequirements?.[0]?.text).toContain("100");
+    expect(current.contract?.effectiveRequirements?.[0]?.text).not.toContain("100");
+    await expect(approveLifecycle("admin", "collab", { revision: 1, documentHash: current.documentHash! })).rejects.toMatchObject({ status: 409 });
+
+    const input = { revision: 1, objectionId: taskA.objectionId, attempts: 2, evidence: "现有客户端公开用例确认数量非法时返回状态码 400，沿用此行为。" };
+    state.role = "member";
+    await expect(resolvePausedObjection("member", "collab", input)).rejects.toMatchObject({ status: 403 });
+    state.role = "owner";
+    await expect(resolvePausedObjection("admin", "collab", { ...input, attempts: 1 })).rejects.toMatchObject({ status: 409 });
+    const revised = await resolvePausedObjection("admin", "collab", input);
+    expect(revised.phase).toBe("plan_confirmation");
+    expect(revised.confirmations).toEqual([]);
+    expect(revised.documentHash).not.toBe(before.documentHash);
+    expect(revised.document).toContain(input.evidence);
+    expect(revised.document).toContain("实现报价接口，数量最多为 100");
+    expect(revised.approvedHash).toBeNull();
+    await expect(applyLifecycleAction(actor(a), "collab", { type: "plan.confirm", revision: 1, documentHash: before.documentHash! })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("同一字段的异议跨文档保持同一 ID，重复证据和退回旧值不会解除停派", async () => {
+    const started = await startLifecycle("admin", "collab");
+    const [a, b] = started.requiredParticipantIds as [string, string];
+    const field = { path: "response.status", definition: "无效数量返回 422" };
+    await submit(a); await submit(b); await compose(1, "", { interfaces: [{ id: "quote", definition: "提供方校验报价数量并使用约定的状态码返回。", fields: [field] }] });
+    const target = { kind: "interface_field" as const, id: "quote", path: field.path };
+    const reject = async (reason: string) => {
+      const current = (await getLifecycleContext("collab"))!;
+      await applyLifecycleAction(actor(b), "collab", { type: "plan.reject", revision: 1, documentHash: current.documentHash!, reason,
+        objections: [{ target, responsibleParticipantId: a, reason, resolutionCondition: "明确旧客户端使用的状态码并提供实际依据" }] });
+      await applyLifecycleAction(actor(a), "collab", { type: "plan.confirm", revision: 1, documentHash: current.documentHash! });
+      return (await getLifecycleContext("collab"))!;
+    };
+    const original = await reject("目前数量错误状态码和客户端需求不一致");
+    const { objectionId } = planObjectionTaskFor(original, a)!;
+    const resolve = { type: "plan.resolve" as const, revision: 1, objectionId, summary: "核对错误状态码约定", change: null, evidence: null };
+    await applyLifecycleAction(actor(a), "collab", { ...resolve, attempt: 1,
+      change: { kind: "interface_field", field: { ...field, definition: "无效数量返回 400" } } });
+    expect((await getLifecycleContext("collab"))!.document).toContain("无效数量返回 400");
+    const reopened = await reject("请重新核证数量非法时的状态码约定");
+    expect(planObjectionTaskFor(reopened, a)).toEqual({ objectionId, attempt: 2 });
+    await applyLifecycleAction(actor(a), "collab", { ...resolve, attempt: 2, change: { kind: "interface_field", field } });
+    const localProof = { kind: "project_file" as const, path: "docs/contract.md", finding: "旧客户端用例确实包含该数量错误的状态码校验", contentHash: "a".repeat(64) };
+    await applyLifecycleAction(actor(a), "collab", { ...resolve, attempt: 3, evidence: localProof });
+    const reviewed = await reject("当前文件记录无法解释这项旧客户端约束");
+    expect(reviewed.planObjections?.[0]).toMatchObject({ id: objectionId, attempts: 3, noProgressRounds: 0 });
+    await applyLifecycleAction(actor(a), "collab", { ...resolve, attempt: 4, evidence: { ...localProof, finding: "换个表述的同一份本机证据" } });
+    await applyLifecycleAction(actor(a), "collab", { ...resolve, attempt: 5, change: { kind: "interface_field", field } });
+    expect((await getLifecycleContext("collab"))!.planObjections?.[0]).toMatchObject({ id: objectionId, state: "paused", noProgressRounds: 2 });
   });
 
   it("联测不能提前、跨方或遗漏，未执行结果不能显示通过", async () => {

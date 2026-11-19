@@ -1,3 +1,4 @@
+import { CONNECTOR_PROTOCOL_VERSION } from "@seam/protocol";
 import { capturePublicScreenshot } from "../../../scripts/evidence/public_screenshot.mjs";
 import { test, expect, type Page } from "@playwright/test";
 
@@ -54,7 +55,7 @@ test("登录、创建项目与 Agent、发起协作", async ({ page }, testInfo)
   expect(targetAgentResponse.ok()).toBeTruthy();
   const { agent: targetAgent } = await targetAgentResponse.json();
   for (const connected of [agent, targetAgent]) {
-    const heartbeat = await page.request.post("/api/connectors/heartbeat", { data: { agentId: connected.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: 9 } }, headers: { authorization: `Bearer ${connected.token}` } });
+    const heartbeat = await page.request.post("/api/connectors/heartbeat", { data: { agentId: connected.id, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION } }, headers: { authorization: `Bearer ${connected.token}` } });
     expect(heartbeat.ok()).toBeTruthy();
   }
 

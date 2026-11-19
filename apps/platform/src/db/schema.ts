@@ -257,6 +257,7 @@ export const lifecycleRevisions = mysqlTable("lifecycle_revisions", {
   informationRequests: json("information_requests").$type<import("@seam/protocol").InformationRequest[]>(),
   attemptHistory: json("attempt_history").$type<import("@seam/protocol").LifecycleContext["attemptHistory"]>(),
   objections: json("objections").$type<{ participantId: string; documentHash: string; reason: string }[]>(),
+  objectionState: json("objection_state").$type<import("@/lib/plan-objections").PlanObjectionState>(),
   document: longtext("document"),
   documentHash: varchar("document_hash", { length: 64 }),
   report: longtext("report"),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentTurnResultSchema, collaborationContextSchema } from "@seam/protocol";
+import { agentTurnResultSchema, collaborationContextSchema, PLAN_OBJECTION_PROTOCOL_VERSION } from "@seam/protocol";
 import { buildNativeOutputSchema, parseNativeAgentOutput } from "../src/response-schema";
 import type { AgentRunInput } from "../src/types";
 
@@ -123,4 +123,29 @@ describe("Native response schema", () => {
 
 it('协议9的Native契约只提供共享HTTP定义和各端引用，所有对象仍严格封闭',()=>{
  const value=input('plan_synthesis');value.context!.lifecycle!.protocolVersion=9;const schema=buildNativeOutputSchema(value);inspectStrictObjects(schema);const text=JSON.stringify(schema);expect(text).toContain('httpDefinitions');expect(text).toContain('httpCheckRefs');expect(text).not.toContain('"httpChecks"');expect(text).toContain('verify_only');
+});
+
+it("新版拒绝无目标的异议，独立处理轮只接受当前异议和尝试编号", () => {
+  const value = input("plan_confirmation");
+  const context = value.context!, lifecycle = context.lifecycle!;
+  lifecycle.protocolVersion = PLAN_OBJECTION_PROTOCOL_VERSION;
+  inspectStrictObjects(buildNativeOutputSchema(value));
+  const issue = { target: { kind: "interface_field" as const, id: "quote", path: "response.body.error" },
+    responsibleParticipantId: context.participant.id, reason: "错误字段缺少明确的固定取值", resolutionCondition: "补齐指定字段的取值及适用边界" };
+  const reject = { type: "plan.reject", revision: 4, documentHash: lifecycle.documentHash, reason: issue.reason };
+  expect(() => parse([reject], value)).toThrow("未发布");
+  expect(parse([{ ...reject, objections: [issue] }], value).actions[0]?.type).toBe("plan.reject");
+
+  lifecycle.phase = "plan_synthesis";
+  const id = crypto.randomUUID();
+  lifecycle.planObjections = [{ ...issue, id, documentHash: lifecycle.documentHash!, participantId: context.participant.id,
+    state: "open", attempts: 1, noProgressRounds: 1 }];
+  context.planObjectionTask = { objectionId: id, attempt: 2 };
+  const schema = buildNativeOutputSchema(value);
+  inspectStrictObjects(schema);
+  expect(JSON.stringify(schema)).not.toContain("plan.compose");
+  const resolve = { type: "plan.resolve", revision: 4, ...context.planObjectionTask, summary: "补充字段",
+    change: { kind: "interface_field", field: { path: "response.body.error", definition: "invalid_quantity" } }, evidence: null };
+  expect(parse([resolve], value).actions[0]).toMatchObject({ type: "plan.resolve", objectionId: id, attempt: 2 });
+  expect(() => parse([{ ...resolve, attempt: 1 }], value)).toThrow("未发布");
 });

@@ -170,7 +170,7 @@ export SEAM_TEST_COMMAND='pnpm test:contract'
 ## Collaboration workflow
 
 1. Connect both project Agents locally, select the two projects, enter the goal and submit once.
-2. Both Agents inspect their projects read-only. A project Agent composes one shared interface contract, responsibilities and joint acceptance cases. Each party reviews the exact document; objections return it for revision and invalidate confirmations.
+2. Both Agents inspect their projects read-only. A project Agent composes one shared interface contract, responsibilities and joint acceptance cases. Each objection identifies a requirement, interface field or acceptance case, with a responsible participant and a condition for resuming. A corresponding change or verifiable evidence is required before both parties review a revised document.
 3. An administrator reviews the complete document and explicitly approves that revision for execution.
 4. Both Agents implement and test locally. Seam then schedules actual joint verification, collecting passed, failed or not-run outcomes separately from local tests and administrator acceptance. A failed round retains its original report and starts a read-only repair plan; both Agents confirm it, and an administrator approves the new document before implementation or verification resumes.
 5. Add requirements to start an incremental revision using the previous contract and report. Review changes and approve the complete new plan; previous approval cannot authorize it.
@@ -179,6 +179,8 @@ export SEAM_TEST_COMMAND='pnpm test:contract'
 Use `--adapter codex-app-server` with a local `SEAM_CODEX_SANDBOX=workspace-write` capability. For test endpoints or dependencies, a local maintainer can also set `SEAM_CODEX_NETWORK_ACCESS=true`; network access remains disabled during planning. Planning and unapproved turns remain read-only; writing requires the approved executing or joint_verifying phase and matching document hash. The adapter persists native threads, resumes after restarts, serializes turns and rejects interactive approvals on the unattended channel. Legacy invitations and collaboration APIs remain available.
 
 Durable local receipts and database scheduling records recover after delivery or dispatch failures. Project workspaces serialize competing tasks; administrators can pause and resume execution. See [the execution architecture upgrade](docs/协作执行架构升级.md).
+
+An objection stops receiving its own jobs after two attempts without progress. Other objections can continue. The collaboration page shows who is responsible, the condition for resuming, and an administrator action to submit new evidence or a decision. Both Connectors need protocol 10 for new managed collaborations.
 
 See [protocol 6 reliability and lightweight repair](docs/协作可靠性与轻量修复.md) for bounded lookup recovery, versioned facts, failure classification, pinned tests, independent HTTP checks and delta repair plans. Rebuild and restart both local Connectors for new managed tasks.
 

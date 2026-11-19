@@ -11,7 +11,10 @@ export function contractChanges(previous: SharedContract, current: SharedContrac
     ...(contract.effectiveRequirements ?? []).map((item): [string, string] => [`要求 ${item.id}`, item.text]),
     ["本版撤销要求", (contract.retiredRequirements ?? []).map((item) => `${item.id}：${item.reason}`).join("\n")],
     ...(contract.serviceExpectations ?? []).map((item): [string, string] => [`就绪 ${item.publisherParticipantId}:${item.name}`, JSON.stringify(item, null, 2)]),
-    ...contract.interfaces.map((item): [string, string] => [`接口 ${item.id}`, item.definition]),
+    ...contract.interfaces.flatMap(item => [
+      [`接口 ${item.id}`, item.definition] as [string, string],
+      ...(item.fields ?? []).map((field): [string, string] => [`接口 ${item.id} / ${field.path}`, field.definition]),
+    ]),
     ...contract.responsibilities.map((item): [string, string] => [`职责 ${item.participantId}`, item.changes]),
     ...contract.acceptanceCases.map((item): [string, string] => [`用例 ${item.id}`, `${item.runnerParticipantId}\n${item.description}\n${item.command}\n${item.expectedResult}\n${item.requiredAssertions?.join("\n") ?? "历史用例未声明完整断言集"}`]),
     ...expandSharedContract(contract).acceptanceCases.flatMap(item => (item.httpChecks ?? []).map((check): [string, string] => [`独立HTTP ${item.id}/${check.id}`, JSON.stringify(check, null, 2)])),

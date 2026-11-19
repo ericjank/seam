@@ -7,10 +7,15 @@ const forbiddenPatterns = [
 ];
 
 export function assertOutboundPolicy(result: AgentTurnResult, projectRoot: string) {
-  if (forbiddenPatterns.some((pattern) => pattern.test(result.message))) {
+  const text = [result.message, ...result.actions.flatMap(action => {
+    if (action.type === "plan.resolve") return [action.summary, action.evidence?.kind === "project_file" ? action.evidence.finding : ""];
+    if (action.type === "plan.reject") return [action.reason, ...(action.objections ?? []).flatMap(item => [item.reason, item.resolutionCondition])];
+    return [];
+  })].join("\n");
+  if (forbiddenPatterns.some((pattern) => pattern.test(text))) {
     throw new Error("本地出站策略阻止了疑似系统密钥的消息；联调凭据请使用专用授权流程");
   }
-  if (projectRoot && result.message.includes(projectRoot)) {
+  if (projectRoot && text.includes(projectRoot)) {
     throw new Error("本地出站策略阻止了包含项目绝对路径的消息");
   }
   return result;

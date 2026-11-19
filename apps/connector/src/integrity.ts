@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import type { AgentTurnResult, CollaborationContext } from "@seam/protocol";
 
 const excluded = new Set(["node_modules", "vendor", "dist", "build", "coverage", "output", "storage"]);
-const privatePath = /(?:^|[\\/])(?:\.\.|\.env(?:\..*)?|credentials|id_rsa|id_ed25519)(?:$|[\\/])|\.(?:pem|key)$/i;
+const privatePath = /(?:^|[\\/])(?:\.\.|\.git|\.env(?:\..*)?|credentials|id_rsa|id_ed25519)(?:$|[\\/])|\.(?:pem|key)$/i;
 export async function hashProjectFile(root: string, path: string) {
   if (!path || isAbsolute(path) || privatePath.test(path)) return null;
   const canonical = await realpath(root), file = resolve(canonical, path);
@@ -45,11 +45,19 @@ export function checkPinnedTests(before: Array<{ path: string; sha256: string }>
 }
 
 export async function fingerprintInformation(turn: AgentTurnResult, root: string) {
-  for (const action of turn.actions) if (action.type === "information.respond") for (const source of action.sources) {
-    if (source.scope !== "local_project") continue;
-    delete source.contentHash;
-    const hash = await hashProjectFile(root, source.reference);
-    if (hash) source.contentHash = hash;
+  for (const action of turn.actions) {
+    if (action.type === "plan.resolve" && action.evidence?.kind === "project_file") {
+      delete action.evidence.contentHash;
+      const hash = await hashProjectFile(root, action.evidence.path);
+      if (hash) action.evidence.contentHash = hash;
+    } else if (action.type === "information.respond") {
+      for (const source of action.sources) {
+        if (source.scope !== "local_project") continue;
+        delete source.contentHash;
+        const hash = await hashProjectFile(root, source.reference);
+        if (hash) source.contentHash = hash;
+      }
+    }
   }
 }
 

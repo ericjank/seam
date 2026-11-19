@@ -1,4 +1,4 @@
-import { agentTurnResultSchema, sharedContractSchema, informationSourceSchema, ARTIFACT_TYPES, CREDENTIAL_TYPES, WORK_STATUSES, type AgentTurnResult } from "@seam/protocol";
+import { agentTurnResultSchema, sharedContractSchema, informationSourceSchema, planObjectionIssueSchema, planObjectionTargetSchema, planObjectionChangeSchema, planObjectionEvidenceSchema, PLAN_OBJECTION_PROTOCOL_VERSION, ARTIFACT_TYPES, CREDENTIAL_TYPES, WORK_STATUSES, type AgentTurnResult } from "@seam/protocol";
 import { z } from "zod";
 import type { AgentRunInput } from "./types.js";
 
@@ -13,9 +13,10 @@ const nativeSource = informationSourceSchema.omit({ contentHash: true, sourceVer
 const factRefs=z.array(z.string().min(1).max(200)).max(200);
 const nativeHttpCheck=sharedContractSchema.shape.acceptanceCases.element.shape.httpChecks.unwrap().element.required();
 const nativeCases = z.array(sharedContractSchema.shape.acceptanceCases.element.omit({httpChecks:true}).required()).min(2).max(100);
-const nativeContract = sharedContractSchema.extend({ httpDefinitions:z.array(nativeHttpCheck).max(3000), responsibilities:z.array(sharedContractSchema.shape.responsibilities.element.required()).min(2).max(50), acceptanceCases: nativeCases, effectiveRequirements:z.array(sharedContractSchema.shape.effectiveRequirements.unwrap().element.required()).min(1).max(200) }).required();
+const legacyInterfaces = z.array(sharedContractSchema.shape.interfaces.element.omit({ fields: true })).min(1).max(30);
+const nativeContract = sharedContractSchema.extend({ interfaces: legacyInterfaces, httpDefinitions:z.array(nativeHttpCheck).max(3000), responsibilities:z.array(sharedContractSchema.shape.responsibilities.element.required()).min(2).max(50), acceptanceCases: nativeCases, effectiveRequirements:z.array(sharedContractSchema.shape.effectiveRequirements.unwrap().element.required()).min(1).max(200) }).required();
 const nativeDelta = z.object({
-  scope: sharedContractSchema.shape.scope.nullable(), interfaces: sharedContractSchema.shape.interfaces.nullable(),
+  scope: sharedContractSchema.shape.scope.nullable(), interfaces: legacyInterfaces.nullable(),
   responsibilities: z.array(sharedContractSchema.shape.responsibilities.element.required()).min(2).max(50).nullable(), httpDefinitions: z.array(nativeHttpCheck).max(3000).nullable(), acceptanceCases: nativeCases.nullable(),
   serviceExpectations: sharedContractSchema.shape.serviceExpectations.unwrap().nullable(),
   risks: sharedContractSchema.shape.risks.nullable(), changeSummary: sharedContractSchema.shape.changeSummary,
@@ -26,6 +27,14 @@ const nativeDelta = z.object({
 const legacyCases=z.array(sharedContractSchema.shape.acceptanceCases.element.omit({httpCheckRefs:true}).extend({httpChecks:z.array(nativeHttpCheck).max(30)}).required()).min(2).max(100);
 const legacyContract=nativeContract.omit({httpDefinitions:true}).extend({acceptanceCases:legacyCases,responsibilities:z.array(sharedContractSchema.shape.responsibilities.element.omit({mode:true})).min(2).max(50)});
 const legacyDelta=nativeDelta.omit({httpDefinitions:true}).extend({acceptanceCases:legacyCases.nullable(),responsibilities:z.array(sharedContractSchema.shape.responsibilities.element.omit({mode:true})).min(2).max(50).nullable()});
+const nativeInterfaces = z.array(sharedContractSchema.shape.interfaces.element.required()).min(1).max(30);
+const structuredContract = nativeContract.extend({ interfaces: nativeInterfaces });
+const structuredDelta = nativeDelta.extend({ interfaces: nativeInterfaces.nullable() });
+const nativeObjection = planObjectionIssueSchema.extend({ target: z.union(planObjectionTargetSchema.options) }).strict();
+const nativeObjectionEvidence = z.union([
+  planObjectionEvidenceSchema.options[0].omit({ contentHash: true }),
+  planObjectionEvidenceSchema.options[1],
+]);
 
 // Native Structured Outputs require every property to be required and every
 // object to be closed. Nullable placeholders model protocol optional fields;
@@ -49,23 +58,43 @@ function nativeResponseSchema(input: AgentRunInput) {
       diagnosisCategory:category.nullable(), attempt: z.literal(input.context.informationTask.attempt ?? 1), value: z.string().max(10_000), validForSeconds: z.number().int().min(30).max(86400),
       status: z.enum(["found", "unavailable"]), answer: z.string().min(1).max(10_000), sources: z.array(nativeSource).min(1).max(20) }).strict()];
   }
+  else if (input.context?.planObjectionTask && !lifecycle.paused) {
+    const { objectionId, attempt } = input.context.planObjectionTask;
+    const issue = lifecycle.planObjections?.find(row => row.id === objectionId);
+    let change: z.ZodType;
+    if (issue?.target.kind === "requirement") {
+      change = planObjectionChangeSchema.options[0].extend({ requirement: planObjectionChangeSchema.options[0].shape.requirement.required() });
+    } else if (issue?.target.kind === "interface_field") {
+      change = planObjectionChangeSchema.options[1];
+    } else if (issue?.target.kind === "acceptance_case") {
+      change = planObjectionChangeSchema.options[2].extend({ acceptanceCase: legacyCases.element });
+    } else {
+      change = z.null();
+    }
+    actions = [z.object({ type: z.literal("plan.resolve"), revision: z.literal(lifecycle.revision),
+      objectionId: z.literal(objectionId), attempt: z.literal(attempt), change: change.nullable(),
+      evidence: nativeObjectionEvidence.nullable(), summary: z.string().min(1).max(2000) }).strict()];
+  }
   else {
     const blocked = z.object({ type: z.literal("workflow.blocked"), revision: z.literal(lifecycle.revision), kind: z.enum(["waiting_peer", "retryable", "needs_admin"]), reason: z.string().min(10).max(5000), dependencyParticipantIds: z.array(id).max(50), retryAfterSeconds: z.number().int().min(1).max(300), requiresAuthorization: z.boolean(), requiresReview: z.boolean(), category }).strict();
     const publish = z.object({ type: z.literal("service.publish"), revision: z.literal(lifecycle.revision), name: z.string().min(1).max(100), baseUrl: z.string().url().max(2000), healthPath: z.string().max(1000), ttlSeconds: z.number().int().min(30).max(3600) }).strict();
     const submit = z.object({ type: z.literal("plan.submit"), revision: z.literal(lifecycle.revision), content: z.string().min(100).max(100_000), factRefs }).strict();
+    const version = lifecycle.protocolVersion ?? 1;
+    const structuredReview = version >= PLAN_OBJECTION_PROTOCOL_VERSION;
     switch (lifecycle.paused ? "paused" : lifecycle.phase) {
       case "planning": actions = lifecycle.repair ? [z.object({ type: z.literal("plan.amend"), revision: z.literal(lifecycle.revision), changes: z.string().min(20).max(20_000), factRefs }).strict()] : [submit]; break;
       case "plan_synthesis":
-        actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: (lifecycle.protocolVersion??1)>=9?nativeContract:legacyContract }).strict()];
-        if (lifecycle.repair && lifecycle.baseline?.documentHash) actions = [z.object({ type: z.literal("plan.patch"), revision: z.literal(lifecycle.revision), baseDocumentHash: z.literal(lifecycle.documentHash ?? lifecycle.baseline.documentHash), delta: (lifecycle.protocolVersion??1)>=9?nativeDelta:legacyDelta }).strict()];
+        actions = [z.object({ type: z.literal("plan.compose"), revision: z.literal(lifecycle.revision), baseDocumentHash: lifecycle.documentHash ? z.literal(lifecycle.documentHash) : z.null(), contract: structuredReview ? structuredContract : version >= 9 ? nativeContract : legacyContract }).strict()];
+        if (lifecycle.repair && lifecycle.baseline?.documentHash) actions = [z.object({ type: z.literal("plan.patch"), revision: z.literal(lifecycle.revision), baseDocumentHash: z.literal(lifecycle.documentHash ?? lifecycle.baseline.documentHash), delta: structuredReview ? structuredDelta : version >= 9 ? nativeDelta : legacyDelta }).strict()];
         break;
       case "plan_confirmation":
-        actions = [submit];
+        actions = structuredReview ? [] : [submit];
         // A missing/invalid snapshot cannot be confirmed, even by a response
         // that bypasses the model-side schema. It can still be revised.
         if (lifecycle.documentHash?.length === 64) actions.push(
           z.object({ type: z.literal("plan.confirm"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash) }).strict(),
-          z.object({ type: z.literal("plan.reject"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash), reason: z.string().min(10).max(10_000) }).strict(),
+          z.object({ type: z.literal("plan.reject"), revision: z.literal(lifecycle.revision), documentHash: z.literal(lifecycle.documentHash),
+            reason: z.string().min(10).max(10_000), ...(structuredReview ? { objections: z.array(nativeObjection).min(1).max(20) } : {}) }).strict(),
         );
         break;
       case "executing": actions = [

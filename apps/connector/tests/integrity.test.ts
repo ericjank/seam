@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { collaborationContextSchema } from "@seam/protocol";
+import { agentTurnResultSchema, collaborationContextSchema } from "@seam/protocol";
 import { checkPinnedTests, collectTestFiles, fingerprintInformation, hashProjectFile, verifyCachedFact } from "../src/integrity";
 let root: string;
 beforeEach(async()=>{root=await mkdtemp(join(tmpdir(),"seam-integrity-"));});
@@ -35,5 +35,20 @@ describe("实际测试资料与共享事实来源指纹",()=>{
   expect((await verifyCachedFact(context,root))!.actions[0]).toMatchObject({type:"information.respond",status:"found",value:"v1"});
   await writeFile(join(root,"protocol.json"),'{"version":"v2"}');expect((await verifyCachedFact(context,root))!.actions[0]).toMatchObject({status:"unavailable"});
   expect(await readFile(join(root,"protocol.json"),"utf8")).toContain("v2");
+ });
+ it("只为可读取的本地异议证据计算实际文件指纹", async () => {
+   await writeFile(join(root, "contract.md"), "公开兼容性说明");
+   await mkdir(join(root, ".git"));
+   await writeFile(join(root, ".git/config"), "private metadata");
+   for (const path of ["contract.md", ".git/config", join(root, "contract.md")]) {
+     const turn = agentTurnResultSchema.parse({ message: "已查阅异议依据", actions: [{
+       type: "plan.resolve", revision: 1, objectionId: crypto.randomUUID(), attempt: 1, summary: "核对了契约来源", change: null,
+       evidence: { kind: "project_file", path, finding: "旧客户使用公开兼容性说明中的值", contentHash: "f".repeat(64) },
+     }] });
+     await fingerprintInformation(turn, root);
+     const action = turn.actions[0];
+     if (action?.type !== "plan.resolve" || action.evidence?.kind !== "project_file") throw new Error("wrong test fixture");
+     expect(action.evidence.contentHash).toBe(path === "contract.md" ? await hashProjectFile(root, path) : undefined);
+   }
  });
 });

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { CONNECTOR_PROTOCOL_VERSION } from "../../packages/protocol/dist/index.js";
 // Actual Connector restart and HTTP/DB receipts; model output is an explicit fixture.
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
@@ -13,7 +14,7 @@ await api.loginOwner();
 for(const boundary of ['before_commit','after_commit_before_ack']){
  const root=await mkdtemp(join(tmpdir(),'seam-receipt-boundary-')),peer=await api.register('receipt-'+boundary+'-'+Date.now(),'generic-cli');let worker,proxy,collaborationId;
  try{
-  await api.call('/api/connectors/heartbeat',{agentId:peer.agent.id,capabilities:{adapter:'generic-cli',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:9}},{token:peer.agent.token});
+  await api.call('/api/connectors/heartbeat',{agentId:peer.agent.id,capabilities:{adapter:'generic-cli',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion: CONNECTOR_PROTOCOL_VERSION}},{token:peer.agent.token});
   const created=await api.call('/api/collaborations',{projectId:peer.project.id,objective:'显式合成协议夹具：只验证回执提交边界，不代表真实业务或模型执行'});collaborationId=created.id;await api.call(`/api/collaborations/${collaborationId}/dispatch`,{autoAdvance:false});
   let intercepted=false,allowDelivery=false,upstreamCommitted=false,jobId;const observations=[];
   proxy=createServer(async(request,response)=>{

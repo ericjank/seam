@@ -1,9 +1,10 @@
 #!/usr/bin/env node
+import { CONNECTOR_PROTOCOL_VERSION } from "../../packages/protocol/dist/index.js";
 import assert from 'node:assert/strict';import{randomUUID,createHash}from'node:crypto';import{SimulationApi}from'./http.mjs';
 const api=new SimulationApi(),checks=[],records=[],suffix=randomUUID().slice(0,8);await api.loginOwner();
-const peers=[];for(const side of['a','b']){const p=await api.register(`completion-${side}-${suffix}`,'mock');await api.call('/api/connectors/heartbeat',{agentId:p.agent.id,capabilities:{adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion:9}},{token:p.agent.token});peers.push(p);}
+const peers=[];for(const side of['a','b']){const p=await api.register(`completion-${side}-${suffix}`,'mock');await api.call('/api/connectors/heartbeat',{agentId:p.agent.id,capabilities:{adapter:'mock',executionMode:'external',testConfigured:false,supportsInformationLookup:true,protocolVersion: CONNECTOR_PROTOCOL_VERSION}},{token:p.agent.token});peers.push(p);}
 const[a,b]=peers,created=await api.call('/api/collaborations',{projectId:a.project.id,targetProjectId:b.project.id,objective:'显式合成协议夹具：验证恢复凭据隔离、旧代际拒绝、规范引用和停止决定，不声明真实模型或业务执行'}),id=created.id;
-const claim=async p=>(await api.call('/api/connectors/poll',{agentId:p.agent.id,waitMs:0,protocolVersion:9,supportsInformationLookup:true},{token:p.agent.token})).job;
+const claim=async p=>(await api.call('/api/connectors/poll',{agentId:p.agent.id,waitMs:0,protocolVersion: CONNECTOR_PROTOCOL_VERSION,supportsInformationLookup:true},{token:p.agent.token})).job;
 const receipt=(p,j,actions)=>({agentId:p.agent.id,jobId:j.id,attempts:j.attempts,status:'completed',result:{agentTurn:{message:'明确合成协议夹具，没有实际执行项目或测试',kind:'status',actions,notifyParticipantIds:[],needsHumanInput:false}}});
 const complete=(p,j,actions)=>api.call('/api/connectors/complete',receipt(p,j,actions),{token:p.agent.token});
 const content='只验证隔离状态与接口，不执行业务实现。双方审批和最终决定保留。'.repeat(8);let j=await claim(a);const recoveryKey=randomUUID();

@@ -4,7 +4,7 @@ import { sealFinalDecision } from "@/lib/final-decision";
 import { expandSharedContract, normalizeSharedContract } from "@seam/protocol";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
-import { CONNECTOR_PROTOCOL_VERSION, canonicalJson, integrationCheckSchema, lifecycleAgentActionSchema, type LifecycleContext, type InformationRequest } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, PLAN_OBJECTION_PROTOCOL_VERSION, canonicalJson, currentObjectionReviewers, integrationCheckSchema, lifecycleAgentActionSchema, objectionTargetKey, objectionTargetLabel, type LifecycleAgentAction, type LifecycleContext, type InformationRequest, type PlanObjectionTask, type SharedContract } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
 import {
   agents, collaborations, collaborationLifecycles, connectorJobs, lifecycleContributions,
@@ -20,12 +20,14 @@ import { authorizeActor, type Actor } from "./actor";
 import { answerInformationRequest, openInformationRequest, expireInformationRequest, factFromRequest, administratorFact, informationKey, INFORMATION_TIMEOUT_MS } from "@/lib/information";
 import { bindFacts, factsReady, sameBindings } from "@/lib/fact-bindings";
 import { repairFailures, validateRepairContract, validatePinnedTests } from "@/lib/repair";
+import { administratorObjectionEvidence, applyObjectionChange, failedObjectionAttempt, hasObjectionTarget, objectionEvidence, objectionTargetFingerprint, type PlanObjectionState, type StoredPlanObjection } from "@/lib/plan-objections";
 
 export type LifecyclePhase = LifecycleContext["phase"];
 export type LifecycleSnapshot = Pick<LifecycleContext, "revision" | "phase" | "documentHash" | "approvedHash">;
 type Lifecycle = typeof collaborationLifecycles.$inferSelect;
 type Revision = typeof lifecycleRevisions.$inferSelect;
 type Contribution = typeof lifecycleContributions.$inferSelect;
+type ObjectionAction = Extract<LifecycleAgentAction, { type: "plan.resolve" }>;
 
 const hash = (content: string) => createHash("sha256").update(content).digest("hex");
 const currentContribution = (collaborationId: string, revision: number) => and(
@@ -71,6 +73,8 @@ function contextFrom(control: Lifecycle, revision: Revision, contributions: Cont
     document: revision.document, documentHash: control.documentHash, approvedHash: control.approvedHash,
     requiredParticipantIds: control.requiredParticipantIds, coordinatorParticipantId: control.requiredParticipantIds[0], paused: Boolean(control.pausedAt),
     changeRequest: revision.changeRequest, contract: revision.sharedContract, objections: revision.objections ?? [],
+    planObjections: revision.objectionState?.items.map(({ seen: _seen, ...item }) => item),
+    objectionDraft: revision.objectionState?.draft ?? null,
     executionReuse: executionReuse(revision.sharedContract, previous, previousContributions, relevant),
     retryBudget: revision.retryBudget ?? { grants: [], stops: [] },
     repair: revision.repair ?? null, informationRequests: revision.informationRequests ?? [],
@@ -175,9 +179,10 @@ export async function startLifecycle(userId: string, collaborationId: string): P
 }
 
 async function beginInformationLookup(control: Lifecycle, participantId: string, question: string, searched?: InformationRequest["responses"][number]["sources"], options: { key?: string; fresh?: boolean; resumeRequiresReview?: boolean; forceVerifyKey?:string; purpose?:InformationRequest["purpose"] } = {}) {
-  if ((control.protocolVersion ?? 1) < CONNECTOR_PROTOCOL_VERSION) {
-    await db.update(collaborationLifecycles).set({ protocolVersion: CONNECTOR_PROTOCOL_VERSION, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
-    control.protocolVersion = CONNECTOR_PROTOCOL_VERSION;
+  const informationProtocol = 9;
+  if ((control.protocolVersion ?? 1) < informationProtocol) {
+    await db.update(collaborationLifecycles).set({ protocolVersion: informationProtocol, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
+    control.protocolVersion = informationProtocol;
   }
   const revision = await getRevision(control);
   const outcome = openInformationRequest({ requests: revision.informationRequests ?? [], id: newId(), revision: control.revision,
@@ -212,7 +217,9 @@ async function finishPlanning(control:Lifecycle, currentAgentId:string|null) {
   const contributions=await getContributions(control), allSubmitted=control.requiredParticipantIds.every(id=>contributions.some(row=>row.participantId===id&&row.content&&!row.pendingPlan));
   await db.update(lifecycleContributions).set({confirmedHash:null,updatedAt:new Date()}).where(currentContribution(control.collaborationId,control.revision));
   const revision=await getRevision(control);
-  await db.update(lifecycleRevisions).set({document:null,documentHash:null,sharedContract:null,factBindings:null,approvalIntent:null,updatedAt:new Date()}).where(eq(lifecycleRevisions.id,revision.id));
+  await db.update(lifecycleRevisions).set({document:null,documentHash:null,sharedContract:null,
+    objectionState: revision.objectionState ? { ...revision.objectionState, draft: null } : null,
+    factBindings:null,approvalIntent:null,updatedAt:new Date()}).where(eq(lifecycleRevisions.id,revision.id));
   await db.update(collaborationLifecycles).set({phase:allSubmitted?"plan_synthesis":"planning",documentHash:null,approvedHash:null,approvedById:null,approvedAt:null,updatedAt:new Date()}).where(eq(collaborationLifecycles.collaborationId,control.collaborationId));
   if(control.phase!=="planning")await cancelSupersededReviews(control,currentAgentId);
   await notify(control.collaborationId,allSubmitted?"各方分析及本轮事实核验已收齐，协调方汇总完整共同文档。":"已收到本方分析，等待其他项目或本轮事实核验。");
@@ -334,6 +341,153 @@ export async function resolveInformation(userId: string, collaborationId: string
   });
 }
 
+async function validatePlanDraft(control: Lifecycle, revision: Revision, collaboration: typeof collaborations.$inferSelect, contract: SharedContract, context: LifecycleContext) {
+  const version = control.protocolVersion ?? 1;
+  const apiIntegration = collaboration.type === "api-integration";
+  validateSharedContract(contract, control.requiredParticipantIds, context.baseline?.contract, version >= 6 && apiIntegration, version >= 7 && apiIntegration, version >= 8 && apiIntegration);
+  if (revision.repair && context.baseline?.contract) validateRepairContract(context.baseline.contract, contract);
+  const [prior] = control.revision > 1 ? await db.select().from(lifecycleRevisions)
+    .where(and(eq(lifecycleRevisions.collaborationId, control.collaborationId), eq(lifecycleRevisions.revision, control.revision - 1))).limit(1) : [];
+  executionReuse(contract, prior, prior ? await db.select().from(lifecycleContributions).where(currentContribution(control.collaborationId, prior.revision)) : [], await getContributions(control), true);
+}
+
+async function publishPlan(control: Lifecycle, revision: Revision, collaboration: typeof collaborations.$inferSelect, contract: SharedContract, context: LifecycleContext, state = revision.objectionState) {
+  const rows = await requiredProjects(control);
+  const bindings = bindFacts(contract.factRefs ?? [], control.facts ?? []);
+  const document = renderSharedContract({ title: collaboration.title, revision: control.revision, requirements: revision.requirements,
+    changeRequest: revision.changeRequest, contract, previous: context.baseline?.contract,
+    names: new Map(rows.map(row => [row.participant.id, row.project.name])), baselines: context.contributions,
+    factBindings: bindings, objections: state?.items });
+  const documentHash = hash(document);
+  if (documentHash === control.documentHash && (revision.objections ?? []).some(item => item.documentHash === documentHash)) {
+    throw new HttpError(422, "该文档已有未解决异议，请实质修订契约后再提交");
+  }
+  const outstanding = state?.items.some(item => item.state !== "addressed");
+  await db.update(lifecycleContributions).set({ confirmedHash: null, updatedAt: new Date() }).where(currentContribution(control.collaborationId, control.revision));
+  await db.update(lifecycleRevisions).set({ document, documentHash, sharedContract: contract, factBindings: bindings, approvalIntent: null,
+    objectionState: state ? { ...state, draft: null } : null, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
+  await db.update(collaborationLifecycles).set({ phase: outstanding ? "plan_synthesis" : "plan_confirmation", documentHash, approvedHash: null, updatedAt: new Date() })
+    .where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
+  await notify(control.collaborationId, outstanding ? "已更新共同文档底稿，相关异议处理完毕后才发起确认。" :
+    "统一契约已生成。双方须检查接口语义、责任边界、联测命令和预期结果，存在冲突请提出异议。");
+}
+
+async function finishPlanReview(control: Lifecycle, state: PlanObjectionState | null) {
+  const rows = await getContributions(control);
+  const objectors = currentObjectionReviewers({ documentHash: control.documentHash, planObjections: state?.items });
+  if (!control.requiredParticipantIds.every(id => objectors.has(id) || rows.some(row => row.participantId === id && row.confirmedHash === control.documentHash))) return;
+  if (objectors.size) {
+    await db.update(lifecycleContributions).set({ confirmedHash: null, updatedAt: new Date() }).where(currentContribution(control.collaborationId, control.revision));
+    await db.update(collaborationLifecycles).set({ phase: "plan_synthesis", updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
+    return;
+  }
+  await db.update(collaborationLifecycles).set({ phase: "awaiting_approval", updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
+  await notify(control.collaborationId, `双方已确认第 ${control.revision} 版完整开发文档。请管理员阅读并确认本版内容；AI 不能自行批准实施。`);
+}
+
+async function raisePlanObjections(control: Lifecycle, revision: Revision, participantId: string, action: Extract<LifecycleAgentAction, { type: "plan.reject" }>) {
+  const items = [...(revision.objectionState?.items ?? [])];
+  if (!action.objections?.length || !revision.sharedContract) throw new HttpError(422, "请指明异议对应的需求、接口字段或验收用例、责任方及恢复条件");
+  const keys = new Set<string>();
+  if (currentObjectionReviewers({ documentHash: action.documentHash, planObjections: items }).has(participantId)) return false;
+  for (const issue of action.objections) {
+    const key = objectionTargetKey(issue.target);
+    if (keys.has(key) || !hasObjectionTarget(revision.sharedContract, issue.target)) throw new HttpError(422, "异议目标重复或不属于当前契约");
+    if (!control.requiredParticipantIds.includes(issue.responsibleParticipantId)) throw new HttpError(422, "异议责任方必须是当前协作的指定参与方");
+    keys.add(key);
+    const index = items.findIndex(row => row.participantId === participantId && objectionTargetKey(row.target) === key);
+    const prior = items[index];
+    const fingerprint = objectionTargetFingerprint(revision.sharedContract, issue.target);
+    const row: StoredPlanObjection = {
+      ...issue, id: prior?.id ?? newId(), participantId, documentHash: action.documentHash,
+      state: "open", attempts: prior?.attempts ?? 0, noProgressRounds: 0, seen: [...new Set([...(prior?.seen ?? []), fingerprint])],
+    };
+    if (index < 0) items.push(row);
+    else items[index] = row;
+  }
+  if (items.length > 200) throw new HttpError(422, "本修订已有 200 项异议，请先处理当前契约");
+  const state = { items, draft: null };
+  await db.update(lifecycleRevisions).set({ objectionState: state, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
+  await finishPlanReview(control, state);
+  await notify(control.collaborationId, `项目 Agent 已提交契约异议：${action.objections.map(row => objectionTargetLabel(row.target)).join("、")}`);
+  return true;
+}
+
+async function saveObjectionAttempt(control: Lifecycle, revision: Revision, collaboration: typeof collaborations.$inferSelect, row: StoredPlanObjection, draft: SharedContract, next: StoredPlanObjection) {
+  const state = { draft, items: revision.objectionState!.items.map(item => item.id === row.id ? next : item) };
+  if (state.items.every(item => item.state === "addressed")) {
+    const context = (await getLifecycleContext(control.collaborationId))!;
+    await publishPlan(control, revision, collaboration, draft, context, state);
+  } else {
+    await db.update(lifecycleRevisions).set({ objectionState: state, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
+  }
+  await audit({ collaborationId: control.collaborationId, actorType: "system", actorId: "seam", action: `lifecycle.objection_${next.state === "open" ? "no_progress" : next.state}`,
+    metadata: { revision: control.revision, objectionId: next.id, target: next.target, responsibleParticipantId: next.responsibleParticipantId, attempt: next.attempts, noProgressRounds: next.noProgressRounds } });
+  if (next.state === "paused") await notify(control.collaborationId,
+    `${objectionTargetLabel(row.target)}连续两轮没有进展，已暂停此异议的派发。恢复条件：${row.resolutionCondition}`, { objectionId: row.id });
+}
+
+function addressedObjection(row: StoredPlanObjection, digest: string, response: NonNullable<StoredPlanObjection["response"]>): StoredPlanObjection {
+  return { ...row, state: "addressed", attempts: row.attempts + 1, noProgressRounds: 0, seen: [...row.seen, digest], response };
+}
+
+async function resolvePlanObjection(control: Lifecycle, revision: Revision, collaboration: typeof collaborations.$inferSelect, participantId: string, action: ObjectionAction) {
+  const row = revision.objectionState?.items.find(item => item.id === action.objectionId);
+  const draft = revision.objectionState?.draft ?? revision.sharedContract;
+  if (!row || !draft || control.phase !== "plan_synthesis" || row.state !== "open" || row.attempts + 1 !== action.attempt) throw new HttpError(409, "异议任务已暂停、处理或换轮，请使用当前派发");
+  if (row.responsibleParticipantId !== participantId) throw new HttpError(403, "仅该异议的责任方可提交修改或证据");
+  let candidate = draft;
+  let next: StoredPlanObjection;
+  try {
+    if (action.change && action.evidence) throw new HttpError(422, "本轮请选择一项对应修改或一条来源可核验的证据");
+    if (action.change) {
+      candidate = normalizeSharedContract(applyObjectionChange(draft, row.target, action.change));
+      const digest = objectionTargetFingerprint(candidate, row.target);
+      if (row.seen.includes(digest) || digest === objectionTargetFingerprint(draft, row.target)) throw new HttpError(422, "目标内容未变化或已在以前轮次提交");
+      await validatePlanDraft(control, revision, collaboration, candidate, (await getLifecycleContext(control.collaborationId))!);
+      next = addressedObjection(row, digest, { kind: "change", detail: action.summary });
+    } else {
+      if (!action.evidence) throw new HttpError(422, action.summary);
+      const { digest, response } = objectionEvidence(action.evidence, control.facts ?? [], control.revision);
+      if (row.seen.includes(digest)) throw new HttpError(422, "证据内容已在该异议的以前轮次提交");
+      next = addressedObjection(row, digest, response);
+    }
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status !== 422) throw error;
+    candidate = draft;
+    next = failedObjectionAttempt(row, error.message);
+  }
+  await saveObjectionAttempt(control, revision, collaboration, row, candidate, next);
+}
+
+export async function recordFailedObjectionTurn(collaborationId: string, snapshot: LifecycleSnapshot, scope: PlanObjectionTask, error: string) {
+  return locked(collaborationId, async (control, collaboration) => {
+    if (!control || control.pausedAt || control.phase !== "plan_synthesis" || control.revision !== snapshot.revision || control.documentHash !== snapshot.documentHash) return;
+    const revision = await getRevision(control);
+    const row = revision.objectionState?.items.find(item => item.id === scope.objectionId);
+    const draft = revision.objectionState?.draft ?? revision.sharedContract;
+    if (!row || !draft || row.state !== "open" || row.attempts + 1 !== scope.attempt) return;
+    await saveObjectionAttempt(control, revision, collaboration, row, draft, failedObjectionAttempt(row, error));
+  });
+}
+
+export async function resolvePausedObjection(userId: string, collaborationId: string, input: { revision: number; objectionId: string; attempts: number; evidence: string }) {
+  await requireAdministrator(userId, collaborationId);
+  return locked(collaborationId, async (control, collaboration) => {
+    if (!control || control.pausedAt || control.revision !== input.revision || control.phase !== "plan_synthesis") throw new HttpError(409, "协作或修订已变化，请重读当前异议");
+    const revision = await getRevision(control), state = revision.objectionState;
+    const row = state?.items.find(item => item.id === input.objectionId), draft = state?.draft ?? revision.sharedContract;
+    if (!row || !draft || row.state !== "paused" || row.attempts !== input.attempts) throw new HttpError(409, "只能为当前暂停的异议补充新证据");
+    const { digest, response } = administratorObjectionEvidence(input.evidence);
+    if (row.seen.includes(digest)) throw new HttpError(422, "请提供与该异议相关的新证据或业务决定");
+    await saveObjectionAttempt(control, revision, collaboration, row, draft, addressedObjection(row, digest, response));
+    await audit({ collaborationId, actorType: "user", actorId: userId, action: "lifecycle.objection_evidence_added",
+      metadata: { revision: control.revision, objectionId: row.id } });
+    await queueWorkflowWakeup(collaborationId);
+    return (await getLifecycleContext(collaborationId))!;
+  });
+}
+
 export async function applyLifecycleAction(actor: Actor, collaborationId: string, rawAction: import("zod").input<typeof lifecycleAgentActionSchema>): Promise<{ changed: boolean }> {
   const inputAction = lifecycleAgentActionSchema.parse(rawAction);
   return locked(collaborationId, async (control, collaboration) => {
@@ -359,6 +513,10 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     }
     const action = preparedAction;
     if (action.type === "plan.amend" || action.type === "plan.patch") throw new HttpError(422, "增量方案未能归一为完整契约操作");
+    if (action.type === "plan.resolve") {
+      await resolvePlanObjection(control, revision, collaboration, participantId, action);
+      return { changed: true };
+    }
     if (action.type === "information.request") {
       if (!["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(control.phase)) throw new HttpError(409, "当前阶段不能开始自动信息查找");
       await beginInformationLookup(control, participantId, action.question, action.searched, { key: action.key, fresh: action.fresh });
@@ -426,6 +584,7 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     if (existing?.block) await db.update(lifecycleContributions).set({ block: null, updatedAt: new Date() }).where(eq(lifecycleContributions.id, existing.id));
     if (action.type === "plan.submit") {
       if (!["planning", "plan_synthesis", "plan_confirmation"].includes(control.phase)) throw new HttpError(409, "当前阶段不能修改开发文档");
+      if ((control.protocolVersion ?? 1) >= PLAN_OBJECTION_PROTOCOL_VERSION && control.phase !== "planning") throw new HttpError(409, "请对当前契约提交具体异议或确认");
       if (existing?.content === action.content && JSON.stringify(existing.workspaceBaseline ?? null) === JSON.stringify(action.baseline ?? null) && canonicalJson(existing.factRefs??[])===canonicalJson(action.factRefs??[])) return { changed: false };
       const localAgent = required.find(row => row.participant.id === participantId)?.agent;
       if ((control.protocolVersion ?? 1) >= 6 && localAgent && ["codex", "codex-app-server", "claude-code", "generic-cli"].includes(localAgent.adapter) && (!action.baseline?.testFiles || !action.baseline.head)) throw new HttpError(422, "真实项目需由新版Connector采集Git基线及测试文件指纹后提交计划");
@@ -442,29 +601,18 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     if (action.type === "plan.compose") {
       try { action.contract = normalizeSharedContract(action.contract); } catch { throw new HttpError(422, "HTTP规范必须有效且引用完整"); }
       if (control.phase !== "plan_synthesis" || participantId !== control.requiredParticipantIds[0] || action.baseDocumentHash !== control.documentHash) throw new HttpError(409, "仅协调方可基于当前版本汇总统一契约");
+      if (control.documentHash && revision.objectionState?.items.some(item => item.state !== "addressed")) throw new HttpError(409, "请分别处理仍未解决的异议，再发起共同文档确认");
       const context = (await getLifecycleContext(collaborationId))!;
       const refs=action.contract.factRefs??[],requiredRefs=[...new Set(context.contributions.flatMap(row=>row.factRefs??[]))];
       if((control.protocolVersion??1)>=7&&requiredRefs.some(key=>!refs.includes(key)))throw new HttpError(422,"共同契约不得遗漏项目分析所引用的共享事实key");
-      const bindings=bindFacts(refs,control.facts??[]);
       if((control.protocolVersion??1)>=7&&!factsReady(refs,control.facts??[],control.revision)){await scheduleFactGates(control,participantId,refs);return {changed:true};}
-      validateSharedContract(action.contract, control.requiredParticipantIds, context.baseline?.contract, (control.protocolVersion ?? 1) >= 6 && collaboration.type === "api-integration", (control.protocolVersion??1)>=7&&collaboration.type==="api-integration", (control.protocolVersion??1)>=8&&collaboration.type==="api-integration");
-      if (revision.repair && context.baseline?.contract) validateRepairContract(context.baseline.contract, action.contract);
-      const [priorRevision] = control.revision > 1 ? await db.select().from(lifecycleRevisions).where(and(eq(lifecycleRevisions.collaborationId, collaborationId), eq(lifecycleRevisions.revision, control.revision - 1))).limit(1) : [];
-      executionReuse(action.contract, priorRevision, priorRevision ? await db.select().from(lifecycleContributions).where(currentContribution(collaborationId, priorRevision.revision)) : [], await getContributions(control), true);
-      const rows = await requiredProjects(control);
-      const document = renderSharedContract({ title: collaboration.title, revision: control.revision, requirements: revision.requirements,
-        changeRequest: revision.changeRequest, contract: action.contract, previous: context.baseline?.contract,
-        names: new Map(rows.map((row) => [row.participant.id, row.project.name])), baselines: context.contributions, factBindings:bindings });
-      const documentHash = hash(document);
-      if (documentHash === control.documentHash && (revision.objections ?? []).some((item) => item.documentHash === documentHash)) throw new HttpError(422, "该文档已有未解决异议，请实质修订契约后再提交");
-      await db.update(lifecycleContributions).set({ confirmedHash: null, updatedAt: new Date() }).where(currentContribution(collaborationId, control.revision));
-      await db.update(lifecycleRevisions).set({ document, documentHash, sharedContract: action.contract, factBindings:bindings, approvalIntent:null, updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
-      await db.update(collaborationLifecycles).set({ phase: "plan_confirmation", documentHash, approvedHash: null, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
-      await notify(collaborationId, "统一契约已生成。双方须检查接口语义、责任边界、联测命令和预期结果，存在冲突请提出异议。");
+      await validatePlanDraft(control, revision, collaboration, action.contract, context);
+      await publishPlan(control, revision, collaboration, action.contract, context);
       return { changed: true };
     }
     if (action.type === "plan.reject") {
       if (control.phase !== "plan_confirmation" || action.documentHash !== control.documentHash) throw new HttpError(409, "只能对当前待确认文档提出异议");
+      if ((control.protocolVersion ?? 1) >= PLAN_OBJECTION_PROTOCOL_VERSION) return { changed: await raisePlanObjections(control, revision, participantId, action) };
       await db.update(lifecycleRevisions).set({ objections: [...(revision.objections ?? []), { participantId, documentHash: action.documentHash, reason: action.reason }].slice(-50), updatedAt: new Date() }).where(eq(lifecycleRevisions.id, revision.id));
       await db.update(lifecycleContributions).set({ confirmedHash: null, updatedAt: new Date() }).where(currentContribution(collaborationId, control.revision));
       await db.update(collaborationLifecycles).set({ phase: "plan_synthesis", updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
@@ -475,13 +623,12 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     if (action.type === "plan.confirm") {
       if (!["plan_confirmation", "awaiting_approval"].includes(control.phase) || !control.documentHash || action.documentHash !== control.documentHash) throw new HttpError(409, "只能确认当前完整开发文档的内容哈希");
       if (!existing?.content) throw new HttpError(409, "请先提交本项目完整开发计划");
+      if (currentObjectionReviewers({ documentHash: control.documentHash, planObjections: revision.objectionState?.items }).has(participantId)) {
+        throw new HttpError(409, "请先处理已提交的异议，随后确认包含修改或依据的新文档");
+      }
       if (existing.confirmedHash === control.documentHash) return { changed: false };
       await db.update(lifecycleContributions).set({ confirmedHash: control.documentHash, updatedAt: new Date() }).where(eq(lifecycleContributions.id, existing.id));
-      const contributions = await getContributions(control);
-      if (control.requiredParticipantIds.every((id) => contributions.some((row) => row.participantId === id && row.confirmedHash === control.documentHash))) {
-        await db.update(collaborationLifecycles).set({ phase: "awaiting_approval", updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, collaborationId));
-        await notify(collaborationId, `双方已确认第 ${control.revision} 版完整开发文档。请管理员阅读并确认本版内容；AI 不能自行批准实施。`);
-      }
+      await finishPlanReview(control, revision.objectionState);
       return { changed: true };
     }
     if (!control.approvedHash || control.approvedHash !== control.documentHash) throw new HttpError(409, "本版文档未获管理员批准");
@@ -557,7 +704,7 @@ async function finishReport(control: Lifecycle, revision: Revision, collaboratio
     const repair = { sourceRevision: control.revision, sourceDocumentHash: control.approvedHash, sourceReportHash: hash(report), cycle: (revision.repair?.cycle ?? 0) + 1, failures };
     const requirements = `修复第${control.revision}版已报告的实施或联调未通过项；沿用上版有效业务目标与验收覆盖，先只读分析原始证据，协商完整修复方案并由双方确认。管理员批准新文档后才允许重新实施和运行验证。\n${failures.map(row => `${row.participantId} / ${row.caseId ?? row.stage} / ${row.status}：${row.summary}`).join("\n")}`;
     await db.insert(lifecycleRevisions).values({ id: newId(), collaborationId: control.collaborationId, revision: next, requirements, changeRequest: requirements, repair, createdById: collaboration.createdById });
-    await db.update(collaborationLifecycles).set({ revision: next, phase: "planning", documentHash: null, approvedHash: null, approvedById: null, approvedAt: null, protocolVersion: CONNECTOR_PROTOCOL_VERSION, updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
+    await db.update(collaborationLifecycles).set({ revision: next, phase: "planning", documentHash: null, approvedHash: null, approvedById: null, approvedAt: null, protocolVersion: Math.max(control.protocolVersion ?? 1, 9), updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
     const oldJobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), inArray(connectorJobs.status, ["pending", "running"])));
     for (const job of oldJobs) if (job.agentId !== currentAgentId) await db.update(connectorJobs).set({ status: "cancelled", error: "本轮失败报告已归档，进入只读修复方案起草；新方案未批准不得实施", leaseUntil: null, updatedAt: new Date() }).where(eq(connectorJobs.id, job.id));
     await db.update(collaborations).set({ status: "negotiating", updatedAt: new Date() }).where(eq(collaborations.id, control.collaborationId));

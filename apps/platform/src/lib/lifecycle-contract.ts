@@ -1,5 +1,5 @@
-import { expandSharedContract } from "@seam/protocol";
-import type { LifecycleContext, SharedContract } from "@seam/protocol";
+import { expandSharedContract, objectionTargetLabel } from "@seam/protocol";
+import type { LifecycleContext, PlanObjection, SharedContract } from "@seam/protocol";
 import { HttpError } from "./http";
 
 export function validateSharedContract(contract: SharedContract, required: string[], previous?: SharedContract | null, requireIndependent = false, requireCoverage = false, requireResponseAssertions = false) {
@@ -8,6 +8,7 @@ export function validateSharedContract(contract: SharedContract, required: strin
   const owners = contract.responsibilities.map((item) => item.participantId);
   if (!unique(owners) || owners.length !== required.length || required.some((id) => !owners.includes(id))) throw new HttpError(422, "统一契约必须且只能包含每个指定参与方的一份责任划分");
   if (!unique(contract.interfaces.map((item) => item.id)) || !unique(contract.acceptanceCases.map((item) => item.id))) throw new HttpError(422, "接口及验收用例 ID 不得重复");
+  if (contract.interfaces.some(item => !unique((item.fields ?? []).map(field => field.path)))) throw new HttpError(422, "同一接口的字段路径不得重复");
   if (contract.acceptanceCases.some((item) => !required.includes(item.runnerParticipantId)) || required.some((id) => !contract.acceptanceCases.some((item) => item.runnerParticipantId === id))) throw new HttpError(422, "联合验收必须覆盖每个参与方，执行方必须属于当前协作");
   if (!unique(contract.impactedParticipantIds) || contract.impactedParticipantIds.some((id) => !required.includes(id))) throw new HttpError(422, "影响范围包含无效或重复的参与方");
   const active = contract.effectiveRequirements ?? [], retired = contract.retiredRequirements ?? [];
@@ -69,6 +70,7 @@ export function renderSharedContract(input: {
   title: string; revision: number; requirements: string; changeRequest: string | null;
   contract: SharedContract; previous?: SharedContract | null;
   factBindings?: NonNullable<LifecycleContext["factBindings"]>; names: Map<string, string>; baselines: LifecycleContext["contributions"];
+  objections?: PlanObjection[];
 }) {
   const c = expandSharedContract(input.contract);
   const name = (id: string) => `${input.names.get(id) ?? id}（${id}）`;
@@ -81,6 +83,7 @@ export function renderSharedContract(input: {
     if (!entry) { entry = {id:`HTTP-${definitions.length+1}`,check}; definitions.push(entry); }
     references.set(`${item.id}/${check.id}`,entry.id);
   }
+  const responses = (input.objections ?? []).filter(item => item.state === "addressed" && item.response);
   return [
     `# ${input.title}：统一开发对接实施文档（第 ${input.revision} 版）`,
     c.effectiveRequirements?.length ? `## 当前有效要求\n\n${c.effectiveRequirements.map((item) => `- ${item.id}：${item.text}；验收方式=${item.verification??"历史未声明"}`).join("\n")}\n\n${c.retiredRequirements?.length ? `本轮撤销：\n${c.retiredRequirements.map((item) => `- ${item.id}：${item.reason}`).join("\n")}` : "无撤销要求"}` : `## 本轮要求（历史文档）\n\n${input.requirements}`,
@@ -88,7 +91,9 @@ export function renderSharedContract(input: {
     `## 复用的既有决定\n\n${c.retainedDecisions.map((line) => `- ${line}`).join("\n") || "无"}\n\n历史测试只作参考，本轮仍须提交实际实施及联合验收结果。`,
     `## 本轮引用的共享事实\n\n${input.factBindings?.map(fact=>`${fact.key}：${fact.value}；来源指纹=${fact.sourceHash}`).join("\n\n") || "未引用共享事实"}\n\n来源由拥有端核验并绑定本修订，变化后重新起草；管理员批准仅对本文档hash有效。`,
     `## 实施范围\n\n${c.scope}`,
-    `## 唯一接口契约\n\n${c.interfaces.map((item) => `### ${item.id}\n\n${item.definition}`).join("\n\n")}`,
+    `## 唯一接口契约\n\n${c.interfaces.map((item) => `### ${item.id}\n\n${item.definition}${item.fields?.length ?
+      `\n\n具体字段以以下约定为准。\n${item.fields.map(field => `- \`${field.path}\` ${field.definition}`).join("\n")}` : ""}`).join("\n\n")}`,
+    ...(responses.length ? [`## 异议处理与依据\n\n${responses.map(item => `### ${objectionTargetLabel(item.target)}（${item.id}）\n\n提出方 ${name(item.participantId)}\n\n责任方 ${name(item.responsibleParticipantId)}\n\n异议 ${item.reason}\n\n恢复条件 ${item.resolutionCondition}\n\n处理记录\n${item.response!.detail}`).join("\n\n")}`] : []),
     `## 项目责任与实施步骤\n\n${c.responsibilities.map((item) => `### ${name(item.participantId)} · ${item.mode === "verify_only" ? "仅验证，复用已核验实施" : "实施并验证"}\n\n${item.changes}`).join("\n\n")}`,
     `## 联合验收\n\n${c.acceptanceCases.map((item) => `### ${item.id} · ${name(item.runnerParticipantId)}\n\n${item.description}\n\n执行命令：${item.command}\n\n预期：${item.expectedResult}\n\n必需成功断言：${item.requiredAssertions?.join("；") ?? "历史文档未声明完整断言集"}\n\n独立HTTP检查：${item.httpChecks?.map(check=>`${check.id} → ${references.get(`${item.id}/${check.id}`)}`).join("；") || "未声明；该用例仅有命令证据"}`).join("\n\n")}\n\n命令由本机 Agent 按本地权限核对执行，平台不直接执行远程文本。每端独立执行其引用的全部HTTP检查，规范相同仅在文档中共用定义；实际结果分别保存。$SEAM_REVISION绑定当前批准修订。`,
     `## 完整HTTP检查定义（相同规范只列一次）\n\n${definitions.map(({id,check})=>`### ${id}\n服务：${name(check.publisherParticipantId)} / ${check.serviceName}；${check.method} ${check.path}\n原始请求正文：${check.requestBody === null ? "无" : JSON.stringify(check.requestBody)}\n预期状态：${check.expectedStatus}；关联要求：${check.requirementIds?.join("、") ?? "历史未声明"}\n字段精确值：${check.bodyChecks.map(field=>`${field.path}=${JSON.stringify(field.equals)}`).join("；") || "无"}\n字段类型：${check.bodyAssertions?.map(field=>`${field.path}:${field.type}${field.nonEmpty?"，非空":""}`).join("；") || "无"}\n响应头：${check.headerChecks?.map(header=>`${header.name} 包含 ${JSON.stringify(header.includes)}`).join("；") || "未声明"}\n空正文：${check.emptyBody===true?"必须为空":"未要求"}`).join("\n\n") || "没有独立HTTP检查"}`,
