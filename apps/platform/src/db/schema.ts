@@ -48,6 +48,7 @@ export const projects = mysqlTable("projects", {
   name: varchar("name", { length: 200 }).notNull(),
   slug: varchar("slug", { length: 80 }).notNull(),
   description: text("description").notNull(),
+  archivedAt: timestamp("archived_at", { fsp: 3 }),
   ...timestamps,
 }, (table) => [uniqueIndex("projects_org_slug_unique").on(table.orgId, table.slug)]);
 

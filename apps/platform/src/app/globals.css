@@ -41,6 +41,7 @@ p { line-height: 1.6; }
 .card-header h2, .card-header h3 { margin: 0; }
 .stack { display: flex; flex-direction: column; gap: 14px; }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.project-actions { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .btn { border: 0; border-radius: 9px; background: var(--brand); color: #fff; padding: 10px 15px; font-weight: 650; font-size: 14px; }
 .btn:hover { background: var(--brand-dark); }
@@ -66,8 +67,8 @@ textarea { resize: vertical; min-height: 100px; line-height: 1.5; }
 .list-item { border: 1px solid var(--line); border-radius: 11px; padding: 14px; background: #fff; }
 .list-item:hover { border-color: #c5d0e5; }
 .tabs { display: flex; gap: 5px; border-bottom: 1px solid var(--line); margin-bottom: 20px; overflow-x: auto; }
-.tabs button { border: 0; background: transparent; color: var(--muted); padding: 12px 15px; border-bottom: 2px solid transparent; white-space: nowrap; }
-.tabs button.active { color: var(--brand); border-bottom-color: var(--brand); font-weight: 700; }
+.tabs button, .tabs a { border: 0; background: transparent; color: var(--muted); padding: 12px 15px; border-bottom: 2px solid transparent; white-space: nowrap; }
+.tabs button.active, .tabs a[aria-current="page"] { color: var(--brand); border-bottom-color: var(--brand); font-weight: 700; }
 .message { display: flex; gap: 12px; padding: 13px 0; border-bottom: 1px solid #edf0f4; }
 .avatar { flex: 0 0 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: var(--brand-soft); color: var(--brand); font-weight: 800; }
 .message-body { flex: 1; min-width: 0; }

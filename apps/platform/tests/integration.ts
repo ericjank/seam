@@ -35,8 +35,72 @@ async function api(path: string, body?: unknown, token?: string, method = "POST"
 async function processAgent(agent: { id: string; token: string }) {
   await runConnector({
     platformUrl: base, agentId: agent.id, token: agent.token, projectRoot: process.cwd(),
+    stateDir: process.env.SEAM_CONNECTOR_STATE_DIR, workspaceLockDir: process.env.SEAM_WORKSPACE_LOCK_DIR,
     adapter: "mock", once: true, pollMs: 1,
   });
+}
+
+async function verifyProjectPermissions(projectPath: string) {
+  const ownerCookie = cookie;
+  for (const role of ["viewer", "member"] as const) {
+    const email = `${role}-${newId()}@seam.test`;
+    await api("/api/users", { name: "项目管理验收", email, password, role });
+    await api("/api/auth/login", { email, password });
+    try {
+      for (const archived of [true, false]) {
+        const change = await raw(projectPath, { archived }, undefined, "PATCH");
+        assert.equal(change.response.status, role === "viewer" ? 403 : 200);
+      }
+      assert.equal((await raw(projectPath, undefined, undefined, "DELETE")).response.status, 403);
+    } finally { cookie = ownerCookie; }
+  }
+}
+
+async function verifyProjectArchiving(collaborationId: string, activeProjectId: string) {
+  const { project } = await api("/api/projects", { name: "项目归档验证" });
+  const path = `/api/projects/${project.id}`;
+  const setArchived = (archived: boolean) => api(path, { archived }, undefined, "PATCH");
+  const list = async (archived = false) => {
+    const { projects } = await api(archived ? "/api/projects?view=archived" : "/api/projects", undefined, undefined, "GET");
+    return projects.find((row: { project: { id: string } }) => row.project.id === project.id);
+  };
+  assert.equal((await list()).unused, true);
+  await setArchived(true);
+  const archivedAt = (await list(true)).project.archivedAt;
+  assert.ok(archivedAt);
+  await setArchived(true);
+  assert.equal((await list(true)).project.archivedAt, archivedAt);
+  assert.equal(await list(), undefined);
+  const agentInput = { projectId: project.id, name: "归档验证 Agent", adapter: "mock" };
+  const goal = { projectId: project.id, objective: "验证归档限制" };
+  const invitation = { projectId: project.id, role: "reviewer" };
+  assert.equal((await raw("/api/agents", agentInput)).response.status, 409);
+  assert.equal((await raw("/api/collaborations", goal)).response.status, 409);
+  assert.equal((await raw("/api/collaborations", { ...goal, projectId: activeProjectId, targetProjectId: project.id })).response.status, 409);
+  assert.equal((await raw(`/api/collaborations/${collaborationId}/participants`, invitation)).response.status, 409);
+  await setArchived(false);
+  assert.equal((await list()).project.archivedAt, null);
+  assert.equal(await list(true), undefined);
+
+  // Agent-only and participation-only projects must each survive deletion attempts.
+  await api("/api/agents", agentInput);
+  assert.equal((await list()).unused, false);
+  assert.equal((await raw(path, undefined, undefined, "DELETE")).response.status, 409);
+  const { project: peer } = await api("/api/projects", { name: "仅有协作记录的项目" });
+  const peerPath = `/api/projects/${peer.id}`;
+  const history = await api("/api/collaborations", { ...goal, projectId: peer.id });
+  await api(peerPath, { archived: true }, undefined, "PATCH");
+  assert.equal((await raw(peerPath, undefined, undefined, "DELETE")).response.status, 409);
+  const detail = await api(`/api/collaborations/${history.id}`, undefined, undefined, "GET");
+  assert.equal(detail.participants[0].project.id, peer.id);
+  assert.ok(!detail.availableProjects.some((row: { project: { id: string } }) => row.project.id === peer.id));
+  assert.ok(detail.messages.length);
+
+  const { project: empty } = await api("/api/projects", { name: "误建的空项目" });
+  const emptyPath = `/api/projects/${empty.id}`;
+  await verifyProjectPermissions(emptyPath);
+  await api(emptyPath, undefined, undefined, "DELETE");
+  assert.equal((await raw(emptyPath, { archived: false }, undefined, "PATCH")).response.status, 404);
 }
 
 async function main() {
@@ -154,6 +218,7 @@ async function main() {
 
   const invalid = await raw("/api/connectors/poll", { agentId: agents[0].id, waitMs: 0 }, "invalid-token");
   assert.equal(invalid.response.status, 401);
+  await verifyProjectArchiving(collaborationId, projects[0].id);
   const outsiderOrg = newId();
   const outsiderId = newId();
   await db.insert(organizations).values({ id: outsiderOrg, name: "隔离测试组织" });
@@ -167,10 +232,13 @@ async function main() {
   await api("/api/auth/login", { email: outsider.email, password });
   const forbidden = await raw(`/api/collaborations/${collaborationId}`, undefined, undefined, "GET");
   assert.equal(forbidden.response.status, 404, "其他组织不能读取协作");
+  const foreignProject = `/api/projects/${projects[0].id}`;
+  assert.equal((await raw(foreignProject, { archived: true }, undefined, "PATCH")).response.status, 404);
+  assert.equal((await raw(foreignProject, undefined, undefined, "DELETE")).response.status, 404);
 
   console.log(JSON.stringify({
     ok: true, collaborationId, releaseCollaborationId: release.id,
-    checks: ["三方 Agent 协商", "提案一致确认", "凭据加密与一次性领取", "自动验收", "契约变更失效", "通用协作", "A2A", "组织隔离"],
+    checks: ["三方 Agent 协商", "提案一致确认", "凭据加密与一次性领取", "自动验收", "契约变更失效", "通用协作", "A2A", "项目归档、恢复与删除", "组织隔离"],
   }, null, 2));
 }
 

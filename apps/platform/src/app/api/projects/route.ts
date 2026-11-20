@@ -4,10 +4,11 @@ import { requireUser } from "@/lib/auth";
 import { handleApiError } from "@/lib/http";
 import { createProject, listProjects } from "@/services/projects";
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const { user } = await requireUser();
-    return NextResponse.json({ projects: await listProjects(user.id) });
+    const view = z.enum(["active", "archived"]).parse(new URL(request.url).searchParams.get("view") ?? "active");
+    return NextResponse.json({ projects: await listProjects(user.id, view) });
   } catch (error) { return handleApiError(error); }
 }
 

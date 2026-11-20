@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { adapterTelemetrySchema } from "@seam/protocol";
-import { db } from "@/db";
+import { db, withTransaction } from "@/db";
 import {
   acceptanceRuns,
   agents,
@@ -23,13 +23,14 @@ import {
 import { newId } from "@/lib/ids";
 import { requireCollaborationAccess, requireParticipantAccess, requireProjectAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
-import { listProjects } from "./projects";
+import { listProjects, requireActiveProject } from "./projects";
 import { HttpError } from "@/lib/http";
 import { getLifecycleContext } from "./lifecycle";
 import { hasLegacyDispatch, recoverDispatchNames } from "@/lib/dispatch-message";
 import { recoverySummary } from "@/lib/recovery-summary";
 
 async function resolveProjectAgent(projectId: string, agentId?: string) {
+  await requireActiveProject(projectId);
   const candidates = await db.select({ id: agents.id }).from(agents).where(eq(agents.projectId, projectId));
   if (agentId && !candidates.some((agent) => agent.id === agentId)) throw new HttpError(422, "Agent 不属于所选项目");
   return agentId || (candidates.length === 1 ? candidates[0]!.id : null);
@@ -51,11 +52,11 @@ export async function createCollaboration(userId: string, input: {
   projectId: string;
   agentId?: string;
 }) {
-  await requireProjectAccess(userId, input.projectId, true);
-  const agentId = await resolveProjectAgent(input.projectId, input.agentId);
   const collaborationId = newId();
   const participantId = newId();
-  await db.transaction(async (tx) => {
+  await withTransaction(async (tx) => {
+    await requireProjectAccess(userId, input.projectId, true);
+    const agentId = await resolveProjectAgent(input.projectId, input.agentId);
     await tx.insert(collaborations).values({
       id: collaborationId,
       title: input.title,
@@ -80,8 +81,8 @@ export async function createCollaboration(userId: string, input: {
       kind: "system",
       body: "协作已创建，等待邀请其他项目参与。",
     });
+    await audit({ collaborationId, actorType: "user", actorId: userId, action: "collaboration.created" });
   });
-  await audit({ collaborationId, actorType: "user", actorId: userId, action: "collaboration.created" });
   return { id: collaborationId, participantId };
 }
 
@@ -91,19 +92,21 @@ export async function inviteParticipant(userId: string, input: {
   agentId?: string;
   role: "provider" | "consumer" | "reviewer" | "participant";
 }) {
-  await requireCollaborationAccess(userId, input.collaborationId, true);
-  const agentId = await resolveProjectAgent(input.projectId, input.agentId);
-  const participant = {
-    id: newId(),
-    collaborationId: input.collaborationId,
-    projectId: input.projectId,
-    agentId,
-    role: input.role,
-    status: "invited" as const,
-  };
-  await db.insert(participants).values(participant);
-  await addSystemMessage(input.collaborationId, "已向一个项目发出协作邀请，等待其项目成员确认。");
-  return participant;
+  return withTransaction(async () => {
+    await requireCollaborationAccess(userId, input.collaborationId, true);
+    const agentId = await resolveProjectAgent(input.projectId, input.agentId);
+    const participant = {
+      id: newId(),
+      collaborationId: input.collaborationId,
+      projectId: input.projectId,
+      agentId,
+      role: input.role,
+      status: "invited" as const,
+    };
+    await db.insert(participants).values(participant);
+    await addSystemMessage(input.collaborationId, "已向一个项目发出协作邀请，等待其项目成员确认。");
+    return participant;
+  });
 }
 
 export async function acceptParticipant(userId: string, participantId: string) {
