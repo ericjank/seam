@@ -29,7 +29,7 @@ Seam 是共享协作状态与任务队列，不是托管业务源码的编程服
 
 ## Connector 配置一次保存
 
-私有 env 文件保留在仓库外，权限设置为 600；不要把真实 Token 提交到 Git。Node.js 要求 22 或以上。
+从项目列表注册 Agent、复制一次性凭据和确认上线的步骤见 [接入项目 Agent](../README.zh-CN.md#接入项目-agent)。以下为使用兼容单轮 Codex CLI 的配置示例，私有 env 文件保留在仓库外，权限设为 `600`。
 
 ```dotenv
 SEAM_PLATFORM_URL=https://seam.example.com
@@ -44,7 +44,7 @@ SEAM_TEST_COMMAND=pnpm test:contract
 在 Seam 仓库构建后运行：
 
 ```bash
-pnpm build
+pnpm --filter @seam/connector... build
 node --env-file=/path/to/private/seam.env apps/connector/dist/cli.js --doctor
 node --env-file=/path/to/private/seam.env apps/connector/dist/cli.js
 ```

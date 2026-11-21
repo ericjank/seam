@@ -134,22 +134,37 @@ pnpm dev
 
 ## 接入项目 Agent
 
-1. 在“项目与 Agent”页创建项目并注册 Agent。
-2. 保存只显示一次的 Agent ID 和 Token。
-3. 在对应项目的私有目录运行 Connector，不要把 Token 写入项目仓库。
+在运行 Agent 的机器上克隆本仓库，进入 **Seam 仓库根目录**。用 `node --version` 确认当前终端使用 Node.js 22 或更高版本，按根目录 `package.json` 的 `packageManager` 选择 pnpm 版本，然后安装依赖并构建 Connector。
 
 ```bash
-pnpm build
-
-node apps/connector/dist/cli.js \
-  --platform http://localhost:3000 \
-  --agent-id <AGENT_ID> \
-  --token <AGENT_TOKEN> \
-  --project-root /path/to/private/project \
-  --adapter mock
+pnpm install --frozen-lockfile
+pnpm --filter @seam/connector... build
 ```
 
-`--adapter` 可选 `codex-app-server`（推荐）、`claude-code`、`codex`（兼容单轮 CLI）、`generic-cli`、`mock`。Codex 需在本机安装并登录；App Server 模式复用原生 thread，Connector 重启后仍可续接，平台提供本机对话打开入口。
+为每个 Agent 在仓库外准备独立的配置文件。下例使用 `~/.seam/order-api.env`。
+
+```bash
+mkdir -p "$HOME/.seam"
+touch "$HOME/.seam/order-api.env"
+chmod 600 "$HOME/.seam/order-api.env"
+```
+
+1. 以组织所有者或成员身份打开「项目与 Agent」→「使用中」。找到目标项目，或点「新建项目」创建。在该项目行点「注册 Agent」，填写名称、选择适配器，再点「生成 Connector 凭据」。
+2. 在「Connector 凭据」弹窗点「复制配置」。若内网 HTTP 页面只选中了文本（如 `v1.0.2`），或提示「自动复制受限」，直接按 `⌘C`（macOS）或 `Ctrl+C`（Windows/Linux），手机可长按选区选「复制」。然后将配置粘贴到刚准备的文件。
+3. 确认文件里有完整的四行 `SEAM_AGENT_ID`、`SEAM_AGENT_TOKEN`、`SEAM_PLATFORM_URL`、`SEAM_PROJECT_ROOT`，保存后再点「已保存，关闭」。**Token 只显示这一次**，Agent ID 以后仍可在「项目详情」查看。
+4. 将 `SEAM_PROJECT_ROOT` 的占位值换成本机业务项目的绝对路径。弹窗中的 `SEAM_PLATFORM_URL` 取自当前浏览器地址。如果平台在另一台机器上，请填写 Connector 能访问的平台域名或内网地址。
+5. 在同一文件追加与注册时一致的适配器。选了「Codex 持久对话（推荐）」就写 `SEAM_ADAPTER=codex-app-server`。Claude Code、Codex CLI、通用 CLI 和 Mock 分别对应 `claude-code`、`codex`、`generic-cli` 和 `mock`。弹窗的四行配置不含此项，省略时 Connector 默认使用 `mock`。
+
+使用 Codex 时，请先在本机安装并登录。持久对话模式可在 Connector 重启后续接原对话，也可从平台打开本机对话。更多配置见 [Connector 环境变量示例](apps/connector/.env.example)。
+
+从 Seam 仓库根目录运行本地诊断，核对输出中的 `adapter`、`project.ok` 和 `cli.ok`，然后启动 Connector。
+
+```bash
+node --env-file="$HOME/.seam/order-api.env" apps/connector/dist/cli.js --doctor
+node --env-file="$HOME/.seam/order-api.env" apps/connector/dist/cli.js
+```
+
+终端显示 `Seam Connector 已连接` 表示平台已收到心跳。保持进程运行，刷新「项目与 Agent」，展开该行的「项目详情」，确认对应 Agent 显示「在线」。
 
 通用 CLI 通过以下环境变量配置；命令最后一个参数会收到完整协商提示：
 
@@ -173,11 +188,7 @@ export SEAM_TEST_COMMAND='pnpm test:contract'
 5. 管理员可补充要求开启下一轮，双方复用上版契约和报告，围绕变化生成完整新版文档并重新确认、批准。平台展示变更和影响项目，旧版授权不能用于新版。
 6. 满意后管理员点击“满意，确认终止任务”。报告收齐不会自行终止，失败报告保持失败状态。
 
-推荐本机 Codex 接入：
-
-```bash
-SEAM_CODEX_SANDBOX=workspace-write node --env-file=/path/to/private/seam.env apps/connector/dist/cli.js --adapter codex-app-server
-```
+如需允许 Codex 在批准的实施阶段写入项目，可在该 Agent 的私有配置文件中设置 `SEAM_CODEX_SANDBOX=workspace-write` 并重启 Connector。
 
 需要 Agent 在实施时访问测试接口或拉取依赖，可由本机维护者一次性设置 `SEAM_CODEX_NETWORK_ACCESS=true`，并用 `--doctor` 检查。默认关闭网络；规划阶段始终不开放网络。
 
@@ -220,7 +231,7 @@ pnpm test:e2e
 
 - Connector 只发送协议消息、显式声明的产物和测试摘要；A2A 文件附件会被忽略。
 - 凭据采用 AES-256-GCM 信封加密，主密钥由 `SEAM_MASTER_KEY` 提供。
-- Web 和审计不回显凭据明文；只有获授权的接收方 Connector 能一次性领取。
+- 协作中提交的业务凭据仅供获授权的接收方 Connector 一次性领取，网页和审计记录不回显这些凭据的明文。
 - 平台不接受公开注册，跨组织资源默认不可见。
 - 生产部署应在 HTTPS 反向代理之后运行，并妥善备份 MySQL 和主密钥。丢失主密钥将无法恢复已加密凭据。
 

@@ -135,22 +135,37 @@ Open `http://localhost:3000`. On the first visit, you will create an organizatio
 
 ## Connect a project Agent
 
-1. Create a project and register an Agent from the Projects & Agents page.
-2. Save the Agent ID and token, which are displayed only once.
-3. Run the Connector in the corresponding private project directory. Never store the token in the project repository.
+Clone Seam on the machine that will run the Agent and open a terminal at the **root of the Seam checkout**. Check that `node --version` reports Node.js 22 or later and select the pnpm version in the root `package.json` under `packageManager`. Then install dependencies and build the Connector.
 
 ```bash
-pnpm build
-
-node apps/connector/dist/cli.js \
-  --platform http://localhost:3000 \
-  --agent-id <AGENT_ID> \
-  --token <AGENT_TOKEN> \
-  --project-root /path/to/private/project \
-  --adapter mock
+pnpm install --frozen-lockfile
+pnpm --filter @seam/connector... build
 ```
 
-Supported `--adapter` values are `codex-app-server` (recommended), `claude-code`, `codex` (legacy single-turn CLI), `generic-cli`, and `mock`. Codex must already be installed and authenticated locally. App Server threads persist across Connector restarts and can be opened from the platform.
+Create a private configuration file outside the repository for each Agent. This example uses `~/.seam/order-api.env`.
+
+```bash
+mkdir -p "$HOME/.seam"
+touch "$HOME/.seam/order-api.env"
+chmod 600 "$HOME/.seam/order-api.env"
+```
+
+1. As an organization owner or member, open **项目与 Agent** (Projects & Agents) and select **使用中** (Active). Find the project or create one with **新建项目**. Click **注册 Agent** in its row, enter a name, choose an adapter, and click **生成 Connector 凭据**.
+2. In the **Connector 凭据** dialog, click **复制配置** (Copy configuration). If the button only selects the text on LAN HTTP (as in `v1.0.2`), or the dialog reports **自动复制受限**, press `⌘C` on macOS or `Ctrl+C` on Windows/Linux. On mobile, press and hold the selection and choose Copy. Then paste the configuration into the private file.
+3. Check that all four lines are present (`SEAM_AGENT_ID`, `SEAM_AGENT_TOKEN`, `SEAM_PLATFORM_URL`, `SEAM_PROJECT_ROOT`). Save the file before clicking **已保存，关闭**. **The token is shown only once.** The Agent ID remains available in **项目详情** (Project details).
+4. Replace the `SEAM_PROJECT_ROOT` placeholder with the absolute path to the business project on the Connector machine. The dialog takes `SEAM_PLATFORM_URL` from the browser address. If the platform runs on another machine, use a hostname or LAN address reachable from the Connector.
+5. Append the adapter you selected during registration. For **Codex 持久对话（推荐）** (persistent Codex), add `SEAM_ADAPTER=codex-app-server`. The values for Claude Code, Codex CLI, generic CLI and Mock are `claude-code`, `codex`, `generic-cli` and `mock`, respectively. The four copied lines omit this setting and the Connector defaults to `mock`.
+
+If you use Codex, install and authenticate it locally. App Server threads persist across Connector restarts and can be opened from the platform. See the [Connector environment example](apps/connector/.env.example) for more settings.
+
+From the root of the Seam checkout, run the local diagnostic and check `adapter`, `project.ok`, and `cli.ok` in its output. Then start the Connector.
+
+```bash
+node --env-file="$HOME/.seam/order-api.env" apps/connector/dist/cli.js --doctor
+node --env-file="$HOME/.seam/order-api.env" apps/connector/dist/cli.js
+```
+
+The terminal prints `Seam Connector 已连接` after the platform receives a heartbeat. Leave the process running, refresh **项目与 Agent**, and open **项目详情** in the project's row to confirm that the Agent shows **在线** (Online).
 
 Native Codex handoffs use readable project information and changes since the last successful turn. Output schemas travel through `turn/start.outputSchema`, rather than being pasted into the chat. Current stage, approval hashes and local permissions remain explicit on every turn. Unchanged goals, effective requirements and user instructions are retained by the session checkpoint; large documents and logs are supplied as immutable local resources with SHA-256 references for on-demand reading. Agents must read the complete approved document before confirming or first implementing that revision. See [handoff architecture and analysis](docs/对话交接优化.md) for synchronization and recovery behavior. Native transport telemetry records body/schema bytes, observed command output and runtime-reported token counters separately. Local cache retention defaults to 30 days (SEAM_RESOURCE_RETENTION_DAYS); current references remain pinned. SEAM_RUN_LABEL adds an optional local test label to compact chat titles. Rebuild and restart the local Connector to use the updated adapter; existing threads are retained and receive an initial synchronization of the current facts and resource references. See [recovery, readiness and evidence](docs/协作执行架构升级.md) for interrupted-work checkpoints, structured blocks and automatically captured test assertions.
 
@@ -219,7 +234,7 @@ Integration coverage includes three-party Agent negotiation, unanimous approval,
 
 - Connectors send only protocol messages, explicitly declared artifacts, and test summaries. A2A file attachments are ignored.
 - Credentials use AES-256-GCM envelope encryption, with the master key supplied through `SEAM_MASTER_KEY`.
-- The web interface and audit log never display plaintext credentials. Only an authorized recipient Connector can collect a credential once.
+- Only an authorized recipient Connector can collect a credential shared through a collaboration, and only once. The web interface and audit log do not display the plaintext of those credentials.
 - Public registration is disabled, and resources are invisible across organizations by default.
 - Run production behind an HTTPS reverse proxy, and back up both MySQL and the master key securely. Encrypted credentials cannot be recovered if the master key is lost.
 
