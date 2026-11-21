@@ -54,14 +54,28 @@ export function ProjectDialog({ action, onDismiss, onSaved }: {
   }
 
   async function copyConfig() {
+    let copied = false;
     try {
-      await navigator.clipboard.writeText(config);
-      setCopyStatus("配置已复制。");
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(config);
+        copied = true;
+      }
     } catch {
-      configRef.current?.focus();
-      configRef.current?.select();
-      setCopyStatus("已选中配置，请使用系统复制。");
+      // The browser may expose the Clipboard API but deny the write.
     }
+    if (!copied) {
+      const field = configRef.current;
+      if (!field || !dialogRef.current?.open) return;
+      field.focus();
+      field.select();
+      try {
+        // On LAN HTTP, copy the selection inside the modal during this click.
+        copied = document.execCommand("copy");
+      } catch {
+        // Leave the full configuration selected for manual copying.
+      }
+    }
+    setCopyStatus(copied ? "配置已复制。" : "自动复制受限，配置已全选。请按 ⌘C 或 Ctrl+C 复制，手机可长按选择「复制」。");
   }
 
   const title = config ? "Connector 凭据" : action.kind === "create" ? "新建项目" : "注册 Agent";

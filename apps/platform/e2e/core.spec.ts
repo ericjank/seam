@@ -71,11 +71,26 @@ test("登录、创建项目与 Agent、发起协作", async ({ page }, testInfo)
   const platformLine = (await config.inputValue()).split("\n").find((line) => line.startsWith("SEAM_PLATFORM_URL="));
   expect(platformLine).toBe(`SEAM_PLATFORM_URL=${new URL(page.url()).origin}`);
   await capturePublicScreenshot(page,testInfo.outputPath("credential-panel-masked.png"),{fullPage:true});
-  // A LAN HTTP origin may have no Clipboard API. Check its manual-copy path.
-  await page.evaluate(() => {
+  // Model LAN HTTP without writing test credentials to the runner's clipboard.
+  const clipboard = await page.evaluateHandle(() => {
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+    const buffer = { text: "" };
+    document.execCommand = (command) => {
+      const field = document.activeElement;
+      if (command !== "copy" || !(field instanceof HTMLTextAreaElement)) return false;
+      buffer.text = field.value.slice(field.selectionStart, field.selectionEnd);
+      return true;
+    };
+    return buffer;
   });
-  await credentials.getByRole("button", { name: "复制配置" }).click();
+  const copyButton = credentials.getByRole("button", { name: "复制配置" });
+  await copyButton.click();
+  expect(await config.evaluate((field: HTMLTextAreaElement, buffer) => buffer.text === field.value, clipboard)).toBe(true);
+  await expect(credentials.getByRole("status")).toHaveText("配置已复制。");
+
+  await page.evaluate(() => { document.execCommand = () => false; });
+  await copyButton.click();
+  await expect(credentials.getByRole("status")).toContainText("⌘C 或 Ctrl+C");
   await expect(config).toBeFocused();
   expect(await config.evaluate((node: HTMLTextAreaElement) => node.selectionStart === 0 && node.selectionEnd === node.value.length)).toBe(true);
   await credentials.getByRole("button", { name: "已保存，关闭" }).click();
