@@ -67,6 +67,7 @@ async function execute(local: LocalAgent) {
   await runConnector({
     platformUrl: base, agentId: local.agent.id, token: local.agent.token,
     projectRoot: local.root, adapter: "generic-cli", once: true, pollMs: 100,
+    stateDir: process.env.SEAM_CONNECTOR_STATE_DIR, workspaceLockDir: process.env.SEAM_WORKSPACE_LOCK_DIR,
   });
 }
 
@@ -143,6 +144,8 @@ async function main() {
   assert.ok(["127.0.0.1", "localhost", "::1"].includes(process.env.DB_HOST ?? "127.0.0.1"), "test database must be local");
   assert.match(process.env.DB_DATABASE ?? "", /^seam_[a-z0-9_]*test$/, "set an explicit, isolated seam_*test database");
   temporaryRoot = await mkdtemp(join(tmpdir(), "seam-workflow-"));
+  process.env.SEAM_CONNECTOR_STATE_DIR = join(temporaryRoot, "connector-state");
+  process.env.SEAM_WORKSPACE_LOCK_DIR = join(temporaryRoot, "workspace-locks");
   const fakeCli = join(temporaryRoot, "fake-agent.mjs");
   await writeFile(fakeCli, fakeCliSource);
   process.env.SEAM_GENERIC_AGENT_COMMAND = process.execPath;

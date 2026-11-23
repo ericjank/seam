@@ -93,7 +93,8 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
   for (;;) {
     if (signal?.aborted) return null;
     const [job] = await db.select().from(connectorJobs)
-      .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, new Date()),
+      // MySQL sets available_at when the job is enqueued. Use the same clock to decide when it is due.
+      .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, sql`CURRENT_TIMESTAMP(3)`),
         sql`COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.lifecycle.protocolVersion')) AS UNSIGNED), 1) <= ${protocolVersion}`,
         supportsInformationLookup ? undefined : sql`(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask') IS NULL OR JSON_TYPE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask')) = 'NULL')`))
       .orderBy(asc(connectorJobs.sequence)).limit(1);

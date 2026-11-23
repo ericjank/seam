@@ -29,6 +29,8 @@ import { getLifecycleContext } from "./lifecycle";
 import { hasLegacyDispatch, recoverDispatchNames } from "@/lib/dispatch-message";
 import { recoverySummary } from "@/lib/recovery-summary";
 
+export const RECENT_JOB_LIMIT = 20;
+
 async function resolveProjectAgent(projectId: string, agentId?: string) {
   await requireActiveProject(projectId);
   const candidates = await db.select({ id: agents.id }).from(agents).where(eq(agents.projectId, projectId));
@@ -177,7 +179,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     projectName: sql<string | null>`NULLIF(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.projectName')), 'null')`,
     agentName: sql<string | null>`NULLIF(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.agentName')), 'null')`,
     cancellationAckAt: connectorJobs.cancellationAckAt, leaseUntil: connectorJobs.leaseUntil, status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt, result: connectorJobs.result,
-  }).from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(20);
+  }).from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(RECENT_JOB_LIMIT);
   const dispatchJobs = hasLegacyDispatch(messageRows) ? await db.select({
     jobId: connectorJobs.id, agentId: connectorJobs.agentId, createdAt: connectorJobs.createdAt,
     workflowId: sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.workflow.id'))`,

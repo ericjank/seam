@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import bcrypt from "bcryptjs";
-import { eq } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { runConnector } from "@seam/connector";
-import { db, pool } from "../src/db";
-import { credentials, messages, organizations, users } from "../src/db/schema";
+import { db, pool, withTransaction } from "../src/db";
+import { connectorJobs, credentials, messages, organizations, users } from "../src/db/schema";
 import { newId } from "../src/lib/ids";
+import { pollConnectorJob } from "../src/services/connectors";
 
 const base = process.env.SEAM_APP_URL ?? "http://localhost:3000";
 const email = process.env.SEAM_TEST_OWNER_EMAIL ?? "owner@seam.test";
@@ -37,6 +38,30 @@ async function processAgent(agent: { id: string; token: string }) {
     platformUrl: base, agentId: agent.id, token: agent.token, projectRoot: process.cwd(),
     stateDir: process.env.SEAM_CONNECTOR_STATE_DIR, workspaceLockDir: process.env.SEAM_WORKSPACE_LOCK_DIR,
     adapter: "mock", once: true, pollMs: 1,
+  });
+}
+
+async function verifyQueueClock(agentId: string) {
+  await withTransaction(async tx => {
+    try {
+      for (const offsetHours of [8, -8]) {
+        // Override only this test connection's clock; use MySQL defaults just as dispatch does.
+        await tx.execute(sql`SET SESSION timestamp = ${Math.floor(Date.now() / 1000) + offsetHours * 3600}`);
+        const dueId = newId(), laterId = newId();
+        const job = { agentId, kind: "a2a.message" as const, payload: {} };
+        await tx.insert(connectorJobs).values([
+          { ...job, id: laterId, availableAt: sql`CURRENT_TIMESTAMP(3) + INTERVAL 10 MINUTE` },
+          { ...job, id: dueId },
+        ]);
+        const claimed = await pollConnectorJob(agentId, 0);
+        assert.equal(claimed?.id, dueId, "领取按数据库时钟已到期的任务");
+        assert.equal(claimed.attempts, 1);
+        assert.equal(await pollConnectorJob(agentId, 0), null, "延迟任务不得提前领取");
+        await tx.delete(connectorJobs).where(inArray(connectorJobs.id, [dueId, laterId]));
+      }
+    } finally {
+      await tx.execute(sql`SET SESSION timestamp = DEFAULT`);
+    }
   });
 }
 
@@ -121,6 +146,7 @@ async function main() {
     agents.push(agent);
   }
 
+  await verifyQueueClock(agents[0]!.id);
   const collaboration = await api("/api/collaborations", {
     title: `三项目接口对接 ${Date.now()}`, type: "api-integration", objective: "协商契约、分工、共享测试 Token 并验收",
     projectId: projects[0].id, agentId: agents[0].id,
@@ -238,7 +264,7 @@ async function main() {
 
   console.log(JSON.stringify({
     ok: true, collaborationId, releaseCollaborationId: release.id,
-    checks: ["三方 Agent 协商", "提案一致确认", "凭据加密与一次性领取", "自动验收", "契约变更失效", "通用协作", "A2A", "项目归档、恢复与删除", "组织隔离"],
+    checks: ["数据库时钟偏差下的任务领取", "三方 Agent 协商", "提案一致确认", "凭据加密与一次性领取", "自动验收", "契约变更失效", "通用协作", "A2A", "项目归档、恢复与删除", "组织隔离"],
   }, null, 2));
 }
 

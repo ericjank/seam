@@ -19,6 +19,10 @@ const tabs = [
   ["chat", "对话"], ["proposals", "提案与确认"], ["artifacts", "产物"], ["work", "任务"], ["credentials", "联调凭据"], ["acceptance", "验收"], ["audit", "审计"],
 ] as const;
 
+const jobStatusLabels = {
+  pending: "等待 Connector 领取", running: "Connector 已领取", completed: "已完成", failed: "失败", cancelled: "已取消",
+};
+
 export function CollaborationDetail({ data }: { data: CollaborationData }) {
   const [dispatchNotice, setDispatchNotice] = useState("");
   const [inviteProjectId, setInviteProjectId] = useState("");
@@ -28,10 +32,8 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
   const id = data.collaboration.id;
   useEffect(() => {
     const events = new EventSource(`/api/collaborations/${id}/events`);
-    let initial = true;
     let timer: ReturnType<typeof setTimeout>;
     events.onmessage = () => {
-      if (initial) { initial = false; return; }
       clearTimeout(timer);
       timer = setTimeout(() => router.refresh(), 500);
     };
@@ -86,7 +88,10 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
       {dispatchNotice && <div className="notice">{dispatchNotice}</div>}
       {data.jobs.length > 0 && <details style={{ marginBottom: 16 }}><summary>最近执行记录（{data.jobs.filter((job) => job.status === "failed").length} 项失败）</summary><div className="list">{data.jobs.map((job) => {
         const participant = data.participants.find((row) => row.participant.agentId === job.agentId);
-        return <div className="list-item" key={job.id}><strong>{dispatchRecipient({ projectName: job.projectName ?? participant?.project.name ?? "历史项目", agentName: job.agentName ?? participant?.agent?.name ?? job.agentId })}</strong> · {job.status}<div className="small muted">{job.id} · 第 {job.attempts} 次领取</div>{job.recovery && <details><summary>中断恢复核对 · {job.recovery.state === "interrupted" ? "已中断，需管理员确认" : job.recovery.state === "completed" ? "原回合已完成，复用原回执" : "状态未确认"}</summary><p className="small muted">核对方式：{job.recovery.readOnly ? "只读" : "未确认"} · 原回合 {job.recovery.turnId ?? "未确认"} · 已记录命令 {job.recovery.observedCommandCount} 项{job.recovery.threadId && <> · <a href={`codex://threads/${job.recovery.threadId}`}>打开原 Codex 对话</a></>}</p>{job.recovery.workspaceTreeHash && <p className="small muted">核对时代码指纹：{job.recovery.workspaceTreeHash}</p>}</details>}{job.status === "cancelled" && job.attempts > 0 && <p className="small muted">{job.cancellationAckAt ? "执行端已确认停止" : "等待执行端停止确认"}</p>}{job.error && <p className="message-text">{job.status === "cancelled" ? job.error.replace("，等待执行端停止确认", "") : job.error}</p>}</div>;
+        return <div className="list-item" key={job.id}>
+          <strong>{dispatchRecipient({ projectName: job.projectName ?? participant?.project.name ?? "历史项目", agentName: job.agentName ?? participant?.agent?.name ?? job.agentId })}</strong> · {jobStatusLabels[job.status]}
+          <div className="small muted">{job.id} · 领取次数 {job.attempts}</div>
+          {job.recovery && <details><summary>中断恢复核对 · {job.recovery.state === "interrupted" ? "已中断，需管理员确认" : job.recovery.state === "completed" ? "原回合已完成，复用原回执" : "状态未确认"}</summary><p className="small muted">核对方式：{job.recovery.readOnly ? "只读" : "未确认"} · 原回合 {job.recovery.turnId ?? "未确认"} · 已记录命令 {job.recovery.observedCommandCount} 项{job.recovery.threadId && <> · <a href={`codex://threads/${job.recovery.threadId}`}>打开原 Codex 对话</a></>}</p>{job.recovery.workspaceTreeHash && <p className="small muted">核对时代码指纹：{job.recovery.workspaceTreeHash}</p>}</details>}{job.status === "cancelled" && job.attempts > 0 && <p className="small muted">{job.cancellationAckAt ? "执行端已确认停止" : "等待执行端停止确认"}</p>}{job.error && <p className="message-text">{job.status === "cancelled" ? job.error.replace("，等待执行端停止确认", "") : job.error}</p>}</div>;
       })}</div></details>}
       <div>{data.messages.map((message) => <div className="message" key={message.id}><div className="avatar">{message.authorName.slice(0, 1).toUpperCase()}</div><div className="message-body"><div className="row"><strong>{message.authorName}</strong><span className="badge">{message.kind}</span><span className="small muted">{formatDateTime(message.createdAt)}</span></div><p className="message-text">{message.body}</p></div></div>)}</div>
       {!data.lifecycle && <form className="row" style={{ marginTop: 18 }} onSubmit={async (event) => {

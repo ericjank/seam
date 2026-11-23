@@ -2,10 +2,11 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { and,asc,desc,eq,gt } from "drizzle-orm";
 import { db } from "@/db";
-import { auditEvents, collaborations } from "@/db/schema";
+import { auditEvents, collaborations, connectorJobs } from "@/db/schema";
 import { requireUser } from "@/lib/auth";
 import { requireCollaborationAccess } from "@/lib/access";
 import { handleApiError } from "@/lib/http";
+import { RECENT_JOB_LIMIT } from "@/services/collaborations";
 export async function GET(request:Request,{params}:{params:Promise<{id:string}>}) {
   try {
     const {user}=await requireUser(),{id}=await params;await requireCollaborationAccess(user.id,id);
@@ -22,11 +23,16 @@ export async function GET(request:Request,{params}:{params:Promise<{id:string}>}
             if (stopped || updating) return;
             updating = true;
             try {
-              const [[collaboration], [event]] = await Promise.all([
+              const [[collaboration], [event], jobs] = await Promise.all([
                 db.select({updatedAt:collaborations.updatedAt}).from(collaborations).where(eq(collaborations.id,id)).limit(1),
                 db.select({sequence:auditEvents.sequence}).from(auditEvents).where(eq(auditEvents.collaborationId,id)).orderBy(desc(auditEvents.sequence)).limit(1),
+                db.select({ sequence: connectorJobs.sequence, status: connectorJobs.status, attempts: connectorJobs.attempts })
+                  .from(connectorJobs).where(eq(connectorJobs.collaborationId, id))
+                  .orderBy(desc(connectorJobs.sequence)).limit(RECENT_JOB_LIMIT),
               ]);
-              const current = `${collaboration?.updatedAt.toISOString() ?? ""}:${event?.sequence ?? 0}`;
+              // Claims change the execution records before the Agent publishes a message or audit event.
+              const jobStates = jobs.map(job => `${job.sequence}.${job.status}.${job.attempts}`).join(",");
+              const current = `${collaboration?.updatedAt.toISOString() ?? ""}:${event?.sequence ?? 0}:${jobStates}`;
               if (!stopped && current !== previous) { previous = current; controller.enqueue(encoder.encode(`data: ${current}\n\n`)); }
             } finally { updating = false; }
           };

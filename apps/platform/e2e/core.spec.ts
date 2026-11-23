@@ -125,4 +125,20 @@ test("登录、创建项目与 Agent、发起协作", async ({ page }, testInfo)
   expect(detail.participants.filter((row: any) => row.participant.status === "active")).toHaveLength(2);
   expect(detail.jobs.filter((job: any) => job.status === "pending")).toHaveLength(2);
   expect(detail.lifecycle.phase).toBe("planning");
+
+  await page.getByText("最近执行记录", { exact: false }).click();
+  for (const peer of [agent, targetAgent]) {
+    const job = detail.jobs.find((row: { agentId: string }) => row.agentId === peer.id);
+    const record = page.locator(".list-item").filter({ hasText: job.id });
+    await expect(record).toContainText("等待 Connector 领取");
+    const response = await page.request.post("/api/connectors/poll", {
+      data: { agentId: peer.id, waitMs: 0, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION },
+      headers: { authorization: `Bearer ${peer.token}` },
+    });
+    expect(response.ok()).toBe(true);
+    expect((await response.json()).job?.id).toBe(job.id);
+    // Neither peer has sent a message or a completion receipt. The open page must show the claim.
+    await expect(record).toContainText("Connector 已领取", { timeout: 10_000 });
+    await expect(record).toContainText("领取次数 1");
+  }
 });
