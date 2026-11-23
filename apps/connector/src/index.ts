@@ -1,7 +1,7 @@
 import { verifyExecutionReuse } from "./execution-reuse.js";
 import { createAgentAdapter, describeExecutionPolicy } from "@seam/agent-adapters";
 import { createHash, randomUUID } from "node:crypto";
-import { CONNECTOR_PROTOCOL_VERSION, collaborationContextSchema } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, collaborationContextSchema, testFingerprintLimit, type LifecycleAgentAction } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
 import { ExecutionJournal, type JournalEntry, type ExecutionCheckpoint, type ControlReceipt } from "./journal.js";
 import { withWorkspaceLock, workspaceBaseline } from "./workspace.js";
@@ -15,6 +15,14 @@ import { discoverProject } from "./discovery.js";
 import { collectTestFiles, checkPinnedTests, fingerprintInformation, verifyCachedFact } from "./integrity.js";
 import { connectorBuildInfo } from "./build-info.js";
 import { runIndependentChecks, buildConfiguredIntegrationReport } from "./independent-checks.js";
+
+function fingerprintBlock(revision: number, error: unknown): Extract<LifecycleAgentAction, { type: "workflow.blocked" }> {
+  const detail = error instanceof Error ? error.message : "无法读取测试资料";
+  return {
+    type: "workflow.blocked", revision, kind: "needs_admin", requiresReview: true, category: "code",
+    reason: `测试指纹核验失败：${detail}`.slice(0, 5000), dependencyParticipantIds: [], retryAfterSeconds: 5,
+  };
+}
 
 export async function runConnector(config: ConnectorConfig) {
   const adapter = createAgentAdapter(config.adapter, { codexSandbox: config.codexSandbox, appServerStateDir: config.appServerStateDir, codexNetworkAccess: config.codexNetworkAccess });
@@ -136,6 +144,7 @@ export async function runConnector(config: ConnectorConfig) {
           if (job.kind === "collaboration.turn") {
             const context = collaborationContextSchema.parse(job.payload.context);
             if (context.informationTask) context.localDiscovery = await discoverProject(config.projectRoot);
+            const fingerprintLimit = testFingerprintLimit(context.lifecycle?.protocolVersion ?? 1);
             const planned = context.lifecycle?.contributions.find((item) => item.participantId === context.participant.id)?.baseline;
             const runs: import("@seam/protocol").CommandEvidence[] = [];
             const collect = (record: Parameters<typeof captureCommand>[0], source: import("@seam/protocol").CommandEvidence["source"]) => { const run = captureCommand(record, config.projectRoot, source); if (run) runs.push(run); };
@@ -162,9 +171,14 @@ export async function runConnector(config: ConnectorConfig) {
             }
             let testFiles: Awaited<ReturnType<typeof collectTestFiles>> | undefined;
             if (!context.informationTask && context.lifecycle?.phase === "joint_verifying") {
-              testFiles = await collectTestFiles(config.projectRoot);
-              try { checkPinnedTests(context.lifecycle.reports.find(row => row.participantId === context.participant.id)?.testFiles, testFiles, context); }
-              catch (error) { result = { agentTurn: { message: (error as Error).message, kind: "status", actions: [{ type: "workflow.blocked", revision: context.lifecycle.revision, kind: "needs_admin", requiresReview: true, category: "code", reason: (error as Error).message }] } }; return; }
+              try {
+                testFiles = await collectTestFiles(config.projectRoot, fingerprintLimit);
+                checkPinnedTests(context.lifecycle.reports.find(row => row.participantId === context.participant.id)?.testFiles, testFiles, context);
+              } catch (error) {
+                const block = fingerprintBlock(context.lifecycle.revision, error);
+                result = { agentTurn: { message: block.reason, kind: "status", actions: [block] } };
+                return;
+              }
             }
             const independentResults = await runIndependentChecks(context, config.codexNetworkAccess === true || !["codex", "codex-app-server"].includes(config.adapter), controller.signal);
             if (!context.informationTask && !context.lifecycle?.paused && context.lifecycle?.phase === "joint_verifying" && process.env.SEAM_TEST_COMMAND && !independentResults.some(row => row.status === "not_run")) {
@@ -179,18 +193,22 @@ export async function runConnector(config: ConnectorConfig) {
             const agentTurn = assertOutboundPolicy(automatic ?? await adapter.run(input), config.projectRoot);
             await fingerprintInformation(agentTurn, config.projectRoot);
             for (const action of agentTurn.actions) {
-              if (action.type === "execution.report" || action.type === "integration.report") {
-                const after = await collectTestFiles(config.projectRoot);
-                try {
+              try {
+                if ((action.type === "plan.submit" || action.type === "plan.amend") && before) {
+                  action.baseline = { ...before, testFiles: await collectTestFiles(config.projectRoot, fingerprintLimit) };
+                } else if (action.type === "execution.report" || action.type === "integration.report") {
+                  const after = await collectTestFiles(config.projectRoot, fingerprintLimit);
                   checkPinnedTests(action.type === "integration.report" ? testFiles : planned?.testFiles, after, context, action.type === "execution.report");
                   action.testFiles = after;
                   for (const run of runs) run.testFiles = after;
                   if (action.type === "integration.report") action.independentResults = independentResults;
-                } catch (error) {
-                  agentTurn.message = (error as Error).message;
-                  agentTurn.actions = [{ type: "workflow.blocked", revision: context.lifecycle!.revision, kind: "needs_admin", requiresReview: true, category: "code", reason: (error as Error).message, dependencyParticipantIds: [], retryAfterSeconds: 5 }];
-                  break;
                 }
+              } catch (error) {
+                const block = fingerprintBlock(context.lifecycle!.revision, error);
+                agentTurn.message = block.reason;
+                agentTurn.kind = "status";
+                agentTurn.actions = [block];
+                break;
               }
             }
             attachCommandEvidence(agentTurn, context, runs);
@@ -200,7 +218,6 @@ export async function runConnector(config: ConnectorConfig) {
               agentTurn.actions = [{ type: "workflow.blocked", revision: context.lifecycle.revision, kind: "retryable", reason: error.message, dependencyParticipantIds: [], retryAfterSeconds: 5 }];
               agentTurn.message = error.message;
             }
-            for (const action of agentTurn.actions) if ((action.type === "plan.submit" || action.type === "plan.amend") && before) action.baseline = { ...before, testFiles: await collectTestFiles(config.projectRoot) };
             const conversation = await adapter.getConversation?.(input);
             result = { agentTurn, ...(nativeRecovery?{recovery:{state:nativeRecovery.state,threadId:nativeRecovery.threadId,turnId:nativeRecovery.turnId,reason:nativeRecovery.reason,readOnly:true}}:{}), provenance:{connector:build,platform:(job.payload.provenance as {platform?:unknown}|undefined)?.platform??null,protocolVersion:CONNECTOR_PROTOCOL_VERSION,jobPayloadHash:input.jobPayloadHash}, ...(conversation ? { conversation } : {}), ...(telemetry ? { telemetry } : {}) };
             finished = !agentTurn.needsHumanInput && agentTurn.actions.some((action) => action.type === "execution.report" && action.status === "passed");

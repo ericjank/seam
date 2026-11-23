@@ -1,9 +1,10 @@
 "use client";
-import { expandSharedContract, objectionTargetLabel } from "@seam/protocol";
+import { TEST_FINGERPRINT_PROTOCOL_VERSION, expandSharedContract, objectionTargetLabel } from "@seam/protocol";
 
 import type { CollaborationData, ActionRunner } from "./detail-types";
 import { contractChanges } from "@/lib/contract-diff";
 import { failureOverview } from "@/lib/failure-overview";
+import { needsPlanningRetryApproval } from "@/lib/workflow";
 import { InformationPanel } from "./information-panel";
 
 const phases = [
@@ -22,6 +23,9 @@ export function LifecyclePanel({ data, run, busy }: { data: CollaborationData; r
   const budgetStops = (lifecycle.retryBudget?.stops ?? []).filter(stop => stop.phase === lifecycle.phase);
   const review = lifecycle.blocks.some(block => block.requiresReview);
   const codeReview = lifecycle.blocks.some(block => block.requiresReview && block.category === "code");
+  const validationPhase = lifecycle.phase === "executing" || lifecycle.phase === "joint_verifying";
+  const planningRetries = lifecycle.phase === "planning" ? lifecycle.blocks.filter(block => needsPlanningRetryApproval(block)
+    && !lifecycle.contributions.some(item => item.participantId === block.participantId)) : [];
   const changes = lifecycle.baseline?.contract && lifecycle.contract ? contractChanges(lifecycle.baseline.contract, lifecycle.contract) : [];
   const name = (id: string) => data.participants.find((row) => row.participant.id === id)?.project.name ?? id;
   const outstanding = (lifecycle.planObjections ?? []).filter(item => item.state !== "addressed");
@@ -65,8 +69,15 @@ export function LifecyclePanel({ data, run, busy }: { data: CollaborationData; r
     </section>}
     <div className="notice" aria-label="审阅摘要"><strong>审阅摘要</strong><p>{lifecycle.contract?.scope ?? lifecycle.requirements}</p><p>验收用例 {lifecycle.contract?.acceptanceCases.length ?? 0} · 报告通过 {checks.filter((check) => check.status === "passed").length} · 未通过 {checks.filter((check) => check.status === "failed").length} · 未执行 {checks.filter((check) => check.status === "not_run").length} · 关联命令证据 {checks.filter((check) => check.runIds.length > 0).length}</p>{lifecycle.reports.map((report) => <p key={report.participantId}>{name(report.participantId)} · {report.status}：{report.summary}</p>)}</div>
     {lifecycle.blocks.length > 0 && <div className="notice" aria-label="协作阻塞"><h3>协作阻塞</h3>{lifecycle.blocks.map((block) => <p key={block.participantId}>{name(block.participantId)} · {block.requiresReview ? "等待管理员确认重试" : block.kind === "needs_admin" ? (block.requiresAuthorization ? "需要本机授权" : "查找后仍缺少事实") : block.kind === "gathering_info" ? "自动查找信息中" : block.kind === "waiting_peer" ? "等待对端" : `退避重试 ${block.attempts}/3`}：{block.reason}{block.dependencyParticipantIds.length > 0 && `；等待 ${block.dependencyParticipantIds.map(name).join("、")}`}</p>)}{data.canAdminister && lifecycle.blocks.some((block) => block.kind === "needs_admin" && !block.requiresReview && !block.informationRequestId) && <form className="stack" onSubmit={async (event) => { event.preventDefault(); const form = event.currentTarget; try { await run(path, { action: "resume", resolution: new FormData(form).get("resolution") }); form.reset(); } catch {} }}><label>补充阻塞所缺的事实<textarea name="resolution" required maxLength={5000} placeholder="仅补充事实；修改实施目标请使用补充要求重新起草。" /></label><button className="btn" disabled={busy}>补充事实并继续</button></form>}</div>}
-    {data.canAdminister && !lifecycle.paused && review && !codeReview && !lifecycle.blocks.some(block => block.kind === "gathering_info") && <button className="btn" disabled={busy} onClick={() => void run(path, { action: "retry-validation", revision: lifecycle.revision, documentHash: lifecycle.documentHash }).catch(() => undefined)}>确认处理完成并{lifecycle.phase === "executing" ? "重试实施" : "重新验证"}</button>}
-    {data.canAdminister && !lifecycle.paused && codeReview && <button className="btn" disabled={busy} onClick={() => void run(path, { action: "append", requirements: "依据当前代码或测试指纹差异起草完整修复方案，保留原有效业务目标、所有验收用例及独立检查；现有测试改动逐文件说明理由，经管理员批准后才实施和验证。" }).catch(() => undefined)}>基于指纹差异重新起草修复方案</button>}
+    {data.canAdminister && !lifecycle.paused && planningRetries.length > 0 && <div className="stack">
+      {(lifecycle.protocolVersion ?? 1) < TEST_FINGERPRINT_PROTOCOL_VERSION && <p className="muted">请先更新并重启本协作两端的 Connector，再恢复本轮计划。</p>}
+      {planningRetries.map(block => <button className="btn" key={block.participantId} disabled={busy}
+        onClick={() => void run(path, { action: "retry-planning", revision: lifecycle.revision, participantId: block.participantId }).catch(() => undefined)}>
+        确认处理完成并重试「{name(block.participantId)}」计划
+      </button>)}
+    </div>}
+    {data.canAdminister && !lifecycle.paused && validationPhase && review && !codeReview && !lifecycle.blocks.some(block => block.kind === "gathering_info") && <button className="btn" disabled={busy} onClick={() => void run(path, { action: "retry-validation", revision: lifecycle.revision, documentHash: lifecycle.documentHash }).catch(() => undefined)}>确认处理完成并{lifecycle.phase === "executing" ? "重试实施" : "重新验证"}</button>}
+    {data.canAdminister && !lifecycle.paused && codeReview && (validationPhase || ["awaiting_approval", "awaiting_review"].includes(lifecycle.phase)) && <button className="btn" disabled={busy} onClick={() => void run(path, { action: "append", requirements: "依据当前代码或测试指纹差异起草完整修复方案，保留原有效业务目标、所有验收用例及独立检查；现有测试改动逐文件说明理由，经管理员批准后才实施和验证。" }).catch(() => undefined)}>基于指纹差异重新起草修复方案</button>}
     {!!lifecycle.attemptHistory.length && <details aria-label="失败与重试归档"><summary>原修订失败与人工确认重试记录（{lifecycle.attemptHistory.length}次）</summary>{lifecycle.attemptHistory.map(item => <details key={item.id}><summary>{item.phase} · {item.createdAt}</summary><pre className="message-text">{item.report}</pre></details>)}</details>}
     {!!lifecycle.contract?.effectiveRequirements?.some(requirement=>requirement.verification==="http") && <details aria-label="需求与独立检查覆盖"><summary>需求与独立检查覆盖</summary>{lifecycle.contract.effectiveRequirements.filter(requirement=>requirement.verification==="http").map(requirement=><p key={requirement.id}><strong>{requirement.id} · {requirement.text}</strong>：{expandSharedContract(lifecycle.contract!).acceptanceCases.flatMap(item=>(item.httpChecks??[]).filter(check=>check.requirementIds?.includes(requirement.id)).map(check=>`${name(item.runnerParticipantId)} / ${check.id}`)).join("；")||"未覆盖"}</p>)}</details>}
     {!!independent.length && <details aria-label="独立HTTP验收"><summary>独立HTTP验收（{independent.filter(item => item.status === "passed").length}/{independent.length}通过）</summary>{independent.map(item => <div className="list-item" key={`${item.caseId}:${item.id}`}><strong>{item.caseId} / {item.id} · {item.status}</strong><p>{item.summary}</p><p className="small muted">批准检查指纹：{item.specHash}</p></div>)}</details>}

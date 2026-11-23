@@ -116,6 +116,16 @@ describe("生命周期自动推进的迟到回调隔离", () => {
     expect(dispatch.body).not.toContain("Agent「b」");
   });
 
+  it("规划中的代码阻塞留在本方，已解除阻塞的对端可继续只读提交", async () => {
+    const lifecycle = state.detail.lifecycle;
+    lifecycle.phase = "planning";
+    lifecycle.contributions = [];
+    lifecycle.blocks = [{ participantId: "b", kind: "needs_admin", category: "code", requiresReview: true, retryAt: null }];
+    await advanceAgentWorkflow("job");
+    expect(newJobs()).toHaveLength(1);
+    expect(newJobs()[0]!.values).toMatchObject({ agentId: "agent-a", payload: { lifecycleSnapshot: { revision: 1, phase: "planning", approvedHash: null } } });
+  });
+
   it("管理员追加新版本后，旧版本回调不能抢占新流程预算", async () => {
     state.detail.lifecycle.revision = 2;
     state.detail.lifecycle.phase = "planning";

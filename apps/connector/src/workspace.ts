@@ -19,6 +19,19 @@ export async function withWorkspaceLock<T>(root: string, signal: AbortSignal, ru
   finally { await unlock(); }
 }
 
+export async function listGitWorktreeFiles(root: string): Promise<string[] | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
+      cwd: root, timeout: 15_000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" },
+    });
+    return stdout.split("\0").filter(Boolean);
+  } catch (error) {
+    const gitError = error as NodeJS.ErrnoException & { stderr?: string };
+    if (gitError.code === "ENOENT" || gitError.stderr?.startsWith("fatal: not a git repository (or any of the parent directories): .git")) return null;
+    throw new Error("无法读取 Git 工作区的测试资料清单，请核对本机 Git 和工作区状态", { cause: error });
+  }
+}
+
 export async function workspaceBaseline(root: string): Promise<z.infer<typeof workspaceBaselineSchema> | null> {
   try {
     const { stdout: top } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: root, timeout: 5000 });

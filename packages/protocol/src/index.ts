@@ -157,8 +157,14 @@ export const acceptanceSubmitActionSchema = z.object({
 });
 
 export const PLAN_OBJECTION_PROTOCOL_VERSION = 10;
-export const CONNECTOR_PROTOCOL_VERSION = 10;
+export const TEST_FINGERPRINT_PROTOCOL_VERSION = 11;
+export const CONNECTOR_PROTOCOL_VERSION = TEST_FINGERPRINT_PROTOCOL_VERSION;
+export const MAX_TEST_FINGERPRINT_FILES = 1024;
+export function testFingerprintLimit(protocolVersion: number) {
+  return protocolVersion >= TEST_FINGERPRINT_PROTOCOL_VERSION ? MAX_TEST_FINGERPRINT_FILES : 500;
+}
 export const testFileSchema = z.object({ path: z.string().min(1).max(1000), sha256: z.string().length(64) });
+const testFingerprintsSchema = z.array(testFileSchema).max(MAX_TEST_FINGERPRINT_FILES);
 export const httpCheckSchema = z.object({
   requirementIds: z.array(z.string().min(1).max(100)).min(1).max(200).optional(),
   id: z.string().min(1).max(100), publisherParticipantId: idSchema, serviceName: z.string().min(1).max(100),
@@ -175,7 +181,7 @@ export const retryBudgetStateSchema = z.object({
 });
 export type RetryBudgetState = z.infer<typeof retryBudgetStateSchema>;
 export const workspaceBaselineSchema = z.object({
-  head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(), testFiles: z.array(testFileSchema).max(500).optional(),
+  head: z.string().nullable(), treeHash: z.string(), capturedAt: z.string(), testFiles: testFingerprintsSchema.optional(),
 });
 export const requirementSchema = z.object({ id: z.string().min(1).max(100), text: z.string().min(1).max(10_000), verification: z.enum(["http", "command", "review"]).optional() });
 export const interfaceFieldSchema = z.object({
@@ -260,7 +266,7 @@ export const independentResultSchema = z.object({
 export const commandEvidenceSchema = z.object({
   id: z.string().min(1).max(100), command: z.string().max(10_000), invocation: z.string().max(10_000).optional(), exitCode: z.number().int().nullable(),
   output: z.string().max(100_000), assertions: z.array(z.string().max(2000)).max(500),
-  source: z.enum(["codex-app-server", "local-test"]), capturedAt: z.string(), testFiles: z.array(testFileSchema).max(500).optional(),
+  source: z.enum(["codex-app-server", "local-test"]), capturedAt: z.string(), testFiles: testFingerprintsSchema.optional(),
 });
 export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
 export const informationSourceSchema = z.object({
@@ -372,8 +378,8 @@ export const lifecycleAgentActionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("plan.resolve"), revision: z.number().int().positive(), ...planObjectionTaskSchema.shape,
     change: planObjectionChangeSchema.nullable(), evidence: planObjectionEvidenceSchema.nullable(), summary: z.string().trim().min(1).max(2000) }),
   z.object({ type: z.literal("plan.confirm"), revision: z.number().int().positive(), documentHash: z.string().length(64) }),
-  z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}), runs: z.array(commandEvidenceSchema).max(200).default([]), category: workflowBlockSchema.shape.category, testFiles: z.array(testFileSchema).max(500).optional() }),
-  z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100), runs: z.array(commandEvidenceSchema).max(200).default([]), independentResults: z.array(independentResultSchema).max(500).optional(), testFiles: z.array(testFileSchema).max(500).optional() }),
+  z.object({ type: z.literal("execution.report"), revision: z.number().int().positive(), status: z.enum(["passed", "failed"]), summary: z.string().min(1).max(20_000), evidence: z.record(z.string(), z.unknown()).default({}), runs: z.array(commandEvidenceSchema).max(200).default([]), category: workflowBlockSchema.shape.category, testFiles: testFingerprintsSchema.optional() }),
+  z.object({ type: z.literal("integration.report"), revision: z.number().int().positive(), documentHash: z.string().length(64), checks: z.array(integrationCheckSchema).min(1).max(100), runs: z.array(commandEvidenceSchema).max(200).default([]), independentResults: z.array(independentResultSchema).max(500).optional(), testFiles: testFingerprintsSchema.optional() }),
   z.object({ type: z.literal("workflow.blocked"), revision: z.number().int().positive(), ...workflowBlockSchema.shape }),
   z.object({ type: z.literal("service.publish"), revision: z.number().int().positive(), ...servicePublicationSchema.shape }),
   z.object({ type: z.literal("information.request"), revision: z.number().int().positive(), question: z.string().min(10).max(5000), searched: z.array(informationSourceSchema).min(2).max(20), key: z.string().min(1).max(200).optional(), fresh: z.boolean().optional() }),
@@ -394,7 +400,7 @@ export function lifecycleActions(phase: string, informationOnly = false, objecti
 export const lifecycleContextSchema = z.object({
   reportHash: z.string().length(64).nullable().optional(),
   finalDecision: z.object({ outcome: z.enum(["accepted", "stopped"]), revision: z.number(), reviewedReportHash: z.string().length(64).nullable(), sealedReportHash: z.string().length(64), documentHash: z.string().nullable(), decidedById: idSchema, decidedAt: z.string() }).nullable().optional(),
-  executionReuse: z.array(z.object({ participantId: idSchema, sourceRevision: z.number(), sourceDocumentHash: z.string().length(64), sourceReportHash: z.string().length(64), workspace: workspaceBaselineSchema, testFiles: z.array(testFileSchema) })).optional(),
+  executionReuse: z.array(z.object({ participantId: idSchema, sourceRevision: z.number(), sourceDocumentHash: z.string().length(64), sourceReportHash: z.string().length(64), workspace: workspaceBaselineSchema, testFiles: testFingerprintsSchema })).optional(),
   retryBudget: retryBudgetStateSchema.optional(),
   factBindings: z.array(factBindingSchema).max(200).optional(),
   approvalPending: z.object({ documentHash: z.string(), requestedAt: z.string() }).nullable().optional(),
@@ -412,7 +418,7 @@ export const lifecycleContextSchema = z.object({
   baseline: z.object({ revision: z.number(), documentHash: z.string().nullable(), document: z.string().nullable(), contract: sharedContractSchema.nullable(), report: z.string().nullable(), informationRequests: z.array(informationRequestSchema).optional(), failureDigest: z.array(z.object({ participantId: idSchema, summary: z.string(), checks: z.array(z.object({ caseId:z.string(),status:z.string(),summary:z.string() })), independentResults:z.array(independentResultSchema), runs:z.array(z.object({id:z.string(),command:z.string(),exitCode:z.number().nullable()})) })).optional() }).nullable().optional(),
   contributions: z.array(z.object({ participantId: idSchema, content: z.string(), baseline: workspaceBaselineSchema.nullable().optional(), factRefs: z.array(z.string()).optional() })),
   confirmations: z.array(idSchema),
-  reports: z.array(z.object({ participantId: idSchema, status: z.enum(["passed", "failed"]), summary: z.string(), evidence: z.record(z.string(), z.unknown()), testFiles: z.array(testFileSchema).optional() })),
+  reports: z.array(z.object({ participantId: idSchema, status: z.enum(["passed", "failed"]), summary: z.string(), evidence: z.record(z.string(), z.unknown()), testFiles: testFingerprintsSchema.optional() })),
   integrationReports: z.array(z.object({ participantId: idSchema, checks: z.array(integrationCheckSchema) })).default([]),
   report: z.string().nullable(),
   blocks: z.array(workflowBlockSchema.extend({ participantId: idSchema, phase: z.string(), attempts: z.number(), retryAt: z.string().nullable(), informationRequestId: idSchema.optional() })).default([]),

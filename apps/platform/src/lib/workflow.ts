@@ -1,4 +1,9 @@
-import type { AgentTurnResult } from "@seam/protocol";
+import type { AgentTurnResult, LifecycleContext } from "@seam/protocol";
+
+export function needsPlanningRetryApproval(block: Pick<LifecycleContext["blocks"][number], "kind" | "category" | "requiresReview" | "informationRequestId">) {
+  return block.kind === "needs_admin" && block.category === "code" && block.requiresReview === true
+    && !block.informationRequestId;
+}
 
 export type Workflow = {
   id: string;

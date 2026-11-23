@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentTurnResultSchema, contentHash } from "../src/index";
+import { MAX_TEST_FINGERPRINT_FILES, agentTurnResultSchema, contentHash, lifecycleAgentActionSchema } from "../src/index";
 
 describe("协作协议", () => {
   it("校验结构化 Agent 返回并填充默认值", () => {
@@ -15,6 +15,22 @@ describe("协作协议", () => {
 
   it("生成稳定内容哈希", async () => {
     expect(await contentHash("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  });
+
+  it.each([508, MAX_TEST_FINGERPRINT_FILES, MAX_TEST_FINGERPRINT_FILES + 1])("计划、命令与两类报告统一校验 %s 项指纹", (count) => {
+    const sha256 = "a".repeat(64);
+    const capturedAt = new Date().toISOString();
+    const testFiles = Array.from({ length: count }, (_, index) => ({ path: `tests/${index}.test.ts`, sha256 }));
+    const run = { id: "run", command: "node --test", output: "", exitCode: 0, assertions: [], source: "local-test", capturedAt, testFiles };
+    const actions = [
+      { type: "plan.submit", revision: 1, content: "先核对正式测试入口，再准备协作实施计划。".repeat(8), baseline: { head: null, treeHash: sha256, capturedAt, testFiles } },
+      { type: "execution.report", revision: 1, status: "passed", summary: "测试已执行", testFiles },
+      { type: "execution.report", revision: 1, status: "passed", summary: "测试已执行", runs: [run] },
+      { type: "integration.report", revision: 1, documentHash: sha256, checks: [{ caseId: "joint", status: "not_run", summary: "合成校验夹具", command: "" }], testFiles },
+    ];
+    for (const action of actions) {
+      expect(lifecycleAgentActionSchema.safeParse(action).success).toBe(count <= MAX_TEST_FINGERPRINT_FILES);
+    }
   });
 });
 

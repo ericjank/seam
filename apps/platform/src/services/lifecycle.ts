@@ -4,7 +4,7 @@ import { sealFinalDecision } from "@/lib/final-decision";
 import { expandSharedContract, normalizeSharedContract } from "@seam/protocol";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
-import { CONNECTOR_PROTOCOL_VERSION, PLAN_OBJECTION_PROTOCOL_VERSION, canonicalJson, currentObjectionReviewers, integrationCheckSchema, lifecycleAgentActionSchema, objectionTargetKey, objectionTargetLabel, type LifecycleAgentAction, type LifecycleContext, type InformationRequest, type PlanObjectionTask, type SharedContract } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, PLAN_OBJECTION_PROTOCOL_VERSION, TEST_FINGERPRINT_PROTOCOL_VERSION, canonicalJson, currentObjectionReviewers, integrationCheckSchema, lifecycleAgentActionSchema, objectionTargetKey, objectionTargetLabel, testFingerprintLimit, type LifecycleAgentAction, type LifecycleContext, type InformationRequest, type PlanObjectionTask, type SharedContract } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
 import {
   agents, collaborations, collaborationLifecycles, connectorJobs, lifecycleContributions,
@@ -20,6 +20,7 @@ import { authorizeActor, type Actor } from "./actor";
 import { answerInformationRequest, openInformationRequest, expireInformationRequest, factFromRequest, administratorFact, informationKey, INFORMATION_TIMEOUT_MS } from "@/lib/information";
 import { bindFacts, factsReady, sameBindings } from "@/lib/fact-bindings";
 import { repairFailures, validateRepairContract, validatePinnedTests } from "@/lib/repair";
+import { needsPlanningRetryApproval } from "@/lib/workflow";
 import { administratorObjectionEvidence, applyObjectionChange, failedObjectionAttempt, hasObjectionTarget, objectionEvidence, objectionTargetFingerprint, type PlanObjectionState, type StoredPlanObjection } from "@/lib/plan-objections";
 
 export type LifecyclePhase = LifecycleContext["phase"];
@@ -496,6 +497,13 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     const participantId = await authorizeActor(actor, collaborationId);
     if (!participantId || actor.kind !== "participant" || !control.requiredParticipantIds.includes(participantId)) throw new HttpError(403, "仅本轮指定的项目 Agent 可提交计划、确认或实施报告");
     if (control.pausedAt || inputAction.revision !== control.revision || control.phase === "terminated") throw new HttpError(409, "协作修订已失效或已终止");
+    const fingerprintLimit = testFingerprintLimit(control.protocolVersion ?? 1);
+    const exceedsLimit = (files?: readonly unknown[]) => (files?.length ?? 0) > fingerprintLimit;
+    if (((inputAction.type === "plan.submit" || inputAction.type === "plan.amend") && exceedsLimit(inputAction.baseline?.testFiles))
+      || ((inputAction.type === "execution.report" || inputAction.type === "integration.report")
+        && (exceedsLimit(inputAction.testFiles) || inputAction.runs.some(run => exceedsLimit(run.testFiles))))) {
+      throw new HttpError(422, `当前协作协议最多接收${fingerprintLimit}项测试指纹，请核对双方 Connector 和当前协作协议版本`);
+    }
     const required = await requiredProjects(control);
     const currentAgentId = required.find((row) => row.participant.id === participantId)?.participant.agentId ?? null;
     const revision = await getRevision(control);
@@ -749,6 +757,38 @@ export async function approveLifecycle(userId: string, collaborationId: string, 
     }
     if((control.protocolVersion??1)>=7&&!sameBindings(revision.factBindings??[],bindFacts(refs,control.facts??[])))throw new HttpError(409,"文档引用的事实已变化，不能沿用旧文档批准");
     await commitLifecycleApproval(userId,control,input.documentHash);
+    return (await getLifecycleContext(collaborationId))!;
+  });
+}
+
+export async function retryLifecyclePlanning(userId: string, collaborationId: string, input: { revision: number; participantId: string }) {
+  return locked(collaborationId, async control => {
+    await requireAdministrator(userId, collaborationId);
+    if (!control || control.pausedAt || control.phase !== "planning" || control.revision !== input.revision
+      || !control.requiredParticipantIds.includes(input.participantId)) {
+      throw new HttpError(409, "只能重试当前轮次双方分析阶段的参与方计划");
+    }
+    const row = (await getContributions(control)).find(item => item.participantId === input.participantId);
+    if (!row?.block || row.content || row.block.phase !== "planning" || !needsPlanningRetryApproval(row.block)) {
+      throw new HttpError(409, "该参与方没有等待管理员确认的规划阻塞");
+    }
+
+    const revision = await getRevision(control);
+    const history = revision.attemptHistory ?? [];
+    if (history.length >= 100) throw new HttpError(409, "本轮重试归档已达上限");
+    if ((control.protocolVersion ?? 1) < TEST_FINGERPRINT_PROTOCOL_VERSION) {
+      await requiredProjects(control, true);
+      await db.update(collaborationLifecycles).set({ protocolVersion: TEST_FINGERPRINT_PROTOCOL_VERSION, updatedAt: new Date() })
+        .where(eq(collaborationLifecycles.collaborationId, collaborationId));
+    }
+    await db.update(lifecycleRevisions).set({
+      attemptHistory: [...history, { id: newId(), phase: control.phase, report: row.block.reason, createdAt: new Date().toISOString(), approvedById: userId }],
+      updatedAt: new Date(),
+    }).where(eq(lifecycleRevisions.id, revision.id));
+    await db.update(lifecycleContributions).set({ block: null, updatedAt: new Date() }).where(eq(lifecycleContributions.id, row.id));
+    await audit({ collaborationId, actorType: "user", actorId: userId, action: "lifecycle.planning_retry_approved", metadata: input });
+    await notify(collaborationId, "管理员已确认规划阻塞处理完成，将按原目标重试该参与方的只读计划。");
+    await queueWorkflowWakeup(collaborationId);
     return (await getLifecycleContext(collaborationId))!;
   });
 }

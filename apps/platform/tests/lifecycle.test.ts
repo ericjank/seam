@@ -93,7 +93,7 @@ import {
   recordRetryBudgetStop, grantRetryBudget,
   appendLifecycleRequirements, applyLifecycleAction, approveLifecycle, assertLifecycleJobCurrent,
   getLifecycleContext, getLifecycleSnapshot, pauseLifecycle, startLifecycle, terminateLifecycle,
-  recoverInformationLookups, retryInformationLookup, retryLifecycleValidation, resolveInformation, resolvePausedObjection, recordFailedObjectionTurn,
+  recoverInformationLookups, retryInformationLookup, retryLifecyclePlanning, retryLifecycleValidation, resolveInformation, resolvePausedObjection, recordFailedObjectionTurn,
 } from "../src/services/lifecycle";
 
 const actor = (id: string) => ({ kind: "participant" as const, id });
@@ -154,6 +154,46 @@ beforeEach(() => {
 });
 
 describe("管理员控制的共同开发生命周期", () => {
+  it("管理员可恢复旧协议中受阻的一方计划并保留另一方，收齐后才汇总契约", async () => {
+    const started = await startLifecycle("admin", "collab");
+    const [blocked, ready] = started.requiredParticipantIds as [string, string];
+    state.rows.collaboration_lifecycles![0]!.protocolVersion = CONNECTOR_PROTOCOL_VERSION - 1;
+    await submit(ready);
+    const reason = "测试指纹采集超过旧协议的容量，请升级双方 Connector。";
+    await applyLifecycleAction(actor(blocked), "collab", {
+      type: "workflow.blocked", revision: 1, kind: "needs_admin", category: "code", requiresReview: true, requiresAuthorization: true, reason,
+    });
+    const input = { revision: 1, participantId: blocked };
+    const testFiles = Array.from({ length: 508 }, (_, index) => ({ path: `tests/case-${index}.ts`, sha256: "a".repeat(64) }));
+    const largePlan = {
+      type: "plan.submit" as const, revision: 1, content: plan(blocked),
+      baseline: { head: "abc", treeHash: "def", capturedAt: new Date().toISOString(), testFiles },
+    };
+    await expect(applyLifecycleAction(actor(blocked), "collab", largePlan)).rejects.toMatchObject({ status: 422 });
+    await expect(retryLifecyclePlanning("admin", "collab", { ...input, revision: 2 })).rejects.toMatchObject({ status: 409 });
+    await expect(retryLifecyclePlanning("admin", "collab", { ...input, participantId: ready })).rejects.toMatchObject({ status: 409 });
+    state.role = "member";
+    await expect(retryLifecyclePlanning("member", "collab", input)).rejects.toMatchObject({ status: 403 });
+    state.role = "owner";
+    const peerCapability = state.rows.audit_events!.find(event => event.actorId === `agent-${ready}`)!;
+    peerCapability.metadata.protocolVersion = CONNECTOR_PROTOCOL_VERSION - 1;
+    await expect(retryLifecyclePlanning("admin", "collab", input)).rejects.toMatchObject({ status: 409, message: expect.stringContaining("请先升级并重启Connector") });
+    state.rows.audit_events!.find(event => event.actorId === `agent-${ready}`)!.metadata.protocolVersion = CONNECTOR_PROTOCOL_VERSION;
+    const retried = await retryLifecyclePlanning("admin", "collab", input);
+    expect(retried).toMatchObject({
+      revision: 1, phase: "planning", documentHash: null, approvedHash: null, protocolVersion: CONNECTOR_PROTOCOL_VERSION,
+      contributions: [{ participantId: ready, content: plan(ready) }], blocks: [],
+      attemptHistory: [{ phase: "planning", report: reason, approvedById: "admin" }],
+    });
+    expect(state.rows.workflow_wakeups!.at(-1)).toMatchObject({ collaborationId: "collab", snapshot: { revision: 1, phase: "planning" } });
+    await expect(retryLifecyclePlanning("admin", "collab", input)).rejects.toMatchObject({ status: 409 });
+    await applyLifecycleAction(actor(blocked), "collab", largePlan);
+    const synthesized = (await getLifecycleContext("collab"))!;
+    expect(synthesized).toMatchObject({ revision: 1, phase: "plan_synthesis", approvedHash: null });
+    expect(synthesized.contributions).toHaveLength(2);
+    expect(synthesized.contributions.find(item => item.participantId === blocked)?.baseline?.testFiles).toHaveLength(508);
+  });
+
   it("预算耗尽持久阻塞，只有管理员能为当前epoch授权且不改文档或批准",async()=>{
     await startLifecycle("admin","collab");const a=(await getLifecycleContext("collab"))!.requiredParticipantIds[0]!;
     const stopped={revision:1,phase:"planning",participantId:a,generation:0,used:12,limit:12};

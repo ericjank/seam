@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { agentTurnResultSchema, collaborationContextSchema } from "@seam/protocol";
 import { checkPinnedTests, collectTestFiles, fingerprintInformation, hashProjectFile, verifyCachedFact } from "../src/integrity";
 let root: string;
@@ -26,6 +27,26 @@ describe("实际测试资料与共享事实来源指纹",()=>{
   await writeFile(join(root,"README.md"),"public fact");await writeFile(join(root,".env"),"secret");await symlink(join(root,"README.md"),join(root,"alias.test.mjs"));
   expect(await hashProjectFile(root,".env")).toBeNull();expect(await hashProjectFile(root,"../outside")).toBeNull();expect(await hashProjectFile(root,join(root,"README.md"))).toBeNull();expect(await hashProjectFile(root,"alias.test.mjs")).toBeNull();
   await expect(collectTestFiles(root)).rejects.toThrow("可核对");
+ });
+ it("跳过 Git 忽略的快照，保留受跟踪夹具和未忽略的新测试", async () => {
+   const git = (...args: string[]) => execFileSync("git", args, { cwd: root });
+   git("init", "--quiet");
+   await mkdir(join(root, "reference/tests"), { recursive: true });
+   await mkdir(join(root, "fixtures"));
+   await writeFile(join(root, ".gitignore"), "/reference/\n/fixtures/tracked.json\n");
+   await writeFile(join(root, "fixtures/tracked.json"), "tracked even if ignored now");
+   git("add", "-f", "fixtures/tracked.json");
+   await writeFile(join(root, "new.test.ts"), "untracked but part of the worktree");
+   await symlink("../../new.test.ts", join(root, "reference/tests/cordis.yml"));
+
+   const before = await collectTestFiles(root);
+   expect(before.map(file => file.path)).toEqual(["fixtures/tracked.json", "new.test.ts"]);
+   await rm(join(root, "fixtures/tracked.json"));
+   const after = await collectTestFiles(root);
+   expect(after.map(file => file.path)).toEqual(["new.test.ts"]);
+   expect(() => checkPinnedTests(before, after, { participant: { id: "consumer" } } as any)).toThrow("fixtures/tracked.json");
+   await symlink("new.test.ts", join(root, "in-scope.test.ts"));
+   await expect(collectTestFiles(root)).rejects.toThrow("in-scope.test.ts");
  });
  it("来源哈希由Connector计算；跨修订缓存验证只读复用，文件变化后不能复用旧事实",async()=>{
   await writeFile(join(root,"protocol.json"),'{"version":"v1"}');const id=crypto.randomUUID(),requestId=crypto.randomUUID();

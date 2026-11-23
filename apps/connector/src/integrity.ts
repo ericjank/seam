@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
-import type { AgentTurnResult, CollaborationContext } from "@seam/protocol";
+import { isAbsolute, join, posix, relative, resolve } from "node:path";
+import { MAX_TEST_FINGERPRINT_FILES, type AgentTurnResult, type CollaborationContext } from "@seam/protocol";
+import { listGitWorktreeFiles } from "./workspace.js";
 
 const excluded = new Set(["node_modules", "vendor", "dist", "build", "coverage", "output", "storage"]);
 const privatePath = /(?:^|[\\/])(?:\.\.|\.git|\.env(?:\..*)?|credentials|id_rsa|id_ed25519)(?:$|[\\/])|\.(?:pem|key)$/i;
@@ -16,19 +17,31 @@ export async function hashProjectFile(root: string, path: string) {
   } catch (error) { if (["ENOENT", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return null; throw error; }
 }
 
-export async function collectTestFiles(root: string) {
+export async function collectTestFiles(root: string, maxFiles = MAX_TEST_FINGERPRINT_FILES) {
   const files: Array<{ path: string; sha256: string }> = [];
-  const isTest = (path: string) => /(?:^|\/)(?:tests?|specs?|__tests__|fixtures)\//i.test(path) || /(?:\.(?:test|spec)\.[^/]+|(?:^|\/)test_[^/]+\.py|Test\.(?:php|java))$/i.test(path);
+  const isTest = (path: string) => !privatePath.test(path) && (/(?:^|\/)(?:tests?|specs?|__tests__|fixtures)\//i.test(path) || /(?:\.(?:test|spec)\.[^/]+|(?:^|\/)test_[^/]+\.py|Test\.(?:php|java))$/i.test(path));
+  const gitPaths = await listGitWorktreeFiles(root);
+  const testPaths = gitPaths && new Set(gitPaths.filter(isTest));
+  const testDirectories = new Set<string>();
+  // 只进入包含候选的目录，仍按磁盘上的实际类型核对文件，不穿过目录符号链接。
+  for (const path of testPaths ?? []) {
+    for (let directory = posix.dirname(path); directory !== "." && !testDirectories.has(directory); directory = posix.dirname(directory)) {
+      testDirectories.add(directory);
+    }
+  }
   const walk = async (directory: string, depth: number) => {
     for (const entry of (await readdir(join(root, directory), { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       if (entry.name.startsWith(".") || excluded.has(entry.name)) continue;
       const path = directory ? `${directory}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) { if (depth < 8) await walk(path, depth + 1); continue; }
-      if (!isTest(path) || privatePath.test(path)) continue;
+      if (entry.isDirectory()) {
+        if (depth < 8 && (!testPaths || testDirectories.has(path))) await walk(path, depth + 1);
+        continue;
+      }
+      if (testPaths ? !testPaths.has(path) : !isTest(path)) continue;
       const sha256 = await hashProjectFile(root, path);
       if (!sha256) throw new Error(`测试资料${path}不是可核对的项目内常规文件，不能建立测试指纹`);
       files.push({ path, sha256 });
-      if (files.length > 500) throw new Error("自动测试资料指纹超过500项，请将独立验收资料收敛到项目测试目录");
+      if (files.length > maxFiles) throw new Error(`自动测试资料指纹超过${maxFiles}项，无法提交完整的测试指纹清单`);
     }
   };
   await walk("", 0);

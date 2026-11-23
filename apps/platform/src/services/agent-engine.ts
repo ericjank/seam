@@ -7,7 +7,7 @@ import { HttpError } from "@/lib/http";
 import { normalizeLifecycleOutcome } from "@/lib/lifecycle-outcome";
 import { dispatchMessage, type DispatchTarget } from "@/lib/dispatch-message";
 import { platformBuildInfo } from "@/lib/build-info";
-import { nextWorkflowTargets, type Workflow } from "@/lib/workflow";
+import { needsPlanningRetryApproval, nextWorkflowTargets, type Workflow } from "@/lib/workflow";
 import { requireCollaborationAccess } from "@/lib/access";
 import { getCollaborationDetail } from "./collaborations";
 import { upsertArtifact } from "./artifacts";
@@ -327,7 +327,8 @@ function lifecycleTargets(lifecycle: NonNullable<Awaited<ReturnType<typeof getLi
   if (lifecycle.phase === "plan_synthesis" && lifecycle.documentHash && lifecycle.planObjections?.some(row => row.state !== "addressed")) {
     return lifecycle.requiredParticipantIds.filter(id => planObjectionTaskFor(lifecycle, id));
   }
-  if (lifecycle.blocks?.some((block) => block.kind === "needs_admin")) return [];
+  if (lifecycle.blocks?.some((block) => block.kind === "needs_admin"
+    && !(lifecycle.phase === "planning" && needsPlanningRetryApproval(block)))) return [];
   const objectors = currentObjectionReviewers(lifecycle);
   const eligible = lifecycle.phase === "plan_synthesis" ? [lifecycle.coordinatorParticipantId ?? lifecycle.requiredParticipantIds[0]!] : lifecycle.requiredParticipantIds.filter((id) => lifecycle.phase === "planning"
     ? !lifecycle.contributions.some((entry) => entry.participantId === id)
@@ -337,7 +338,7 @@ function lifecycleTargets(lifecycle: NonNullable<Awaited<ReturnType<typeof getLi
   return eligible.filter((id) => {
     const block = lifecycle.blocks?.find((item) => item.participantId === id);
     if (!block) return true;
-    if (block.kind === "gathering_info") return false;
+    if (block.kind === "gathering_info" || block.kind === "needs_admin") return false;
     if (block.kind === "waiting_peer" && block.dependencyParticipantIds.length) return block.dependencyParticipantIds.every((dependency) => lifecycle.phase === "planning"
       ? lifecycle.contributions.some((item) => item.participantId === dependency)
       : lifecycle.services?.some((item) => item.participantId === dependency && Date.parse(item.expiresAt) > Date.now()));
