@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { agentTurnResultSchema, tokenUsageBreakdownSchema, type AgentTurnResult, type AdapterTelemetry } from "@seam/protocol";
+import { activeThreadWriterMessage, agentTurnResultSchema, threadBusyReceiptSchema, tokenUsageBreakdownSchema, type AgentTurnResult, type AdapterTelemetry, type ThreadBusyReceipt } from "@seam/protocol";
 import { checkCli } from "./cli.js";
 import { buildNativeHandoff, materializeHandoffResources, NATIVE_HANDOFF_VERSION, type HandoffCheckpoint } from "./handoff.js";
 import { parseNativeAgentOutput } from "./response-schema.js";
@@ -25,6 +25,30 @@ type Session = {
 const queues = new Map<string, Promise<void>>();
 const isRecord = (value: unknown): value is RecordValue => value !== null && typeof value === "object" && !Array.isArray(value);
 const authority = (input:AgentRunInput) => createHash("sha256").update(JSON.stringify({jobId:input.context?.jobId,collaborationId:input.context?.collaborationId,participantId:input.context?.participant.id,revision:input.context?.lifecycle?.revision,phase:input.context?.lifecycle?.phase,documentHash:input.context?.lifecycle?.documentHash,approvedHash:input.context?.lifecycle?.approvedHash})).digest("hex");
+
+class AppServerRpcError extends Error {
+  readonly code: number | null;
+  readonly rpcMessage: string;
+
+  constructor(readonly method: string, error: RecordValue) {
+    const code = typeof error.code === "number" && Number.isInteger(error.code) ? error.code : null;
+    const message = typeof error.message === "string" ? error.message : "";
+    // Native diagnostics can contain local paths, credentials, or provider data.
+    const rpcMessage = /\balready has an active writer\b/i.test(message) ? activeThreadWriterMessage
+      : isRecord(error.data) && error.data.type === "modelProviderMismatch" ? "会话的模型提供方与当前配置不一致"
+      : /\b(?:thread not found|no rollout found)\b/i.test(message) ? "找不到原会话"
+      : "请求被拒绝";
+    super(`Codex App Server ${method} 请求失败（错误码 ${code ?? "unknown"}）：${rpcMessage}`);
+    this.code = code;
+    this.rpcMessage = rpcMessage;
+  }
+}
+
+export class CodexThreadBusyError extends Error {
+  constructor(readonly receipt: ThreadBusyReceipt) {
+    super("Codex 会话已有写入者，等待会话释放");
+  }
+}
 
 /** A dedicated stdio connection. It never connects to or restarts the user's app. */
 class AppServerConnection {
@@ -116,7 +140,7 @@ class AppServerConnection {
     if (!pending) return;
     this.pending.delete(value.id);
     clearTimeout(pending.timer);
-    if (isRecord(value.error)) pending.reject(new Error(`Codex App Server ${pending.method} 请求被拒绝（错误码 ${String(value.error.code ?? "unknown")}）`));
+    if (isRecord(value.error)) pending.reject(new AppServerRpcError(pending.method, value.error));
     else if (isRecord(value.result)) pending.resolve(value.result);
     else pending.reject(new Error("Codex App Server 响应缺少结果"));
   }
@@ -232,6 +256,32 @@ class AppServerConnection {
   }
 }
 
+export async function readCodexThreadHistory(projectRoot: string, threadId: string, cursor?: string) {
+  const connection = new AppServerConnection(await realpath(projectRoot));
+  try {
+    await connection.initialize();
+    const { thread } = await connection.request("thread/read", { threadId, includeTurns: false }, 30_000);
+    if (!isRecord(thread) || thread.id !== threadId) throw new Error("无法读取指定的本机 Codex 会话");
+    const page = await connection.request("thread/turns/list", { threadId, limit: 5, itemsView: "full", ...(cursor ? { cursor } : {}) }, 30_000);
+    if (!Array.isArray(page.data)) throw new Error("Codex App Server 未返回历史分页");
+    const turns = page.data.filter(isRecord).map((turn) => ({
+      id: turn.id,
+      status: turn.status,
+      messages: (Array.isArray(turn.items) ? turn.items.filter(isRecord) : []).flatMap((item) => {
+        if (item.type === "agentMessage" && typeof item.text === "string") return [{ role: "assistant", text: item.text }];
+        if (item.type === "userMessage" && Array.isArray(item.content)) {
+          return item.content.filter(isRecord).flatMap((part) => part.type === "text" && typeof part.text === "string" ? [{ role: "user", text: part.text }] : []);
+        }
+        return [];
+      }),
+    }));
+    return {
+      thread: { id: threadId, name: typeof thread.name === "string" ? thread.name : null, status: isRecord(thread.status) ? thread.status.type : null },
+      turns, nextCursor: typeof page.nextCursor === "string" ? page.nextCursor : null,
+    };
+  } finally { await connection.close(); }
+}
+
 async function serialize<T>(key: string, operation: () => Promise<T>): Promise<T> {
   const previous = queues.get(key) ?? Promise.resolve();
   let release!: () => void;
@@ -275,6 +325,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       try{
         let session:Session;try{session=JSON.parse(await readFile(path,"utf8"));}catch{return {state:"unresolved",reason:"原会话映射不可读取"};}
         if(session.projectRoot!==projectRoot||session.collaborationId!==identity.collaborationId||session.participantId!==identity.participantId)return {state:"unresolved",reason:"原会话归属不匹配"};
+        if(input.resumeThreadId && session.threadId!==input.resumeThreadId)return {state:"unresolved",reason:"原 Codex 会话与本地映射不符"};
         const signature=authority(input),saved=session.active;
         if(session.lastJobId===input.context!.jobId&&session.lastAuthority===signature&&session.lastResult){
           if(session.lastTelemetry)input.onTelemetry?.(session.lastTelemetry);
@@ -321,6 +372,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           const value: unknown = JSON.parse(await readFile(path, "utf8"));
           if (!isRecord(value) || value.version !== 1 || typeof value.threadId !== "string" || value.projectRoot !== projectRoot || value.collaborationId !== identity.collaborationId || value.participantId !== identity.participantId) throw new Error("Codex 会话映射无效；不会静默创建新线程或复用其他项目会话");
           session = value as Session;
+          if (input.resumeThreadId && session.threadId !== input.resumeThreadId) throw new Error("原 Codex 会话与本地映射不符");
           if (input.context?.jobId && session.lastJobId === input.context.jobId && session.lastInputHash === inputHash && session.lastResult) {
             const cached = agentTurnResultSchema.parse(session.lastResult);
             if (session.lastTelemetry) input.onTelemetry?.(session.lastTelemetry);
@@ -331,6 +383,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") { await unlock(); throw error; }
         }
       }
+      if (input.resumeThreadId && !session) { await unlock?.(); throw new Error("缺少原 Codex 会话的本地映射"); }
       const connection = new AppServerConnection(projectRoot, session?.threadId);
       let attemptedTurn = false, acceptedTurn = false;
       const save = async () => {
@@ -343,8 +396,17 @@ export class CodexAppServerAdapter implements AgentAdapter {
         await connection.initialize();
         const sandbox = codexSandboxForTurn(input, this.options);
         const base = { cwd: projectRoot, approvalPolicy: "never", sandbox };
-        const response = session
-          ? await connection.request("thread/resume", { threadId: session.threadId, excludeTurns: true, ...base })
+        const resumeThreadId = session?.threadId;
+        const response = resumeThreadId
+          ? await connection.request("thread/resume", { threadId: resumeThreadId, excludeTurns: true, ...base }).catch((error: unknown) => {
+            if (error instanceof AppServerRpcError) {
+              const receipt = threadBusyReceiptSchema.safeParse({
+                type: "thread_busy", threadId: resumeThreadId, method: error.method, code: error.code, message: error.rpcMessage,
+              });
+              if (receipt.success) throw new CodexThreadBusyError(receipt.data);
+            }
+            throw error;
+          })
           : await connection.request("thread/start", { ...base, ephemeral: !identity, serviceName: "seam_connector" });
         if (!isRecord(response.thread) || typeof response.thread.id !== "string") throw new Error("Codex App Server 未返回会话标识");
         if (session && response.thread.id !== session.threadId) throw new Error("Codex 恢复的会话与本地映射不符");

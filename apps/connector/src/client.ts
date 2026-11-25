@@ -1,4 +1,4 @@
-import { CONNECTOR_PROTOCOL_VERSION, connectorJobSchema, type ConnectorJob } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, connectorJobSchema, type ConnectorJob, type ThreadBusyReceipt } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
 
 export interface ConnectorCapabilities {
@@ -24,7 +24,10 @@ export class PlatformClient {
   }
 
   async poll(): Promise<ConnectorJob | null> {
-    const response = await this.request("/api/connectors/poll", { agentId: this.config.agentId, waitMs: 0, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION }, AbortSignal.timeout(15_000));
+    const response = await this.request("/api/connectors/poll", {
+      agentId: this.config.agentId, waitMs: 0, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION,
+      supportsThreadBusy: this.config.adapter === "codex-app-server",
+    }, AbortSignal.timeout(15_000));
     const job = response.job ? connectorJobSchema.parse(response.job) : null;
     if (job) this.attempts.set(job.id, job.attempts);
     return job;
@@ -35,9 +38,10 @@ export class PlatformClient {
     const job = connectorJobSchema.parse(response.job); this.attempts.set(job.id, job.attempts); return job;
   }
 
-  async complete(jobId: string, result: Record<string, unknown> | undefined, error?: string, attempts = this.attempts.get(jobId)) {
+  async complete(jobId: string, result: Record<string, unknown> | undefined, error?: string, attempts = this.attempts.get(jobId), threadBusy?: ThreadBusyReceipt) {
     const response = await this.request("/api/connectors/complete", {
-      agentId: this.config.agentId, jobId, attempts, status: error ? "failed" : "completed", result, error,
+      agentId: this.config.agentId, jobId, attempts,
+      ...(threadBusy ? { status: "waiting_thread", threadBusy } : { status: error ? "failed" : "completed", result, error }),
     }, AbortSignal.timeout(30_000));
     this.attempts.delete(jobId);
     return response;

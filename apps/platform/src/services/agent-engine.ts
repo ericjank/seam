@@ -1,6 +1,6 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
-import { collaborations, connectorJobs, messages, participants } from "@/db/schema";
+import { collaborations, connectorJobs, messages, outstandingConnectorJobStatuses, participants } from "@/db/schema";
 import { agentTurnResultSchema, currentObjectionReviewers, informationTaskFor, lifecycleActions, planObjectionTaskFor, type CollaborationContext, type Participant } from "@seam/protocol";
 import { newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
@@ -25,11 +25,19 @@ export async function dispatchAgentTurns(userId: string, collaborationId: string
     // Repeated clicks and messages join the current run. Polling refreshes its context.
     const active = await db.select().from(connectorJobs).where(and(
       eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"),
-      inArray(connectorJobs.status, ["pending", "running"]),
+      inArray(connectorJobs.status, outstandingConnectorJobStatuses),
     ));
     const detail = await getCollaborationDetail(userId, collaborationId);
     if(detail.lifecycle)return enqueueManaged(detail,active,participantIds,options);
-    if (active.length) return active.map(job=>job.id);
+    const inFlight = active.filter((job) => job.status !== "waiting_thread");
+    if (inFlight.length) return inFlight.map((job) => job.id);
+    if (active.length) {
+      const waitingAgents = new Set(active.map((job) => job.agentId));
+      const targets = detail.participants.filter(({ participant }) => participant.status === "active" && participant.agentId &&
+        !waitingAgents.has(participant.agentId) && (!participantIds || participantIds.includes(participant.id)));
+      if (!targets.length) return active.map((job) => job.id);
+      participantIds = targets.map(({ participant }) => participant.id);
+    }
     const workflow: Workflow = {
       id: newId(), round: 1, maxRounds: Math.max(1, Math.min(collaboration.maxNegotiationRounds, 12)),
       autoAdvance: options.autoAdvance ?? false, inputMessageId: detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id,
@@ -42,7 +50,7 @@ async function enqueueManaged(detail:Awaited<ReturnType<typeof getCollaborationD
   const lifecycle=detail.lifecycle!,collaborationId=detail.collaboration.id;
       if (lifecycle.paused || !["planning", "plan_synthesis", "plan_confirmation", "executing", "joint_verifying"].includes(lifecycle.phase) && !lifecycle.requiredParticipantIds.some(id=>informationTaskFor(lifecycle!,id))) throw new HttpError(409, "当前阶段等待管理员确认，不能继续派发实施");
       const eligible = lifecycleTargets(lifecycle);
-      const busyAgents=new Set(active.filter(job=>["pending","running"].includes(job.status)).map(job=>job.agentId));
+      const busyAgents = new Set(active.map((job) => job.agentId));
       const free=eligible.filter(id=>!busyAgents.has(detail.participants.find(row=>row.participant.id===id)?.participant.agentId??""));
       const history=await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId,collaborationId),eq(connectorJobs.kind,"collaboration.turn"),inArray(connectorJobs.status,["completed","failed"])));
       const eligibleIds=participantIds ? participantIds.filter(id=>free.includes(id)) : free;
@@ -257,7 +265,7 @@ export async function completeAgentTurn(jobId: string, result: unknown) {
 export async function advanceAgentWorkflow(jobId: string) {
   const [job] = await db.select().from(connectorJobs).where(eq(connectorJobs.id, jobId)).limit(1);
   const workflow = (job?.payload as { workflow?: Workflow } | undefined)?.workflow;
-  if (!job?.collaborationId || !workflow) return;
+  if (!job?.collaborationId || !workflow || job.status === "waiting_thread") return;
   return withTransaction(async () => {
     const [collaboration] = await db.select().from(collaborations).where(eq(collaborations.id, job.collaborationId!)).limit(1).for("update");
     if (!collaboration) return;
@@ -274,20 +282,22 @@ export async function advanceAgentWorkflow(jobId: string) {
         await recordFailedObjectionTurn(collaboration.id, snapshot, scope, job.error ?? "责任方未提交此异议的修改或证据");
         detail = await getCollaborationDetail(collaboration.createdById, collaboration.id);
       }
-      await enqueueManaged(detail,allJobs.filter(row=>["pending","running"].includes(row.status)),undefined,{autoAdvance:true});return;
+      await enqueueManaged(detail, allJobs.filter((row) => outstandingConnectorJobStatuses.includes(row.status)), undefined, { autoAdvance: true }); return;
     }
     const runJobs = allJobs.filter((j) => (j.payload as { workflow?: Workflow }).workflow?.id === workflow.id);
     if (runJobs.some((j) => (j.payload as { workflow: Workflow }).workflow.round > workflow.round)) return;
     const batch = runJobs.filter((j) => (j.payload as { workflow: Workflow }).workflow.round === workflow.round);
-    if (batch.some((j) => j.status === "running" || j.status === "pending")) return;
+    if (batch.some((job) => outstandingConnectorJobStatuses.includes(job.status))) return;
     // A newer explicit run supersedes a late callback from an older one.
     if (allJobs.some((j) => j.status === "pending" || j.status === "running")) return;
     if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
     if (detail.messages.some((m) => (m.metadata as Record<string, unknown>).workflowStopped === workflow.id)) return;
     const lastInputId = detail.messages.filter((m) => m.authorType === "user" && (m.metadata as Record<string, unknown>).dispatch !== false).at(-1)?.id;
+    const waitingAgents = new Set(allJobs.filter((row) => row.status === "waiting_thread").map((row) => row.agentId));
     const outcome = nextWorkflowTargets({
       workflow, failed: batch.some((j) => j.status !== "completed"), completed: collaboration.status === "completed",
-      activeParticipantIds: detail.participants.filter((p) => p.participant.status === "active" && p.participant.agentId).map((p) => p.participant.id),
+      activeParticipantIds: detail.participants.filter(({ participant }) => participant.status === "active" && participant.agentId &&
+        !waitingAgents.has(participant.agentId)).map(({ participant }) => participant.id),
       newInstruction: lastInputId !== workflow.inputMessageId,
       turns: batch.flatMap((j) => {
         const parsed = agentTurnResultSchema.safeParse((j.result as { agentTurn?: unknown } | null)?.agentTurn);

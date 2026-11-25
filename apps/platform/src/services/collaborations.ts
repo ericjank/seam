@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
-import { adapterTelemetrySchema } from "@seam/protocol";
+import { adapterTelemetrySchema, threadBusyReceiptSchema } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
 import {
   acceptanceRuns,
@@ -191,6 +191,8 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     const job = jobsById.get(id);
     return job ? [job] : [];
   });
+  const waitingRows = await db.select({ jobId: connectorJobs.id, agentId: connectorJobs.agentId, attempts: connectorJobs.attempts, result: connectorJobs.result })
+    .from(connectorJobs).where(and(eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.status, "waiting_thread")));
   const dispatchJobs = hasLegacyDispatch(messageRows) ? await db.select({
     jobId: connectorJobs.id, agentId: connectorJobs.agentId, createdAt: connectorJobs.createdAt,
     workflowId: sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.workflow.id'))`,
@@ -230,6 +232,10 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     acceptanceRuns: acceptanceRows,
     auditEvents: auditRows,
     availableProjects,
+    threadWaits: waitingRows.flatMap(({ result, ...job }) => {
+      const blocker = threadBusyReceiptSchema.safeParse((result as { threadBusy?: unknown } | null)?.threadBusy);
+      return blocker.success ? [{ ...job, ...blocker.data }] : [];
+    }),
     jobs: recentJobRows.map(({ result, ...job }) => {
       const record = result as { recovery?: unknown; conversation?: { threadId?: unknown; transport?: unknown; title?: unknown; runLabel?: unknown }; telemetry?: unknown;provenance?:{connector?:{sourceId?:string};platform?:{sourceId?:string};protocolVersion?:number} } | null;
       const conversation = record?.conversation, telemetry = adapterTelemetrySchema.safeParse(record?.telemetry);

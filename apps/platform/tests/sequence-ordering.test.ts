@@ -140,7 +140,7 @@ describe("同毫秒事件按数据库序列排序", () => {
     const detail = await getCollaborationDetail("user", "collaboration");
 
     expect(detail.jobs.map((job) => job.id)).toEqual(expectedIds);
-    expect(state.jobReads).toEqual([
+    expect(state.jobReads.filter(({ params }) => !params.includes("waiting_thread"))).toEqual([
       {
         fields: ["id"], where: "`connector_jobs`.`collaboration_id` = ?", params: ["collaboration"],
         order: "`connector_jobs`.`sequence` desc", limit: 20,
@@ -159,7 +159,7 @@ describe("同毫秒事件按数据库序列排序", () => {
     const detail = await getCollaborationDetail("user", "collaboration");
 
     expect(detail.jobs).toEqual([]);
-    expect(state.jobReads).toHaveLength(1);
+    expect(state.jobReads.filter(({ params }) => !params.includes("waiting_thread"))).toHaveLength(1);
     expect(state.jobReads[0]?.fields).toEqual(["id"]);
   });
 

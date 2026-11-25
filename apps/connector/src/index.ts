@@ -1,7 +1,7 @@
 import { verifyExecutionReuse } from "./execution-reuse.js";
-import { createAgentAdapter, describeExecutionPolicy } from "@seam/agent-adapters";
+import { CodexThreadBusyError, createAgentAdapter, describeExecutionPolicy } from "@seam/agent-adapters";
 import { createHash, randomUUID } from "node:crypto";
-import { CONNECTOR_PROTOCOL_VERSION, collaborationContextSchema, testFingerprintLimit, type LifecycleAgentAction } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, collaborationContextSchema, testFingerprintLimit, type LifecycleAgentAction, type ThreadBusyReceipt } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
 import { ExecutionJournal, type JournalEntry, type ExecutionCheckpoint, type ControlReceipt } from "./journal.js";
 import { withWorkspaceLock, workspaceBaseline } from "./workspace.js";
@@ -40,7 +40,7 @@ export async function runConnector(config: ConnectorConfig) {
   };
   const deliver = async (entry: JournalEntry) => {
     try {
-      await client.complete(entry.jobId, entry.result, entry.error, entry.attempts);
+      await client.complete(entry.jobId, entry.result, entry.error, entry.attempts, entry.threadBusy);
       await journal.save({ ...entry, state: "acknowledged" });
     } catch (error) {
       if (error instanceof PlatformError && !error.retryable) await journal.save({ ...entry, state: "rejected", rejection: error.message });
@@ -115,11 +115,13 @@ export async function runConnector(config: ConnectorConfig) {
       const job = recoveredJob ?? await client.poll();
       if (!job) { if (!config.once) await new Promise((resolve) => setTimeout(resolve, config.pollMs)); continue; }
       const controller = new AbortController();
-      const recoveryKey=(await journal.read(job.id))?.recoveryKey??randomUUID();
+      const previous = await journal.read(job.id);
+      const recoveryKey = previous?.threadBusy ? randomUUID() : (previous?.recoveryKey ?? randomUUID());
       active = { id: job.id, attempts: job.attempts, controller, recoveryKey, leaseTimer: setTimeout(() => controller.abort(), 60_000) };
       renewLocalLease(job.leaseUntil ?? new Date(Date.now() + 60_000).toISOString());
       let result: Record<string, unknown> | undefined;
       let executionError: string | undefined;
+      let threadBusy: ThreadBusyReceipt | undefined;
       try {
         const receipt = await client.heartbeat(capabilities, AbortSignal.timeout(15_000), { id: job.id, attempts: job.attempts, recoveryKey });
         if (receipt.jobState?.cancelRequested) controller.abort(new Error("领取轮次已失效或任务已取消"));
@@ -127,10 +129,11 @@ export async function runConnector(config: ConnectorConfig) {
         if (controller.signal.aborted || receipt.jobState?.cancelRequested || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error("任务领取未获当前轮次执行确认，未运行本机Agent");
         renewLocalLease(receipt.jobState.leaseUntil);
         const cached = recovering ? null : await journal.begin(job,recoveryKey);
-        if (cached) { result = cached.result; executionError = cached.error; }
+        if (cached) { result = cached.result; executionError = cached.error; threadBusy = cached.threadBusy; }
         else await withWorkspaceLock(config.projectRoot, controller.signal, async () => {
           const before = await workspaceBaseline(config.projectRoot);
           let checkpoint: ExecutionCheckpoint | undefined;
+          let saved: ExecutionCheckpoint | null = null;
           let finished = false;
           let nativeRecovery: Awaited<ReturnType<NonNullable<typeof adapter.recover>>> | undefined;
           try {
@@ -148,10 +151,11 @@ export async function runConnector(config: ConnectorConfig) {
             const planned = context.lifecycle?.contributions.find((item) => item.participantId === context.participant.id)?.baseline;
             const runs: import("@seam/protocol").CommandEvidence[] = [];
             const collect = (record: Parameters<typeof captureCommand>[0], source: import("@seam/protocol").CommandEvidence["source"]) => { const run = captureCommand(record, config.projectRoot, source); if (run) runs.push(run); };
-            const saved = context.lifecycle?.phase === "executing" ? await journal.checkpoint(context.collaborationId) : null;
+            saved = context.lifecycle?.phase === "executing" ? await journal.checkpoint(context.collaborationId) : null;
+            const resumeThreadId = typeof job.payload.resumeThreadId === "string" ? job.payload.resumeThreadId : undefined;
             const same = (a: typeof before | undefined, b: typeof before | undefined) => Boolean(a && b && a.head === b.head && a.treeHash === b.treeHash);
             if(recovering && adapter.recover){
-              nativeRecovery=await adapter.recover({context,projectRoot:config.projectRoot,signal:controller.signal,onCommand:record=>collect(record,"codex-app-server"),onTelemetry:()=>{}});
+              nativeRecovery=await adapter.recover({context,projectRoot:config.projectRoot,signal:controller.signal,resumeThreadId,onCommand:record=>collect(record,"codex-app-server"),onTelemetry:()=>{}});
               const isImplementation=context.lifecycle?.phase==="executing";
               if(nativeRecovery.state!=="completed" && (isImplementation||context.lifecycle?.phase==="joint_verifying")){
                 if(isImplementation && nativeRecovery.state==="interrupted" && context.lifecycle?.approvedHash && planned && before)checkpoint={revision:context.lifecycle.revision,approvedHash:context.lifecycle.approvedHash,approvedBaseline:planned,current:before,state:"recoverable",jobId:job.id};
@@ -186,10 +190,10 @@ export async function runConnector(config: ConnectorConfig) {
               context.lifecycle.evidenceRuns.push(...runs.map((run) => ({ ...run, participantId: context.participant.id })));
             }
             let telemetry: import("@seam/protocol").AdapterTelemetry | undefined;
-            const input = { context, signal: controller.signal, projectRoot: config.projectRoot, resuming, onCommand: (record: Parameters<typeof captureCommand>[0]) => collect(record, "codex-app-server"),
+            const input = { context, signal: controller.signal, projectRoot: config.projectRoot, resuming, resumeThreadId, onCommand: (record: Parameters<typeof captureCommand>[0]) => collect(record, "codex-app-server"),
               onTelemetry: (record: import("@seam/protocol").AdapterTelemetry) => { telemetry = record; }, jobPayloadHash: createHash("sha256").update(JSON.stringify(job.payload)).digest("hex") };
-            const automatic = nativeRecovery?.result ?? await verifyExecutionReuse(context, config.projectRoot) ?? await verifyCachedFact(context, config.projectRoot)
-              ?? (!context.informationTask && context.lifecycle?.phase === "joint_verifying" ? buildConfiguredIntegrationReport(context, process.env.SEAM_TEST_COMMAND, runs, independentResults) : null);
+            const automatic = nativeRecovery?.result ?? (resumeThreadId ? null : await verifyExecutionReuse(context, config.projectRoot) ?? await verifyCachedFact(context, config.projectRoot)
+              ?? (!context.informationTask && context.lifecycle?.phase === "joint_verifying" ? buildConfiguredIntegrationReport(context, process.env.SEAM_TEST_COMMAND, runs, independentResults) : null));
             const agentTurn = assertOutboundPolicy(automatic ?? await adapter.run(input), config.projectRoot);
             await fingerprintInformation(agentTurn, config.projectRoot);
             for (const action of agentTurn.actions) {
@@ -245,6 +249,12 @@ export async function runConnector(config: ConnectorConfig) {
                 kind: "needs_admin", requiresReview: true, category: "code", reason: "联合验收期间工作区指纹变化；当前命令和独立HTTP结果不能证明最终代码版本，未发布通过结论。", dependencyParticipantIds: [], retryAfterSeconds: 5 }] };
             }
           }
+          } catch (error) {
+            if (error instanceof CodexThreadBusyError && checkpoint && job.collaborationId) {
+              checkpoint = undefined;
+              await journal.saveCheckpoint(job.collaborationId, saved);
+            }
+            throw error;
           } finally {
             if (checkpoint && job.collaborationId) {
               const current = await workspaceBaseline(config.projectRoot);
@@ -253,7 +263,8 @@ export async function runConnector(config: ConnectorConfig) {
           }
         }, config.workspaceLockDir);
       } catch (error) {
-        executionError = error instanceof Error ? error.message : String(error);
+        if (error instanceof CodexThreadBusyError) threadBusy = error.receipt;
+        else executionError = error instanceof Error ? error.message : String(error);
       }
       // A rejected/lost completion is a delivery failure, not a second local
       // execution failure. Never send a contradictory second receipt.
@@ -266,7 +277,7 @@ export async function runConnector(config: ConnectorConfig) {
       }
       active = undefined;
       if(result&&job.kind==="collaboration.turn")result.provenance={connector:build,platform:(job.payload.provenance as {platform?:unknown}|undefined)?.platform??null,protocolVersion:CONNECTOR_PROTOCOL_VERSION,jobPayloadHash:createHash("sha256").update(JSON.stringify(job.payload)).digest("hex")};
-      const receipt: JournalEntry = { jobId: job.id, attempts: job.attempts, recoveryKey, state: "pending", result, error: executionError, updatedAt: new Date().toISOString() };
+      const receipt: JournalEntry = { jobId: job.id, attempts: job.attempts, recoveryKey, state: "pending", result, error: executionError, threadBusy, updatedAt: new Date().toISOString() };
       await journal.save(receipt);
       await deliver(receipt);
     } catch (error) {

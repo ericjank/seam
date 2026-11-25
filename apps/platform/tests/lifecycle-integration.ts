@@ -1,4 +1,4 @@
-import { CONNECTOR_PROTOCOL_VERSION, type PlanObjectionTask } from "@seam/protocol";
+import { activeThreadWriterMessage, CONNECTOR_PROTOCOL_VERSION, type PlanObjectionTask } from "@seam/protocol";
 import { fixtureContract, fixtureRuns } from "./fixtures/shared-contract";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -14,7 +14,7 @@ let cookie = "";
 let memberCookie = "";
 const checks: string[] = [];
 type Local = { projectId: string; agentId: string; token: string };
-type Claimed = { id: string; attempts: number; payload: { context: { participant: { id: string }; lifecycle: { revision: number; documentHash: string }; planObjectionTask?: PlanObjectionTask } } };
+type Claimed = { id: string; attempts: number; payload: { resumeThreadId?: string; context: { participant: { id: string }; lifecycle: { revision: number; documentHash: string }; planObjectionTask?: PlanObjectionTask } } };
 
 async function raw(path: string, body?: unknown, options: { token?: string; session?: string; method?: string } = {}) {
   const response = await fetch(`${base}${path}`, {
@@ -49,8 +49,8 @@ async function register(label: string): Promise<Local> {
   const { agent } = await api("/api/agents", { projectId: project.id, name: `fixture-${label}`, adapter: "mock" });
   return { projectId: project.id, agentId: agent.id, token: agent.token };
 }
-async function claim(local: Local): Promise<Claimed> {
-  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true }, { token: local.token });
+async function claim(local: Local, supportsThreadBusy = false): Promise<Claimed> {
+  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true, supportsThreadBusy }, { token: local.token });
   assert.ok(result.job, "the platform must automatically enqueue the expected turn");
   return result.job;
 }
@@ -133,6 +133,20 @@ async function main() {
   assert.equal(rejected.phase, "plan_synthesis");
   assert.equal(rejected.planObjections.length, 2);
   const scopeA = rejected.planObjections.find((row: { responsibleParticipantId: string }) => row.responsibleParticipantId === a);
+  const heldJob = await claim(second, true);
+  const scopeB = heldJob.payload.context.planObjectionTask;
+  assert.ok(scopeB);
+  const busy = { type: "thread_busy", threadId: randomUUID(), method: "thread/resume", code: -32600, message: activeThreadWriterMessage };
+  const busyReceipt = { agentId: second.agentId, jobId: heldJob.id, attempts: heldJob.attempts, status: "waiting_thread", threadBusy: busy };
+  await expected("/api/connectors/complete", { ...busyReceipt, threadBusy: { ...busy, method: "turn/start" } }, 422, { token: second.token });
+  await api("/api/connectors/complete", busyReceipt, { token: second.token });
+  await api("/api/connectors/complete", busyReceipt, { token: second.token });
+  await api(`${path}/dispatch`, { autoAdvance: true });
+  const blockedOnThread = await detail();
+  assert.equal(blockedOnThread.jobs.find((job: any) => job.id === heldJob.id).status, "waiting_thread");
+  assert.deepEqual(blockedOnThread.threadWaits, [{ jobId: heldJob.id, agentId: second.agentId, attempts: heldJob.attempts, ...busy }]);
+  assert.equal(blockedOnThread.lifecycle.planObjections.find((row: { id: string }) => row.id === scopeB.objectionId).attempts, 0);
+  assert.ok(!blockedOnThread.jobs.some((job: any) => job.agentId === second.agentId && ["pending", "running"].includes(job.status)));
   for (const attempt of [1, 2]) {
     const job = await claim(first);
     assert.deepEqual(job.payload.context.planObjectionTask, { objectionId: scopeA.id, attempt });
@@ -144,7 +158,23 @@ async function main() {
   await api(`${path}/dispatch`, { autoAdvance: true });
   const noDispatch = await api("/api/connectors/poll", { agentId: first.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true }, { token: first.token });
   assert.equal(noDispatch.job, null);
-  const bResolve = await claim(second);
+  const retryBody = { action: "retry-thread", jobId: heldJob.id, attempts: heldJob.attempts };
+  const memberEmail = `lifecycle-negative-${suffix}@seam.test`, memberPassword = `Fixture-${suffix}`;
+  await api("/api/users", { name: "生命周期普通成员", email: memberEmail, password: memberPassword, role: "member" });
+  memberCookie = await login(memberEmail, memberPassword);
+  await expected(`${path}/dispatch`, retryBody, 403, { session: memberCookie });
+  const retries = await Promise.all([raw(`${path}/dispatch`, retryBody), raw(`${path}/dispatch`, retryBody)]);
+  assert.deepEqual(retries.map(({ response }) => response.status).sort(), [202, 409]);
+  assert.deepEqual(retries.find(({ response }) => response.ok)?.data.jobs, [heldJob.id]);
+  const legacyPoll = await api("/api/connectors/poll", { agentId: second.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true }, { token: second.token });
+  assert.equal(legacyPoll.job, null);
+  const bResolve = await claim(second, true);
+  assert.equal(bResolve.id, heldJob.id);
+  assert.equal(bResolve.attempts, heldJob.attempts + 1);
+  assert.equal(bResolve.payload.resumeThreadId, busy.threadId);
+  assert.equal(bResolve.payload.context.lifecycle.revision, 1);
+  assert.deepEqual(bResolve.payload.context.planObjectionTask, scopeB);
+  await expected("/api/connectors/complete", busyReceipt, 409, { token: second.token });
   assert.ok(bResolve.payload.context.planObjectionTask);
   await complete(second, bResolve, { ...bResolve.payload.context.planObjectionTask, type: "plan.resolve", revision: 1, evidence: null,
     summary: "仅在目标用例明确客户端错误传递", change: { kind: "acceptance_case", acceptanceCase: {
@@ -154,9 +184,11 @@ async function main() {
   assert.equal((await detail()).lifecycle.documentHash, beforeEdit.documentHash);
   await lifecycle({ action: "resolve-objection", revision: 1, objectionId: scopeA.id, attempts: 2, evidence: "公开兼容用例记录无效数量返回 HTTP 400，保留既有状态码。" });
   const afterEdit = (await detail()).lifecycle;
+  assert.equal(afterEdit.phase, "plan_confirmation");
   assert.notEqual(afterEdit.documentHash, beforeEdit.documentHash);
   assert.ok(afterEdit.document.includes("客户端将错误传回调用方"));
   assert.equal(afterEdit.planObjections.every((row: { state: string }) => row.state === "addressed"), true);
+  checks.push("会话占用独立等待且不扣异议次数，重复回执与管理员重派并发受保护，升级后的 Connector 按原任务、原修订和原会话续接");
   const staleHash = await claim(first);
   await complete(first, staleHash, { type: "plan.confirm", revision: 1, documentHash: beforeEdit.documentHash }, 409);
   await confirm(second); await confirm(first);
@@ -167,9 +199,6 @@ async function main() {
   await expected(`${path}/lifecycle`, { action: "terminate", revision: 1 }, 409);
   checks.push("两轮无进展仅停派对应字段异议；其他用例异议继续；补证后重新确认；修订后拒绝旧hash");
 
-  const memberEmail = `lifecycle-negative-${suffix}@seam.test`, memberPassword = `Fixture-${suffix}`;
-  await api("/api/users", { name: "生命周期普通成员", email: memberEmail, password: memberPassword, role: "member" });
-  memberCookie = await login(memberEmail, memberPassword);
   for (const body of [{ action: "approve", revision: 1, documentHash: ready.documentHash }, { action: "append", requirements: "越权改要求" }, { action: "pause" }]) await expected(`${path}/lifecycle`, body, 403, { session: memberCookie });
   const next = await lifecycle({ action: "append", requirements: "第二版增量增加折扣，复用已有路径和金额约定" });
   assert.equal(next.lifecycle.revision, 2); assert.equal(next.lifecycle.baseline.documentHash, ready.documentHash);

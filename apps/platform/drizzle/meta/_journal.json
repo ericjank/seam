@@ -99,6 +99,13 @@
       "when": 1795621947027,
       "tag": "0013_connector_jobs_agent_status_sequence",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "5",
+      "when": 1795623477991,
+      "tag": "0014_connector_jobs_waiting_thread",
+      "breakpoints": true
     }
   ]
 }

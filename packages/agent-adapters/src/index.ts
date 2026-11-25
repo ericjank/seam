@@ -55,7 +55,7 @@ export function createAgentAdapter(type: AdapterType, options: AdapterOptions = 
 
 export { buildPrompt, parseAgentOutput } from "./cli.js";
 export { MockAgentAdapter } from "./mock.js";
-export { CodexAppServerAdapter } from "./app-server.js";
+export { CodexAppServerAdapter, CodexThreadBusyError, readCodexThreadHistory } from "./app-server.js";
 export { codexNetworkForTurn, codexSandboxForTurn } from "./policy.js";
 export type { AgentAdapter, AdapterOptions, AdapterType, AgentRunInput, CodexSandbox } from "./types.js";
 

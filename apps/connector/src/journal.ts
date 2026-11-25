@@ -1,13 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ConnectorJob } from "@seam/protocol";
+import type { ConnectorJob, ThreadBusyReceipt } from "@seam/protocol";
 import type { ConnectorConfig } from "./config.js";
 
 export type JournalEntry = {
   jobId: string; attempts: number; state: "running" | "pending" | "acknowledged" | "rejected";
   result?: Record<string, unknown>; error?: string; rejection?: string; updatedAt: string;
+  threadBusy?: ThreadBusyReceipt;
   recoveryKey?: string;
 };
 export type ControlReceipt = { jobId: string; attempts: number; state: "pending" | "acknowledged" | "rejected"; reason?: string };
@@ -48,7 +49,7 @@ export class ExecutionJournal {
   async begin(job: ConnectorJob, recoveryKey?: string) {
     const entry = await this.read(job.id);
     if (entry?.state === "running") throw new Error("此任务上次执行中断，完成状态未知。已阻止自动重复实施，请核对本地修改及日志后继续新任务。");
-    if (entry) return entry;
+    if (entry && !(entry.threadBusy && job.attempts > entry.attempts && job.payload.resumeThreadId === entry.threadBusy.threadId)) return entry;
     await this.save({ jobId: job.id, attempts: job.attempts, state: "running", recoveryKey });
     return null;
   }
@@ -69,5 +70,9 @@ export class ExecutionJournal {
     try { return JSON.parse(await readFile(join(this.directory, `checkpoint-${collaborationId}.json`), "utf8")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
   }
-  async saveCheckpoint(collaborationId: string, value: ExecutionCheckpoint) { await this.write(`checkpoint-${collaborationId}.json`, value); }
+  async saveCheckpoint(collaborationId: string, value: ExecutionCheckpoint | null) {
+    const name = `checkpoint-${collaborationId}.json`;
+    if (value) await this.write(name, value);
+    else await rm(join(this.directory, name), { force: true });
+  }
 }

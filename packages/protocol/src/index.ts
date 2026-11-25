@@ -560,13 +560,31 @@ export const connectorJobSchema = z.object({
 });
 export type ConnectorJob = z.infer<typeof connectorJobSchema>;
 
-export const connectorResultSchema = z.object({
-  jobId: idSchema,
-  attempts: z.number().int().positive().optional(),
-  status: z.enum(["completed", "failed"]),
-  result: z.record(z.string(), z.unknown()).optional(),
-  error: z.string().max(10_000).optional(),
+export const activeThreadWriterMessage = "already has an active writer";
+export const threadBusyReceiptSchema = z.object({
+  type: z.literal("thread_busy"),
+  threadId: idSchema,
+  method: z.literal("thread/resume"),
+  code: z.literal(-32600),
+  message: z.literal(activeThreadWriterMessage),
 });
+export type ThreadBusyReceipt = z.infer<typeof threadBusyReceiptSchema>;
+
+export const connectorResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    jobId: idSchema,
+    attempts: z.number().int().positive().optional(),
+    status: z.enum(["completed", "failed"]),
+    result: z.record(z.string(), z.unknown()).optional(),
+    error: z.string().max(10_000).optional(),
+  }),
+  z.object({
+    jobId: idSchema,
+    attempts: z.number().int().positive(),
+    status: z.literal("waiting_thread"),
+    threadBusy: threadBusyReceiptSchema,
+  }),
+]);
 export type ConnectorResult = z.infer<typeof connectorResultSchema>;
 
 export const apiErrorSchema = z.object({

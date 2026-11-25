@@ -8,7 +8,7 @@ import { CONNECTOR_PROTOCOL_VERSION, PLAN_OBJECTION_PROTOCOL_VERSION, TEST_FINGE
 import { db, withTransaction } from "@/db";
 import {
   agents, collaborations, collaborationLifecycles, connectorJobs, lifecycleContributions,
-  lifecycleRevisions, messages, participants, projects, auditEvents,
+  lifecycleRevisions, messages, outstandingConnectorJobStatuses, participants, projects, auditEvents,
 } from "@/db/schema";
 import { requireCollaborationAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
@@ -59,7 +59,7 @@ async function getContributions(control: Lifecycle) {
 }
 
 async function cancelSupersededReviews(control: Lifecycle, currentAgentId: string | null) {
-  const jobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, ["pending", "running"])));
+  const jobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, outstandingConnectorJobStatuses)));
   for (const job of jobs) {
     const snapshot = (job.payload as { lifecycleSnapshot?: LifecycleSnapshot }).lifecycleSnapshot;
     if (job.agentId === currentAgentId || snapshot?.revision !== control.revision || !["plan_synthesis", "plan_confirmation"].includes(snapshot.phase)) continue;
@@ -263,7 +263,7 @@ async function settleFactGates(control:Lifecycle,currentAgentId:string|null=null
 }
 
 async function cancelInformationJobs(control: Lifecycle, requestId: string, keepAgentId: string | null = null) {
-  const jobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), inArray(connectorJobs.status, ["pending", "running"])));
+  const jobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), inArray(connectorJobs.status, outstandingConnectorJobStatuses)));
   for (const job of jobs) if (job.agentId !== keepAgentId && (job.payload as { context?: { informationTask?: { requestId?: string } } }).context?.informationTask?.requestId === requestId) {
     await db.update(connectorJobs).set({ status: "cancelled", leaseUntil: null, error: "资料查找轮次已变化，旧答复不能续接或发布", updatedAt: new Date() }).where(eq(connectorJobs.id, job.id));
   }
@@ -713,7 +713,7 @@ async function finishReport(control: Lifecycle, revision: Revision, collaboratio
     const requirements = `修复第${control.revision}版已报告的实施或联调未通过项；沿用上版有效业务目标与验收覆盖，先只读分析原始证据，协商完整修复方案并由双方确认。管理员批准新文档后才允许重新实施和运行验证。\n${failures.map(row => `${row.participantId} / ${row.caseId ?? row.stage} / ${row.status}：${row.summary}`).join("\n")}`;
     await db.insert(lifecycleRevisions).values({ id: newId(), collaborationId: control.collaborationId, revision: next, requirements, changeRequest: requirements, repair, createdById: collaboration.createdById });
     await db.update(collaborationLifecycles).set({ revision: next, phase: "planning", documentHash: null, approvedHash: null, approvedById: null, approvedAt: null, protocolVersion: Math.max(control.protocolVersion ?? 1, 9), updatedAt: new Date() }).where(eq(collaborationLifecycles.collaborationId, control.collaborationId));
-    const oldJobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), inArray(connectorJobs.status, ["pending", "running"])));
+    const oldJobs = await db.select().from(connectorJobs).where(and(eq(connectorJobs.collaborationId, control.collaborationId), inArray(connectorJobs.status, outstandingConnectorJobStatuses)));
     for (const job of oldJobs) if (job.agentId !== currentAgentId) await db.update(connectorJobs).set({ status: "cancelled", error: "本轮失败报告已归档，进入只读修复方案起草；新方案未批准不得实施", leaseUntil: null, updatedAt: new Date() }).where(eq(connectorJobs.id, job.id));
     await db.update(collaborations).set({ status: "negotiating", updatedAt: new Date() }).where(eq(collaborations.id, control.collaborationId));
     await audit({ collaborationId: control.collaborationId, actorType: "system", actorId: "seam", action: "lifecycle.repair_drafted", metadata: { revision: next, ...repair } });
@@ -831,7 +831,7 @@ export async function appendLifecycleRequirements(userId: string, collaborationI
     await db.update(collaborationLifecycles).set({ revision, phase: "planning", documentHash: null, approvedHash: null, approvedById: null, approvedAt: null, updatedAt: new Date() })
       .where(eq(collaborationLifecycles.collaborationId, collaborationId));
     await db.update(connectorJobs).set({ status: "cancelled", error: "管理员追加要求，旧修订任务已失效", leaseUntil: null, updatedAt: new Date() }).where(and(
-      eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, ["pending", "running"]),
+      eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, outstandingConnectorJobStatuses),
     ));
     await db.update(collaborations).set({ status: "negotiating", updatedAt: new Date() }).where(eq(collaborations.id, collaborationId));
     await notify(collaborationId, `管理员已追加第 ${revision} 版要求。双方将重新协商完整开发文档，旧版执行授权不适用于新版。`);
@@ -856,7 +856,7 @@ export async function terminateLifecycle(userId: string, collaborationId: string
     await db.update(collaborationLifecycles).set({ phase: "terminated", finalDecision: sealed.decision, terminatedById: userId, terminatedAt: new Date(), updatedAt: new Date() })
       .where(eq(collaborationLifecycles.collaborationId, collaborationId));
     await db.update(connectorJobs).set({ status: "cancelled", error: "管理员已终止协作", leaseUntil: null, updatedAt: new Date() }).where(and(
-      eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, ["pending", "running"]),
+      eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, outstandingConnectorJobStatuses),
     ));
     await db.update(collaborations).set({ status: "completed", updatedAt: new Date() }).where(eq(collaborations.id, collaborationId));
     await notify(collaborationId, abandoningRepair ? `管理员已终止第${control.revision}版未执行的修复草案，原始失败证据已保留。` : `管理员已审阅第 ${control.revision} 版实施报告并手动终止协作。后续自动派发与旧任务回传均停止。`);

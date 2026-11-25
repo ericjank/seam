@@ -21,6 +21,8 @@ export interface AgentRunInput {
   jobPayloadHash?: string;
   /** A locally verified checkpoint from this approved revision, never model supplied. */
   resuming?: boolean;
+  /** A retried task must use the original, locally mapped Codex thread. */
+  resumeThreadId?: string;
   resources?: Array<{ key: string; path: string; hash: string; bytes: number }>;
   resourceStats?: { createdBytes: number; availableBytes: number; files: number; prunedFiles: number };
   onCommand?: (record: { id: string; command: string; exitCode: number | null; output: string }) => void;

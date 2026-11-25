@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { collaborationContextSchema, type CollaborationContext } from "@seam/protocol";
-import { buildPrompt, codexNetworkForTurn, codexSandboxForTurn, createAgentAdapter } from "../src/index";
+import { buildPrompt, codexNetworkForTurn, codexSandboxForTurn, CodexThreadBusyError, createAgentAdapter, readCodexThreadHistory } from "../src/index";
 
 const temporary: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -48,14 +48,20 @@ createInterface({input: process.stdin}).on('line', line => {
  if (msg.method==='initialize') respond({userAgent:'test'});
  if (msg.method==='thread/name/set') respond({});
  if (msg.method==='thread/start') {
-  const id='thread-'+Object.keys(db).length; db[id]={turns:0}; save(); respond({thread:{id,status:{type:'idle'}}});
+  const id=process.env.SEAM_FAKE_THREAD_ID || 'thread-'+Object.keys(db).length; db[id]={turns:0}; save(); respond({thread:{id,status:{type:'idle'}}});
  }
- if (msg.method==='thread/read') respond({thread:{id:msg.params.threadId,status:{type:'idle'},turns:db[msg.params.threadId]?.lastTurn?[db[msg.params.threadId].lastTurn]:[]}});
+ if (msg.method==='thread/read') respond({thread:{id:msg.params.threadId,status:{type:'idle'},turns:msg.params.includeTurns&&db[msg.params.threadId]?.lastTurn?[db[msg.params.threadId].lastTurn]:[]}});
+ if (msg.method==='thread/turns/list') {
+  const turn=db[msg.params.threadId]?.lastTurn;
+  respond({data:turn?[turn]:[],nextCursor:msg.params.cursor?null:'older-history'});
+ }
  if (msg.method==='thread/resume') {
-  if (process.env.SEAM_FAKE_RESUME_FAIL) send({id:msg.id,error:{code:-32600,message:'private diagnostic'}});
+  if (process.env.SEAM_FAKE_RESUME_ERROR) send({id:msg.id,error:JSON.parse(process.env.SEAM_FAKE_RESUME_ERROR)});
+  else if (process.env.SEAM_FAKE_RESUME_FAIL) send({id:msg.id,error:{code:-32600,message:'private diagnostic'}});
   else respond({thread:{id:msg.params.threadId,status:{type:'idle'}}});
  }
  if (msg.method==='turn/start') {
+  if (process.env.SEAM_FAKE_TURN_ERROR) { send({id:msg.id,error:JSON.parse(process.env.SEAM_FAKE_TURN_ERROR)}); return; }
   const threadId=msg.params.threadId; const current=db[threadId]; current.turns++; save();
   const turnId='turn-'+current.turns; current.lastTurn={id:turnId,status:'inProgress',items:[]};save();respond({turn:{id:turnId,status:'inProgress'}});
   if (process.env.SEAM_FAKE_HOLD) return;
@@ -107,6 +113,56 @@ createInterface({input: process.stdin}).on('line', line => {
 }
 
 describe("Codex App Server 持久会话", () => {
+  it("写入者占用在轮次开始前返回脱敏回执，释放后只续接原线程", async () => {
+    const f = await fixture(), value = context(), threadId = crypto.randomUUID();
+    vi.stubEnv("SEAM_FAKE_THREAD_ID", threadId);
+    const first = await f.adapter().run({ projectRoot: f.directory, context: value });
+    expect(JSON.parse(first.message).threadId).toBe(threadId);
+    const next = { ...value, jobId: crypto.randomUUID() };
+    vi.stubEnv("SEAM_FAKE_RESUME_ERROR", JSON.stringify({ code: -32600, message: `thread ${threadId} already has an active writer: /private/secret/session` }));
+    const blocked = await f.adapter().run({ projectRoot: f.directory, context: next }).catch((error: unknown) => error);
+    expect(blocked).toBeInstanceOf(CodexThreadBusyError);
+    expect(blocked).toMatchObject({
+      receipt: { type: "thread_busy", threadId, method: "thread/resume", code: -32600, message: "already has an active writer" },
+    });
+    expect(JSON.stringify(blocked)).not.toContain("/private/secret");
+    expect((await f.calls()).filter((call) => call.method === "turn/start")).toHaveLength(1);
+    vi.stubEnv("SEAM_FAKE_RESUME_ERROR", "");
+    await expect(f.adapter().run({ projectRoot: f.directory, context: next, resumeThreadId: crypto.randomUUID() })).rejects.toThrow("原 Codex 会话与本地映射不符");
+    const resumed = await f.adapter().run({ projectRoot: f.directory, context: next, resumeThreadId: threadId });
+    expect(JSON.parse(resumed.message)).toMatchObject({ threadId, turnNumber: 2 });
+    expect((await f.calls()).filter((call) => call.method === "thread/start")).toHaveLength(1);
+  });
+
+  it.each([
+    { method: "thread/resume", variable: "SEAM_FAKE_RESUME_ERROR", code: -32600, message: "private invalid request" },
+    { method: "thread/resume", variable: "SEAM_FAKE_RESUME_ERROR", code: -32603, message: "already has an active writer" },
+    { method: "turn/start", variable: "SEAM_FAKE_TURN_ERROR", code: -32600, message: "already has an active writer" },
+  ])("$method 的其他 RPC 错误保留方法和错误码", async ({ method, variable, code, message }) => {
+    const f = await fixture(), value = context();
+    vi.stubEnv("SEAM_FAKE_THREAD_ID", crypto.randomUUID());
+    await f.adapter().run({ projectRoot: f.directory, context: value });
+    vi.stubEnv(variable, JSON.stringify({ code, message }));
+    const error = await f.adapter().run({ projectRoot: f.directory, context: { ...value, jobId: crypto.randomUUID() } }).catch((reason: unknown) => reason);
+    expect(error).not.toBeInstanceOf(CodexThreadBusyError);
+    expect(error).toMatchObject({ method, code });
+    expect(String(error)).not.toContain("private invalid request");
+  });
+
+  it("从本机读取两页历史只请求元数据与历史分页", async () => {
+    const f = await fixture(), threadId = crypto.randomUUID();
+    vi.stubEnv("SEAM_FAKE_THREAD_ID", threadId);
+    await f.adapter().run({ projectRoot: f.directory, context: context() });
+    const before = (await f.calls()).length;
+    const first = await readCodexThreadHistory(f.directory, threadId);
+    expect(first).toMatchObject({ thread: { id: threadId }, nextCursor: "older-history", turns: [{ messages: [{ role: "assistant", text: expect.any(String) }] }] });
+    expect((await readCodexThreadHistory(f.directory, threadId, first.nextCursor!)).nextCursor).toBeNull();
+    const reads = (await f.calls()).slice(before).filter((call) => call.method !== "initialize" && call.method !== "initialized");
+    expect(reads.map((call) => call.method)).toEqual(["thread/read", "thread/turns/list", "thread/read", "thread/turns/list"]);
+    expect(reads[0]?.params).toEqual({ threadId, includeTurns: false });
+    expect(reads[3]?.params).toMatchObject({ threadId, limit: 5, cursor: "older-history" });
+  });
+
   it("失败或未上报用量会使累计基线失效，后续轮次不背负未知前序消耗", async () => {
     const f=await fixture(), value=context(), records:any[]=[];
     const run=()=>f.adapter().run({projectRoot:f.directory,context:{...value,jobId:crypto.randomUUID()},onTelemetry:record=>records.push(record)});

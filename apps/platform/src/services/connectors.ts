@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
 import { gt, and, asc, desc, eq, lte, isNull, sql } from "drizzle-orm";
+import { threadBusyReceiptSchema, type ConnectorResult } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
 import { agents, collaborations, connectorJobs, connectorJobsClaimIndex, auditEvents } from "@/db/schema";
 import { hashToken, newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
+import { requireCollaborationAccess } from "@/lib/access";
+import { audit } from "@/lib/audit";
 import { completeAgentTurn, refreshAgentJobContext } from "./agent-engine";
 import { submitAcceptance } from "./acceptance";
 import { drainWorkflowWakeups, queueWorkflowWakeup } from "./workflow-outbox";
+import { assertLifecycleJobCurrent, type LifecycleSnapshot } from "./lifecycle";
 import { z, ZodError } from "zod";
 
 const localTestResultSchema = z.object({
@@ -82,7 +86,7 @@ export async function recoverConnectorJob(agentId:string, jobId:string, attempts
   });
 }
 
-export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false, protocolVersion = 1) {
+export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false, protocolVersion = 1, supportsThreadBusy = false) {
   const informationOnly = (payload: unknown) => Boolean((payload as { context?: { informationTask?: unknown } } | null)?.context?.informationTask);
   if (signal?.aborted) return null;
   await heartbeat(agentId);
@@ -98,7 +102,8 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
       // MySQL sets available_at when the job is enqueued. Use the same clock to decide when it is due.
       .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, sql`CURRENT_TIMESTAMP(3)`),
         sql`COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.lifecycle.protocolVersion')) AS UNSIGNED), 1) <= ${protocolVersion}`,
-        supportsInformationLookup ? undefined : sql`(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask') IS NULL OR JSON_TYPE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask')) = 'NULL')`))
+        supportsInformationLookup ? undefined : sql`(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask') IS NULL OR JSON_TYPE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask')) = 'NULL')`,
+        supportsThreadBusy ? undefined : sql`JSON_EXTRACT(${connectorJobs.payload}, '$.resumeThreadId') IS NULL`))
       .orderBy(asc(connectorJobs.sequence)).limit(1);
     if (candidate) {
       if (signal?.aborted) return null;
@@ -147,14 +152,31 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
   }
 }
 
-export async function completeConnectorJob(agentId: string, input: {
-  jobId: string;
-  status: "completed" | "failed";
-  result?: Record<string, unknown>;
-  error?: string;
-  attempts?: number;
-}) {
-  const receiptHash = createHash("sha256").update(canonical({ status: input.status, result: input.result ?? null, error: input.error ?? null, attempts: input.attempts ?? null })).digest("hex");
+export async function retryThreadJob(userId: string, collaborationId: string, input: { jobId: string; attempts: number }) {
+  return withTransaction(async () => {
+    const { role } = await requireCollaborationAccess(userId, collaborationId, true);
+    if (role !== "owner") throw new HttpError(403, "仅协作管理员可以重派等待会话释放的任务");
+    const [collaboration] = await db.select({ id: collaborations.id }).from(collaborations).where(eq(collaborations.id, collaborationId)).limit(1).for("update");
+    if (!collaboration) throw new HttpError(404, "协作不存在");
+    const [job] = await db.select().from(connectorJobs).where(and(
+      eq(connectorJobs.id, input.jobId), eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"),
+    )).limit(1).for("update");
+    if (job?.status !== "waiting_thread" || job.attempts !== input.attempts) throw new HttpError(409, "等待会话释放的任务已变化，请刷新协作");
+    const blocker = threadBusyReceiptSchema.parse((job.result as { threadBusy?: unknown } | null)?.threadBusy);
+    const payload = await refreshAgentJobContext(job) as Record<string, unknown>;
+    await db.update(connectorJobs).set({
+      status: "pending", payload: { ...payload, resumeThreadId: blocker.threadId },
+      receiptHash: null, result: null, leaseUntil: null, availableAt: sql`CURRENT_TIMESTAMP(3)`, updatedAt: new Date(),
+    }).where(eq(connectorJobs.id, job.id));
+    await audit({ collaborationId, actorType: "user", actorId: userId, action: "connector.thread_retry", metadata: { jobId: job.id, attempts: job.attempts, threadId: blocker.threadId } });
+    return job.id;
+  });
+}
+
+export async function completeConnectorJob(agentId: string, input: ConnectorResult) {
+  const receiptHash = createHash("sha256").update(canonical(input.status === "waiting_thread"
+    ? { status: input.status, threadBusy: input.threadBusy, attempts: input.attempts }
+    : { status: input.status, result: input.result ?? null, error: input.error ?? null, attempts: input.attempts ?? null })).digest("hex");
   let actionError: unknown;
   let advance = false;
   const [candidate] = await db.select().from(connectorJobs)
@@ -167,6 +189,7 @@ export async function completeConnectorJob(agentId: string, input: {
       .where(eq(collaborations.id, candidate.collaborationId)).limit(1).for("update");
     const [job] = await db.select().from(connectorJobs)
       .where(and(eq(connectorJobs.id, input.jobId), eq(connectorJobs.agentId, agentId))).limit(1).for("update");
+    if (job?.status === "waiting_thread" && job.receiptHash === receiptHash) return;
     if (job && ["completed", "failed"].includes(job.status) && job.receiptHash === receiptHash) {
       if (job.status === "failed" && input.status === "completed") throw new HttpError(422, job.error ?? "动作已拒绝");
       advance = job.kind === "collaboration.turn";
@@ -177,6 +200,19 @@ export async function completeConnectorJob(agentId: string, input: {
     }
     if (input.attempts !== undefined ? input.attempts !== job.attempts : job.attempts > 1) {
       throw new HttpError(409, "任务已重新领取，请使用当前领取轮次回传结果");
+    }
+    if (input.status === "waiting_thread") {
+      if (job.kind !== "collaboration.turn" || !job.collaborationId) throw new HttpError(422, "仅协作任务可等待会话释放");
+      const payload = job.payload as { lifecycleSnapshot?: LifecycleSnapshot; resumeThreadId?: string };
+      if (payload.resumeThreadId && input.threadBusy.threadId !== payload.resumeThreadId) throw new HttpError(422, "会话标识与原重派任务不符");
+      await assertLifecycleJobCurrent(job.collaborationId, payload.lifecycleSnapshot);
+      await db.update(connectorJobs).set({
+        status: "waiting_thread", receiptHash, result: { threadBusy: input.threadBusy }, error: null,
+        leaseUntil: null, recoveryKeyHash: null, updatedAt: new Date(),
+      }).where(eq(connectorJobs.id, job.id));
+      await audit({ collaborationId: job.collaborationId, actorType: "connector", actorId: agentId, action: "connector.thread_busy",
+        metadata: { jobId: job.id, attempts: job.attempts, ...input.threadBusy } });
+      return;
     }
     if (input.status === "failed") {
       await db.update(connectorJobs).set({

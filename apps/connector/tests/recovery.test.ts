@@ -7,14 +7,65 @@ import { runConnector } from "../src/index";
 import { readConfig } from "../src/config";
 import { ExecutionJournal } from "../src/journal";
 import { withWorkspaceLock, workspaceBaseline } from "../src/workspace";
-import { MockAgentAdapter } from "@seam/agent-adapters";
-import { collaborationContextSchema } from "@seam/protocol";
+import { CodexAppServerAdapter, CodexThreadBusyError, MockAgentAdapter } from "@seam/agent-adapters";
+import { activeThreadWriterMessage, collaborationContextSchema, type ConnectorJob, type ThreadBusyReceipt } from "@seam/protocol";
 
 let root: string;
 beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "seam-recovery-")); });
 afterEach(async () => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); await rm(root, { recursive: true, force: true }); });
 
 describe("本地执行与网络故障恢复", () => {
+  it("持久重发会话占用回执，中心重派更高领取轮次后续接原线程", async () => {
+    const config = readConfig(["--once", "--adapter", "codex-app-server"], {
+      SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "test-only", SEAM_PROJECT_ROOT: root,
+    });
+    config.stateDir = join(root, "state");
+    config.workspaceLockDir = join(root, "locks");
+    config.appServerStateDir = join(root, "threads");
+    const jobId = crypto.randomUUID(), collaborationId = crypto.randomUUID(), threadId = crypto.randomUUID();
+    const context = collaborationContextSchema.parse({
+      jobId, collaborationId, title: "等待会话", type: "custom", status: "negotiating", objective: "续接原协作",
+      participant: { id: crypto.randomUUID(), projectId: crypto.randomUUID(), projectName: "原项目", agentId: config.agentId, agentName: "fixture", role: "consumer", approvalRequired: true, status: "active" },
+      participants: [], messages: [], artifacts: [], workItems: [],
+    });
+    const original: ConnectorJob = { id: jobId, agentId: config.agentId, collaborationId, kind: "collaboration.turn", attempts: 1, payload: { context } };
+    const threadBusy: ThreadBusyReceipt = { type: "thread_busy", threadId, method: "thread/resume", code: -32600, message: activeThreadWriterMessage };
+    let nextJob: ConnectorJob | null = original;
+    const receipts: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, options: { body: string }) => {
+      const body = JSON.parse(options.body);
+      if (url.endsWith("/poll")) {
+        expect(body.supportsThreadBusy).toBe(true);
+        const job = nextJob;
+        nextJob = null;
+        return Response.json({ job });
+      }
+      if (url.endsWith("/complete")) {
+        receipts.push(body);
+        if (receipts.length === 1) throw new Error("receipt ACK lost");
+      }
+      if (body.activeJob) return Response.json({ jobState: { cancelRequested: false, leaseUntil: new Date(Date.now() + 1_200_000).toISOString() } });
+      return Response.json({ ok: true });
+    }));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(CodexAppServerAdapter.prototype, "healthCheck").mockResolvedValue({ ok: true, detail: "fixture" });
+    const run = vi.spyOn(CodexAppServerAdapter.prototype, "run").mockRejectedValueOnce(new CodexThreadBusyError(threadBusy))
+      .mockResolvedValueOnce({ message: "原线程续接", kind: "status", actions: [], notifyParticipantIds: [], needsHumanInput: false });
+    const journal = new ExecutionJournal(config);
+    await runConnector(config);
+    expect(await journal.pending()).toMatchObject([{ threadBusy, jobId, attempts: 1 }]);
+    await runConnector(config);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(receipts[0]).toMatchObject({ status: "waiting_thread", threadBusy, jobId, attempts: 1 });
+    expect(receipts[1]).toEqual(receipts[0]);
+    nextJob = { ...original, attempts: 2, payload: { context, resumeThreadId: threadId } };
+    await runConnector(config);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1]?.[0].resumeThreadId).toBe(threadId);
+    expect(receipts[2]).toMatchObject({ status: "completed", jobId, attempts: 2 });
+  });
+
   it("服务端保存完成但 ACK 丢失，Connector 重启后只重发回执，不重复执行命令", async () => {
     await writeFile(join(root, "test.mjs"), 'import { appendFileSync } from "node:fs"; appendFileSync("runs.txt", "executed\\n");');
     vi.stubEnv("SEAM_TEST_COMMAND", "node test.mjs");

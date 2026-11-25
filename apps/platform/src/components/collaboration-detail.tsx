@@ -21,7 +21,16 @@ const tabs = [
 
 const jobStatusLabels = {
   pending: "等待 Connector 领取", running: "Connector 已领取", completed: "已完成", failed: "失败", cancelled: "已取消",
+  waiting_thread: "等待 Codex 会话释放",
 };
+
+function ReadOnlyThread({ threadId }: { threadId: string }) {
+  return <details className="small">
+    <summary>只读查看会话</summary>
+    <p>在会话所在设备的 Seam 目录运行。使用 <code>--cursor</code> 传入返回的 <code>nextCursor</code> 可查看更早一页。</p>
+    <input readOnly aria-label="只读查看命令" value={`node apps/connector/dist/cli.js --read-thread ${threadId}`} onFocus={(event) => event.currentTarget.select()} />
+  </details>;
+}
 
 export function CollaborationDetail({ data }: { data: CollaborationData }) {
   const [dispatchNotice, setDispatchNotice] = useState("");
@@ -48,9 +57,28 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
     <div className="page-header"><div><div className="row"><span className="badge badge-blue">{data.collaboration.type}</span><span className="badge">{data.collaboration.status}</span></div><h1 style={{ marginTop: 12 }}>{data.collaboration.title}</h1><p className="muted">{data.collaboration.objective}</p></div>{(!data.lifecycle || ["planning", "plan_confirmation", "executing"].includes(data.lifecycle.phase)) && <button className="btn btn-secondary" disabled={busy} onClick={() => void run(`/api/collaborations/${id}/dispatch`, { autoAdvance: true }).catch(() => undefined)}>{data.lifecycle ? "重试自动流程" : "继续推进"}</button>}</div>
     {error && <div className="notice error">{error}</div>}
     <LifecyclePanel data={data} run={run} busy={busy} />
+    {data.threadWaits.length > 0 && <section className="card" aria-label="等待 Codex 会话释放">
+      <h2>等待 Codex 会话释放</h2>
+      {data.threadWaits.map((wait) => {
+        const owner = data.participants.find(({ participant }) => participant.agentId === wait.agentId);
+        return <div className="list-item" key={wait.jobId}>
+          <strong>责任方 {owner?.project.name ?? "原项目"} · {owner?.agent?.name ?? wait.agentId}</strong>
+          <p>原会话已有写入者，任务尚未开始。</p>
+          <p>请由持有方在原设备退出该会话，等到 <code>thread/closed</code> 或用 <code>lsof</code> 确认写锁释放。</p>
+          <ReadOnlyThread threadId={wait.threadId} />
+          {data.canAdminister && <button className="btn btn-secondary btn-small" disabled={busy || data.lifecycle?.paused}
+            onClick={() => void run(`/api/collaborations/${id}/dispatch`, { action: "retry-thread", jobId: wait.jobId, attempts: wait.attempts }).catch(() => undefined)}>
+            确认已释放并重派原任务
+          </button>}
+        </div>;
+      })}
+    </section>}
     {(conversations.length > 0 || telemetry.length > 0) && <details className="card" aria-label="本机AI对话与用量"><summary>本机 AI 对话与用量 · {conversations.length} 个会话</summary>
       <p className="small muted">根据最近 {data.jobs.length} 条执行记录汇总；其中 {data.jobs.length - telemetry.length} 条未取得原生用量记录（可能未执行、非原生端或中断），不计为零成本。同一会话可包含多个修订，批次用于区分独立测试。字节量不等同于模型 token 或费用；未上报用量显示为未知。</p>
-      {conversations.map((job) => <p key={job.conversation!.threadId}><a href={`codex://threads/${job.conversation!.threadId}`}>{job.conversation!.title}</a> · {job.conversation!.runLabel || "正式任务"} · 最近任务 {job.status}</p>)}
+      {conversations.map((job) => <div key={job.conversation!.threadId}>
+        <p>{job.conversation!.title} · {job.conversation!.runLabel || "正式任务"} · {jobStatusLabels[job.status]}</p>
+        <ReadOnlyThread threadId={job.conversation!.threadId} />
+      </div>)}
       {telemetry.map((item) => <details key={item.turnId}><summary>第 {item.revision} 版 · {item.phase} · 输入正文 {item.promptBytes} 字节 · token {item.tokenUsage?.turnDelta?.totalTokens ?? "未知"}</summary>
         <p>输出协议 {item.schemaBytes} 字节；命令输出 {item.commandOutputBytes} 字节；含资源读取的命令 {item.resourceReadCommands} 次、输出 {item.resourceCommandOutputBytes} 字节；上下文压缩 {item.contextCompacted ? "发生" : "未观察到"}。</p>
         <p>本轮新增缓存 {item.resourceStats.createdBytes} 字节；当前资源 {item.resourceStats.files} 份、{item.resourceStats.availableBytes} 字节；清理过期资源 {item.resourceStats.prunedFiles} 份。</p>
@@ -65,7 +93,10 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
           const capability = data.connectorCapabilities.find((item) => item.agentId === row.participant.agentId);
           return <div className="small muted">{capability ? `本机执行能力：${capability.adapter} · ${capability.executionMode === "workspace-write" ? "项目内可写" : capability.executionMode === "read-only" ? "只读，实施前需本机配置写入" : "权限由本地工具管理"} · ${capability.testConfigured ? "已配置本地测试" : "未配置本地测试命令"} · ${(capability.protocolVersion ?? 1) >= CONNECTOR_PROTOCOL_VERSION && capability.supportsInformationLookup ? `协议v${capability.protocolVersion}，支持自动资料查找与验收指纹` : `需升级并重启Connector至协议v${CONNECTOR_PROTOCOL_VERSION}；在线状态不能代替能力`}` : "尚未上报执行能力，请在本机运行 Connector --doctor 并更新 Connector"}</div>;
         })()}
-        {data.jobs.find((job) => job.agentId === row.participant.agentId && job.conversation)?.conversation && <a className="btn btn-secondary btn-small" href={`codex://threads/${data.jobs.find((job) => job.agentId === row.participant.agentId && job.conversation)!.conversation!.threadId}`}>打开本机 Codex 对话</a>}
+        {(() => {
+          const conversation = data.jobs.find((job) => job.agentId === row.participant.agentId && job.conversation)?.conversation;
+          return conversation && <ReadOnlyThread threadId={conversation.threadId} />;
+        })()}
         <details className="small muted"><summary>参与方标识</summary>{row.participant.id}</details>
         {row.participant.status === "invited" && <button className="btn btn-secondary btn-small" style={{ marginTop: 10 }} onClick={() => void run(`/api/participants/${row.participant.id}/accept`, {}).catch(() => undefined)}>代表该项目接受邀请</button>}
       </div>)}</div>
@@ -91,7 +122,15 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
         return <div className="list-item" key={job.id}>
           <strong>{dispatchRecipient({ projectName: job.projectName ?? participant?.project.name ?? "历史项目", agentName: job.agentName ?? participant?.agent?.name ?? job.agentId })}</strong> · {jobStatusLabels[job.status]}
           <div className="small muted">{job.id} · 领取次数 {job.attempts}</div>
-          {job.recovery && <details><summary>中断恢复核对 · {job.recovery.state === "interrupted" ? "已中断，需管理员确认" : job.recovery.state === "completed" ? "原回合已完成，复用原回执" : "状态未确认"}</summary><p className="small muted">核对方式：{job.recovery.readOnly ? "只读" : "未确认"} · 原回合 {job.recovery.turnId ?? "未确认"} · 已记录命令 {job.recovery.observedCommandCount} 项{job.recovery.threadId && <> · <a href={`codex://threads/${job.recovery.threadId}`}>打开原 Codex 对话</a></>}</p>{job.recovery.workspaceTreeHash && <p className="small muted">核对时代码指纹：{job.recovery.workspaceTreeHash}</p>}</details>}{job.status === "cancelled" && job.attempts > 0 && <p className="small muted">{job.cancellationAckAt ? "执行端已确认停止" : "等待执行端停止确认"}</p>}{job.error && <p className="message-text">{job.status === "cancelled" ? job.error.replace("，等待执行端停止确认", "") : job.error}</p>}</div>;
+          {job.recovery && <details>
+            <summary>中断恢复核对 · {job.recovery.state === "interrupted" ? "已中断，需管理员确认" : job.recovery.state === "completed" ? "原回合已完成，复用原回执" : "状态未确认"}</summary>
+            <p className="small muted">核对方式：{job.recovery.readOnly ? "只读" : "未确认"} · 原回合 {job.recovery.turnId ?? "未确认"} · 已记录命令 {job.recovery.observedCommandCount} 项</p>
+            {job.recovery.threadId && <ReadOnlyThread threadId={job.recovery.threadId} />}
+            {job.recovery.workspaceTreeHash && <p className="small muted">核对时代码指纹：{job.recovery.workspaceTreeHash}</p>}
+          </details>}
+          {job.status === "cancelled" && job.attempts > 0 && <p className="small muted">{job.cancellationAckAt ? "执行端已确认停止" : "等待执行端停止确认"}</p>}
+          {job.error && <p className="message-text">{job.status === "cancelled" ? job.error.replace("，等待执行端停止确认", "") : job.error}</p>}
+        </div>;
       })}</div></details>}
       <div>{data.messages.map((message) => <div className="message" key={message.id}><div className="avatar">{message.authorName.slice(0, 1).toUpperCase()}</div><div className="message-body"><div className="row"><strong>{message.authorName}</strong><span className="badge">{message.kind}</span><span className="small muted">{formatDateTime(message.createdAt)}</span></div><p className="message-text">{message.body}</p></div></div>)}</div>
       {!data.lifecycle && <form className="row" style={{ marginTop: 18 }} onSubmit={async (event) => {

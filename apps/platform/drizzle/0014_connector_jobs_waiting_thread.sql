@@ -1,0 +1,1 @@
+ALTER TABLE `connector_jobs` MODIFY COLUMN `status` enum('pending','running','completed','failed','cancelled','waiting_thread') NOT NULL DEFAULT 'pending';

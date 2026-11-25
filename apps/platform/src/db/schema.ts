@@ -204,7 +204,7 @@ export const connectorJobs = mysqlTable("connector_jobs", {
   collaborationId: varchar("collaboration_id", { length: 36 }).references(() => collaborations.id, { onDelete: "cascade" }),
   kind: mysqlEnum("kind", ["collaboration.turn", "a2a.message", "local.test"]).notNull(),
   payload: json("payload").notNull(),
-  status: mysqlEnum("status", ["pending", "running", "completed", "failed", "cancelled"]).notNull().default("pending"),
+  status: mysqlEnum("status", ["pending", "running", "completed", "failed", "cancelled", "waiting_thread"]).notNull().default("pending"),
   result: json("result"),
   error: text("error"),
   attempts: int("attempts").notNull().default(0),
@@ -219,6 +219,8 @@ export const connectorJobs = mysqlTable("connector_jobs", {
   index(connectorJobsClaimIndex).on(table.agentId, table.status, table.sequence),
   index("connector_jobs_collaboration_sequence_idx").on(table.collaborationId, table.sequence),
 ]);
+
+export const outstandingConnectorJobStatuses: Array<typeof connectorJobs.$inferSelect.status> = ["pending", "running", "waiting_thread"];
 
 export const auditEvents = mysqlTable("audit_events", {
   id: id().primaryKey(),

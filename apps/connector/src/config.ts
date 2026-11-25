@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { AdapterType, CodexSandbox } from "@seam/agent-adapters";
+import { z } from "zod";
 
 export interface ConnectorConfig {
   platformUrl: string;
@@ -11,6 +12,8 @@ export interface ConnectorConfig {
   pollMs: number;
   codexSandbox?: CodexSandbox;
   doctor?: boolean;
+  readThread?: string;
+  historyCursor?: string;
   appServerStateDir?: string;
   codexNetworkAccess?: boolean;
   stateDir?: string;
@@ -20,7 +23,7 @@ export interface ConnectorConfig {
 export function readConfig(args: string[], env = process.env): ConnectorConfig {
   const flags = new Map<string, string>();
   const booleanFlags = new Set(["once", "doctor", "help"]);
-  const valueFlags = new Set(["platform", "agent-id", "token", "project-root", "adapter", "codex-sandbox", "app-server-state-dir", "codex-network-access", "connector-state-dir", "workspace-lock-dir"]);
+  const valueFlags = new Set(["platform", "agent-id", "token", "project-root", "adapter", "codex-sandbox", "app-server-state-dir", "codex-network-access", "connector-state-dir", "workspace-lock-dir", "read-thread", "cursor"]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg?.startsWith("--")) throw new Error(`无法识别的参数 ${arg}`);
@@ -33,9 +36,13 @@ export function readConfig(args: string[], env = process.env): ConnectorConfig {
     index += 1;
   }
   const doctor = args.includes("--doctor");
+  const readThread = flags.get("read-thread");
+  const historyCursor = flags.get("cursor");
+  if (readThread && !z.string().uuid().safeParse(readThread).success) throw new Error("--read-thread 需要有效的 Codex 会话标识");
+  if (historyCursor && !readThread) throw new Error("--cursor 仅用于 --read-thread 历史分页");
   const required = (name: string, flag: string) => {
     const value = flags.get(flag) ?? env[name];
-    if (!value && !doctor) throw new Error(`缺少配置 ${name} 或 --${flag}`);
+    if (!value && !doctor && !readThread) throw new Error(`缺少配置 ${name} 或 --${flag}`);
     if (!value) return "";
     return value;
   };
@@ -57,6 +64,8 @@ export function readConfig(args: string[], env = process.env): ConnectorConfig {
     pollMs,
     codexSandbox,
     doctor,
+    readThread,
+    historyCursor,
     appServerStateDir: flags.get("app-server-state-dir") ?? env.SEAM_APP_SERVER_STATE_DIR,
     codexNetworkAccess: network === "true",
     stateDir: flags.get("connector-state-dir") ?? env.SEAM_CONNECTOR_STATE_DIR,

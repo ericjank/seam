@@ -2,6 +2,7 @@
 import { readConfig } from "./config.js";
 import { runConnector } from "./index.js";
 import { diagnoseConnector } from "./doctor.js";
+import { readCodexThreadHistory } from "@seam/agent-adapters";
 
 try {
   if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Seam Connector 需要 Node.js 22+；请先选择已安装的新版 Node.js。");
@@ -10,6 +11,8 @@ try {
     console.log(`Seam Connector
   node --env-file=/path/to/private/connector.env apps/connector/dist/cli.js
   --doctor                 本地诊断，无需中心凭据，不调用 AI
+  --read-thread <id>       在会话所在设备上只读查看最近一页，无需中心凭据
+  --cursor <nextCursor>    继续读取上一页返回的更早历史
   --adapter codex-app-server  推荐：按协作保持本机 Codex 持久会话
   --adapter codex          兼容：每轮独立调用 codex exec
   --app-server-state-dir <path>  本机私有会话映射目录（默认 ~/.seam/threads）
@@ -22,7 +25,10 @@ try {
   --platform <url> --agent-id <id> --token <token>  建议改用私有 env 文件配置`);
   } else {
     const config = readConfig(args);
-    if (config.doctor) {
+    if (config.readThread) {
+      const history = await readCodexThreadHistory(config.projectRoot, config.readThread, config.historyCursor);
+      console.log(JSON.stringify(history, null, 2));
+    } else if (config.doctor) {
       const report = await diagnoseConnector(config);
       console.log(JSON.stringify(report, null, 2));
       if (!report.ok) process.exitCode = 1;
