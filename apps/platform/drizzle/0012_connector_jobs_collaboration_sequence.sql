@@ -1,0 +1,1 @@
+CREATE INDEX `connector_jobs_collaboration_sequence_idx` ON `connector_jobs` (`collaboration_id`,`sequence`);

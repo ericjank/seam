@@ -5,6 +5,7 @@ import * as schema from "../src/db/schema";
 const state = vi.hoisted(() => ({
   rows: {} as Record<string, any[]>,
   orders: [] as { table: string; sql: string }[],
+  jobReads: [] as { fields?: string[]; where: string; params: unknown[]; order: string; limit?: number }[],
   updates: [] as { table: string; values: any }[],
 }));
 
@@ -15,13 +16,16 @@ vi.mock("@/db", async () => {
   const filter = (table: string, rows: any[], condition: any) => {
     if (!condition) return rows;
     const { sql, params } = dialect.sqlToQuery(condition);
+    if (table === "connector_jobs" && sql.includes("`connector_jobs`.`collaboration_id`")) {
+      rows = rows.filter((row) => params.includes(row.collaborationId));
+    }
     if (sql.includes(`\`${table}\`.\`id\``)) rows = rows.filter((row) => params.includes(row.id));
     if (sql.includes(`\`${table}\`.\`status\``)) rows = rows.filter((row) => params.includes(row.status));
     return rows;
   };
   return {
     db: {
-      select: () => {
+      select: (fields?: Record<string, unknown>) => {
         let table = "";
         let condition: any;
         let max: number | undefined;
@@ -37,6 +41,10 @@ vi.mock("@/db", async () => {
         };
         for (const method of ["innerJoin", "leftJoin", "for"]) query[method] = () => query;
         query.then = (resolve: (rows: any[]) => unknown, reject: (reason: unknown) => unknown) => {
+          if (table === "connector_jobs") {
+            const { sql: where, params } = condition ? dialect.sqlToQuery(condition) : { sql: "", params: [] };
+            state.jobReads.push({ fields: fields && Object.keys(fields), where, params, order, limit: max });
+          }
           let rows = [...filter(table, state.rows[table] ?? [], condition)];
           const column = order.match(/`[^`]+`\.`([^`]+)` (asc|desc)/);
           if (column) {
@@ -79,6 +87,7 @@ import { listAcceptance, submitAcceptance } from "../src/services/acceptance";
 beforeEach(() => {
   const sameTime = new Date("2026-11-11T12:00:00.000Z");
   state.orders = []; state.updates = [];
+  state.jobReads = [];
   state.rows = {
     messages: [
       { id: "a-new", sequence: 2, body: "新的实施授权", authorType: "user", metadata: {}, createdAt: sameTime },
@@ -114,6 +123,39 @@ describe("同毫秒事件按数据库序列排序", () => {
     expect(detail.acceptanceRuns[0]?.status).toBe("failed");
     expect(detail.auditEvents[0]?.id).toBe("a-new");
     expect(detail.connectorCapabilities[0]?.executionMode).toBe("workspace-write");
+  });
+
+  it("最近任务只排序并限量读取 ID，随后按原顺序返回批量读取的详情", async () => {
+    const history = Array.from({ length: 25 }, (_, index) => ({
+      id: `job-${index + 1}`, sequence: index + 1, collaborationId: "collaboration",
+    }));
+    state.rows.connector_jobs = [...history, { id: "other-job", sequence: 26, collaborationId: "other" }];
+    const expectedIds = history.slice(-20).reverse().map((job) => job.id);
+
+    const detail = await getCollaborationDetail("user", "collaboration");
+
+    expect(detail.jobs.map((job) => job.id)).toEqual(expectedIds);
+    expect(state.jobReads).toEqual([
+      {
+        fields: ["id"], where: "`connector_jobs`.`collaboration_id` = ?", params: ["collaboration"],
+        order: "`connector_jobs`.`sequence` desc", limit: 20,
+      },
+      {
+        fields: expect.arrayContaining(["id", "result"]), where: expect.stringContaining("`connector_jobs`.`id` in ("),
+        params: ["collaboration", ...expectedIds], order: "", limit: undefined,
+      },
+    ]);
+    expect(state.jobReads[1]?.where).toContain("`connector_jobs`.`collaboration_id` = ?");
+  });
+
+  it("协作没有任务时跳过详情查询", async () => {
+    state.rows.connector_jobs = [];
+
+    const detail = await getCollaborationDetail("user", "collaboration");
+
+    expect(detail.jobs).toEqual([]);
+    expect(state.jobReads).toHaveLength(1);
+    expect(state.jobReads[0]?.fields).toEqual(["id"]);
   });
 
   it("Connector在同毫秒多任务中按先插入先领取", async () => {

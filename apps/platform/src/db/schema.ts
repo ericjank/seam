@@ -212,7 +212,10 @@ export const connectorJobs = mysqlTable("connector_jobs", {
   recoveryKeyHash: varchar("recovery_key_hash", { length: 64 }),
   cancellationAckAt: timestamp("cancellation_ack_at", { fsp: 3 }),
   ...timestamps,
-}, (table) => [index("connector_jobs_agent_status_idx").on(table.agentId, table.status, table.availableAt)]);
+}, (table) => [
+  index("connector_jobs_agent_status_idx").on(table.agentId, table.status, table.availableAt),
+  index("connector_jobs_collaboration_sequence_idx").on(table.collaborationId, table.sequence),
+]);
 
 export const auditEvents = mysqlTable("audit_events", {
   id: id().primaryKey(),

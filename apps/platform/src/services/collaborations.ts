@@ -174,12 +174,23 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     project: { id: row.project.id, name: row.project.name },
     agent: row.agent ? { id: row.agent.id, name: row.agent.name } : null,
   }));
-  const jobRows = await db.select({
+  // Sort only IDs to keep large receipt JSON out of the MySQL sort.
+  const recentJobIds = (await db.select({ id: connectorJobs.id }).from(connectorJobs)
+    .where(eq(connectorJobs.collaborationId, collaborationId))
+    .orderBy(desc(connectorJobs.sequence)).limit(RECENT_JOB_LIMIT)).map((job) => job.id);
+  const jobRows = recentJobIds.length ? await db.select({
     id: connectorJobs.id, agentId: connectorJobs.agentId, kind: connectorJobs.kind,
     projectName: sql<string | null>`NULLIF(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.projectName')), 'null')`,
     agentName: sql<string | null>`NULLIF(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.participant.agentName')), 'null')`,
     cancellationAckAt: connectorJobs.cancellationAckAt, leaseUntil: connectorJobs.leaseUntil, status: connectorJobs.status, error: connectorJobs.error, attempts: connectorJobs.attempts, updatedAt: connectorJobs.updatedAt, result: connectorJobs.result,
-  }).from(connectorJobs).where(eq(connectorJobs.collaborationId, collaborationId)).orderBy(desc(connectorJobs.sequence)).limit(RECENT_JOB_LIMIT);
+  }).from(connectorJobs).where(and(
+    eq(connectorJobs.collaborationId, collaborationId), inArray(connectorJobs.id, recentJobIds),
+  )) : [];
+  const jobsById = new Map(jobRows.map((job) => [job.id, job]));
+  const recentJobRows = recentJobIds.flatMap((id) => {
+    const job = jobsById.get(id);
+    return job ? [job] : [];
+  });
   const dispatchJobs = hasLegacyDispatch(messageRows) ? await db.select({
     jobId: connectorJobs.id, agentId: connectorJobs.agentId, createdAt: connectorJobs.createdAt,
     workflowId: sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.workflow.id'))`,
@@ -219,7 +230,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     acceptanceRuns: acceptanceRows,
     auditEvents: auditRows,
     availableProjects,
-    jobs: jobRows.map(({ result, ...job }) => {
+    jobs: recentJobRows.map(({ result, ...job }) => {
       const record = result as { recovery?: unknown; conversation?: { threadId?: unknown; transport?: unknown; title?: unknown; runLabel?: unknown }; telemetry?: unknown;provenance?:{connector?:{sourceId?:string};platform?:{sourceId?:string};protocolVersion?:number} } | null;
       const conversation = record?.conversation, telemetry = adapterTelemetrySchema.safeParse(record?.telemetry);
       return { ...job, recovery: recoverySummary(record?.recovery), provenance:record?.provenance?{connectorSourceId:/^[a-f0-9]{64}$/.test(record.provenance.connector?.sourceId??"")?record.provenance.connector!.sourceId!:"unknown",platformSourceId:/^[a-f0-9]{64}$/.test(record.provenance.platform?.sourceId??"")?record.provenance.platform!.sourceId!:"unknown",protocolVersion:record.provenance.protocolVersion}:null, telemetry: telemetry.success ? telemetry.data : null, conversation: conversation?.transport === "codex-app-server" && typeof conversation.threadId === "string" && /^[0-9a-f-]{36}$/i.test(conversation.threadId)

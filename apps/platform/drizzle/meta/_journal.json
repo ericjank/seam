@@ -85,6 +85,13 @@
       "when": 1795191537179,
       "tag": "0011_project_archiving",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "5",
+      "when": 1795620734875,
+      "tag": "0012_connector_jobs_collaboration_sequence",
+      "breakpoints": true
     }
   ]
 }
