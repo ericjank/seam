@@ -1,4 +1,4 @@
-import { activeThreadWriterMessage, CONNECTOR_PROTOCOL_VERSION, type PlanObjectionTask } from "@seam/protocol";
+import { activeThreadWriterMessage, CONNECTOR_PROTOCOL_VERSION, legacyThreadResumeError, type PlanObjectionTask } from "@seam/protocol";
 import { fixtureContract, fixtureRuns } from "./fixtures/shared-contract";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -14,7 +14,7 @@ let cookie = "";
 let memberCookie = "";
 const checks: string[] = [];
 type Local = { projectId: string; agentId: string; token: string };
-type Claimed = { id: string; attempts: number; payload: { resumeThreadId?: string; context: { participant: { id: string }; lifecycle: { revision: number; documentHash: string }; planObjectionTask?: PlanObjectionTask } } };
+type Claimed = { id: string; attempts: number; payload: { resumeThreadId?: string; retryOfFailedAttempt?: number; context: { participant: { id: string }; lifecycle: { revision: number; documentHash: string }; planObjectionTask?: PlanObjectionTask } } };
 
 async function raw(path: string, body?: unknown, options: { token?: string; session?: string; method?: string } = {}) {
   const response = await fetch(`${base}${path}`, {
@@ -45,20 +45,20 @@ async function login(email: string, password: string) {
   return session.split(";")[0]!;
 }
 async function register(label: string): Promise<Local> {
-  const { project } = await api("/api/projects", { name: `lifecycle-negative-${label}-${suffix}`, description: "确定性生命周期负例测试" });
+  const { project } = await api("/api/projects", { name: `lifecycle-negative-${label}-${suffix.slice(0, 16)}`, description: "确定性生命周期负例测试" });
   const { agent } = await api("/api/agents", { projectId: project.id, name: `fixture-${label}`, adapter: "mock" });
   return { projectId: project.id, agentId: agent.id, token: agent.token };
 }
-async function claim(local: Local, supportsThreadBusy = false): Promise<Claimed> {
-  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true, supportsThreadBusy }, { token: local.token });
+async function claim(local: Local, supportsThreadBusy = false, supportsLegacyThreadRetry = false): Promise<Claimed> {
+  const result = await api("/api/connectors/poll", { agentId: local.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION, supportsInformationLookup: true, supportsThreadBusy, supportsLegacyThreadRetry }, { token: local.token });
   assert.ok(result.job, "the platform must automatically enqueue the expected turn");
   return result.job;
 }
 function content(local: Local, extra = "") {
   return `# ${local.agentId} 的完整开发贡献\n\n${"读取合成项目，明确接口边界与实施步骤，审批前只读，审批后实际执行并提交测试证据。".repeat(4)}\n\n${extra}`;
 }
-async function complete(local: Local, job: Claimed, action: Record<string, unknown> | Record<string, unknown>[], status = 200) {
-  const body = { agentId: local.agentId, jobId: job.id, attempts: job.attempts, status: "completed", result: { agentTurn: {
+async function complete(local: Local, job: Claimed, action: Record<string, unknown> | Record<string, unknown>[], status = 200, resultMeta: Record<string, unknown> = {}) {
+  const body = { agentId: local.agentId, jobId: job.id, attempts: job.attempts, status: "completed", result: { ...resultMeta, agentTurn: {
     message: "确定性 HTTP 负例测试回执；本回执不代表真实业务实施", kind: "status", actions: Array.isArray(action) ? action : [action], notifyParticipantIds: [], needsHumanInput: false,
   } } };
   if (status === 200) return api("/api/connectors/complete", body, { token: local.token });
@@ -72,6 +72,118 @@ async function confirm(local: Local, job?: Claimed) {
   const claimed = job ?? await claim(local);
   return complete(local, claimed, { type: "plan.confirm", revision: claimed.payload.context.lifecycle.revision, documentHash: claimed.payload.context.lifecycle.documentHash });
 }
+
+async function verifyLegacyThreadRetry(outcome: "no-progress" | "resolved" | "missing-native-receipt") {
+  const initialState = outcome === "resolved" ? "paused" : "open";
+  const label = outcome === "missing-native-receipt" ? "unproved" : initialState;
+  const coordinator = await register(`legacy-${label}-coordinator`);
+  const responsible = await register(`legacy-${label}-responsible`);
+  for (const local of [coordinator, responsible]) await api("/api/connectors/heartbeat", {
+    agentId: local.agentId, capabilities: { adapter: "mock", executionMode: "external", testConfigured: false,
+      supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION },
+  }, { token: local.token });
+  const { id } = await api("/api/collaborations", { title: `旧任务续接 ${outcome} ${suffix}`, objective: "只验证旧版会话失败的定向重试",
+    projectId: coordinator.projectId, targetProjectId: responsible.projectId });
+  const path = `/api/collaborations/${id}`;
+  const detail = () => api(path, undefined, { method: "GET" });
+  const threadId = randomUUID();
+  const conversation = { threadId, transport: "codex-app-server" };
+  const originalPlanning = await claim(responsible);
+  await complete(responsible, originalPlanning, { type: "plan.submit", revision: 1, content: content(responsible) }, 200, { conversation });
+  await submit(coordinator);
+  const synthesis = (await detail()).lifecycle;
+  await complete(coordinator, await claim(coordinator), { type: "plan.compose", revision: 1,
+    baseDocumentHash: synthesis.documentHash, contract: fixtureContract(synthesis.requiredParticipantIds, 1) });
+  const review = (await detail()).lifecycle;
+  const firstReview = await claim(coordinator), secondReview = await claim(responsible);
+  const participantId = secondReview.payload.context.participant.id;
+  const target = review.contract.acceptanceCases.find((item: { runnerParticipantId: string }) => item.runnerParticipantId === participantId);
+  assert.ok(target);
+  await complete(responsible, secondReview, { type: "plan.reject", revision: 1, documentHash: review.documentHash, reason: "验收预期需要补充错误传递",
+    objections: [{ target: { kind: "acceptance_case", id: target.id }, responsibleParticipantId: participantId,
+      reason: "验收用例需要明确客户端如何传递错误", resolutionCondition: "目标用例验证客户端将错误传递给调用方" }] });
+  await confirm(coordinator, firstReview);
+  const original = await claim(responsible);
+  const scope = original.payload.context.planObjectionTask;
+  assert.ok(scope);
+  const failed = { agentId: responsible.agentId, jobId: original.id, attempts: original.attempts, status: "failed", error: legacyThreadResumeError };
+  await api("/api/connectors/complete", failed, { token: responsible.token });
+  const retry = { action: "retry-failed-thread", jobId: original.id, attempts: original.attempts, threadId, confirmedThreadReleased: true };
+  await expected(`${path}/dispatch`, { ...retry, confirmedThreadReleased: false }, 422);
+  await expected(`${path}/dispatch`, retry, 403, { session: memberCookie });
+  await expected(`${path}/dispatch`, { ...retry, threadId: randomUUID() }, 409);
+  const successor = (await detail()).jobs.find((job: any) => job.agentId === responsible.agentId && job.status === "pending");
+  assert.ok(successor);
+  if (initialState === "paused") {
+    const running = await claim(responsible);
+    assert.equal(running.id, successor.id);
+    await expected(`${path}/dispatch`, retry, 409);
+    await complete(responsible, running, []);
+  }
+  const beforeRetry = await detail();
+  const oldObjection = beforeRetry.lifecycle.planObjections[0];
+  assert.equal(oldObjection.state, initialState);
+  assert.deepEqual(beforeRetry.legacyThreadRetries, [{
+    jobId: original.id, agentId: responsible.agentId, attempts: original.attempts, objectionId: scope.objectionId, threadId,
+  }]);
+  const attempts = await Promise.all([raw(`${path}/dispatch`, retry), raw(`${path}/dispatch`, retry)]);
+  assert.deepEqual(attempts.map(({ response }) => response.status).sort(), [202, 409]);
+  assert.deepEqual(attempts.find(({ response }) => response.ok)?.data.jobs, [original.id]);
+  const queued = await detail();
+  assert.deepEqual(queued.lifecycle.planObjections[0], oldObjection);
+  if (initialState === "open") assert.equal(queued.jobs.find((job: any) => job.id === successor.id).status, "cancelled");
+  const archive = queued.auditEvents.find((event: any) => event.action === "connector.legacy_thread_retry");
+  assert.equal(archive.metadata.jobId, original.id);
+  assert.equal(archive.metadata.failedReceipt.status, "failed");
+  assert.equal(archive.metadata.failedReceipt.error, legacyThreadResumeError);
+  assert.match(archive.metadata.failedReceipt.receiptHash, /^[a-f0-9]{64}$/);
+  const oldConnector = await api("/api/connectors/poll", { agentId: responsible.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION,
+    supportsInformationLookup: true, supportsThreadBusy: true }, { token: responsible.token });
+  assert.equal(oldConnector.job, null);
+  const claimed = await claim(responsible, true, true);
+  assert.equal(claimed.id, original.id);
+  assert.equal(claimed.attempts, original.attempts + 1);
+  assert.equal(claimed.payload.retryOfFailedAttempt, original.attempts);
+  assert.equal(claimed.payload.resumeThreadId, threadId);
+  assert.equal(claimed.payload.context.lifecycle.revision, 1);
+  assert.deepEqual(claimed.payload.context.planObjectionTask, { objectionId: scope.objectionId, attempt: oldObjection.attempts + 1 });
+  await expected("/api/connectors/complete", failed, 409, { token: responsible.token });
+  const resolution = { ...claimed.payload.context.planObjectionTask, type: "plan.resolve", revision: 1,
+    summary: "本次重新执行后的证据", evidence: null,
+    change: outcome === "no-progress" ? null : { kind: "acceptance_case", acceptanceCase: {
+      ...target, httpCheckRefs: undefined, httpChecks: [], expectedResult: `${target.expectedResult}，客户端将错误传递给调用方`,
+    } },
+  };
+  if (outcome === "missing-native-receipt") {
+    await complete(responsible, claimed, resolution, 422, { conversation });
+    const after = await detail();
+    assert.equal(after.jobs.find((job: any) => job.id === original.id).status, "failed");
+    assert.deepEqual(after.lifecycle.planObjections[0], oldObjection);
+    assert.equal(after.lifecycle.phase, "plan_synthesis");
+    const poll = await api("/api/connectors/poll", { agentId: responsible.agentId, waitMs: 0, protocolVersion: CONNECTOR_PROTOCOL_VERSION,
+      supportsInformationLookup: true, supportsThreadBusy: true, supportsLegacyThreadRetry: true }, { token: responsible.token });
+    assert.equal(poll.job, null);
+    assert.equal(after.auditEvents.find((event: any) => event.action === "connector.legacy_thread_retry").metadata.failedReceipt.error, legacyThreadResumeError);
+    return;
+  }
+  const turnId = randomUUID();
+  await complete(responsible, claimed, resolution, 200, { conversation, telemetry: {
+    version: 1, jobId: original.id, threadId, turnId, revision: 1, phase: "plan_synthesis",
+    promptBytes: 1, schemaBytes: 1, commandOutputBytes: 0, resourceCommandOutputBytes: 0, resourceReadCommands: 0, durationMs: 1,
+    resourceStats: { createdBytes: 0, availableBytes: 0, files: 0, prunedFiles: 0 }, contextCompacted: false, tokenUsage: null,
+  } });
+  const after = await detail();
+  const stored = after.jobs.find((job: any) => job.id === original.id);
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.telemetry.turnId, turnId);
+  assert.equal(after.lifecycle.planObjections[0].attempts, oldObjection.attempts + 1);
+  assert.equal(after.lifecycle.planObjections[0].state, initialState === "open" ? "paused" : "addressed");
+  assert.equal(after.lifecycle.phase, initialState === "open" ? "plan_synthesis" : "plan_confirmation");
+  assert.ok(after.auditEvents.some((event: any) => event.action === "connector.legacy_thread_retry_completed" &&
+    event.metadata.jobId === original.id && event.metadata.turnId === turnId));
+  assert.equal(after.auditEvents.find((event: any) => event.action === "connector.legacy_thread_retry").metadata.failedReceipt.error, legacyThreadResumeError);
+}
+
 async function main() {
   await api("/api/health", undefined, { method: "GET" });
   cookie = await login(process.env.SEAM_SIMULATION_EMAIL ?? "simulation-owner@seam.test", process.env.SEAM_SIMULATION_PASSWORD ?? "LocalSimulation!2026");
@@ -265,6 +377,10 @@ async function main() {
   await expected(`${path}/dispatch`, { autoAdvance: true }, 409);
   assert.equal((await detail()).collaboration.status, "completed");
   checks.push("未执行留在原修订，普通成员不能批准重试；管理员确认后只重跑受影响一方，失败报告完整归档，手动终止后不派发");
+  await verifyLegacyThreadRetry("no-progress");
+  await verifyLegacyThreadRetry("resolved");
+  await verifyLegacyThreadRetry("missing-native-receipt");
+  checks.push("旧版会话失败保留回执，管理员并发确认只重派一次，沿用原任务和线程，只有新执行回执可更新异议");
   console.log(JSON.stringify({ status: "passed", collaborationId: created.id, scope: "真实HTTP协议与权限验证，Agent结果为明确标注的合成回执", checks }, null, 2));
 }
 

@@ -116,7 +116,8 @@ export async function runConnector(config: ConnectorConfig) {
       if (!job) { if (!config.once) await new Promise((resolve) => setTimeout(resolve, config.pollMs)); continue; }
       const controller = new AbortController();
       const previous = await journal.read(job.id);
-      const recoveryKey = previous?.threadBusy ? randomUUID() : (previous?.recoveryKey ?? randomUUID());
+      const restarting = previous && job.attempts > previous.attempts && (previous.threadBusy || job.payload.retryOfFailedAttempt === previous.attempts);
+      const recoveryKey = restarting ? randomUUID() : (previous?.recoveryKey ?? randomUUID());
       active = { id: job.id, attempts: job.attempts, controller, recoveryKey, leaseTimer: setTimeout(() => controller.abort(), 60_000) };
       renewLocalLease(job.leaseUntil ?? new Date(Date.now() + 60_000).toISOString());
       let result: Record<string, unknown> | undefined;

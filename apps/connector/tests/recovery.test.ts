@@ -8,13 +8,54 @@ import { readConfig } from "../src/config";
 import { ExecutionJournal } from "../src/journal";
 import { withWorkspaceLock, workspaceBaseline } from "../src/workspace";
 import { CodexAppServerAdapter, CodexThreadBusyError, MockAgentAdapter } from "@seam/agent-adapters";
-import { activeThreadWriterMessage, collaborationContextSchema, type ConnectorJob, type ThreadBusyReceipt } from "@seam/protocol";
+import { activeThreadWriterMessage, collaborationContextSchema, legacyThreadResumeError, type ConnectorJob, type ThreadBusyReceipt } from "@seam/protocol";
 
 let root: string;
 beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "seam-recovery-")); });
 afterEach(async () => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); await rm(root, { recursive: true, force: true }); });
 
 describe("本地执行与网络故障恢复", () => {
+  it("管理员重派旧会话失败任务时归档原回执，再调用 App Server 提交新回执", async () => {
+    const config = readConfig(["--once", "--adapter", "codex-app-server"], {
+      SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "test-only", SEAM_PROJECT_ROOT: root,
+    });
+    config.stateDir = join(root, "state");
+    config.workspaceLockDir = join(root, "locks");
+    config.appServerStateDir = join(root, "threads");
+    const id = crypto.randomUUID(), collaborationId = crypto.randomUUID(), threadId = crypto.randomUUID();
+    const context = collaborationContextSchema.parse({
+      jobId: id, collaborationId, title: "旧任务重试", type: "custom", status: "negotiating", objective: "续接原线程",
+      participant: { id: crypto.randomUUID(), projectId: crypto.randomUUID(), projectName: "原项目", agentId: config.agentId, agentName: "fixture", role: "consumer", approvalRequired: true, status: "active" },
+      participants: [], messages: [], artifacts: [], workItems: [],
+    });
+    const job: ConnectorJob = { id, agentId: config.agentId, collaborationId, kind: "collaboration.turn", attempts: 2,
+      payload: { context, resumeThreadId: threadId, retryOfFailedAttempt: 1 } };
+    const journal = new ExecutionJournal(config);
+    await journal.save({ jobId: id, attempts: 1, state: "acknowledged", error: legacyThreadResumeError, recoveryKey: "previous-private-key" });
+    const receipts: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, options: { body: string }) => {
+      const body = JSON.parse(options.body);
+      if (url.endsWith("/poll")) {
+        expect(body.supportsLegacyThreadRetry).toBe(true);
+        return Response.json({ job });
+      }
+      if (url.endsWith("/complete")) receipts.push(body);
+      if (body.activeJob) return Response.json({ jobState: { cancelRequested: false, leaseUntil: new Date(Date.now() + 1_200_000).toISOString() } });
+      return Response.json({ ok: true });
+    }));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(CodexAppServerAdapter.prototype, "healthCheck").mockResolvedValue({ ok: true, detail: "fixture" });
+    const run = vi.spyOn(CodexAppServerAdapter.prototype, "run")
+      .mockResolvedValue({ message: "实际重新调用适配器", kind: "status", actions: [], notifyParticipantIds: [], needsHumanInput: false });
+    await runConnector(config);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[0]).toMatchObject({ resumeThreadId: threadId, context: { jobId: id } });
+    expect(receipts).toMatchObject([{ status: "completed", jobId: id, attempts: 2 }]);
+    expect(JSON.parse(await readFile(join(journal.directory, `receipt-${id}-1.json`), "utf8")))
+      .toMatchObject({ jobId: id, attempts: 1, error: legacyThreadResumeError });
+    expect((await journal.read(id))?.recoveryKey).not.toBe("previous-private-key");
+  });
+
   it("持久重发会话占用回执，中心重派更高领取轮次后续接原线程", async () => {
     const config = readConfig(["--once", "--adapter", "codex-app-server"], {
       SEAM_AGENT_ID: crypto.randomUUID(), SEAM_AGENT_TOKEN: "test-only", SEAM_PROJECT_ROOT: root,

@@ -2,7 +2,7 @@
 
 import { formatDateTime } from "@/lib/date-time";
 import { dispatchRecipient } from "@/lib/dispatch-message";
-import { CONNECTOR_PROTOCOL_VERSION } from "@seam/protocol";
+import { CONNECTOR_PROTOCOL_VERSION, objectionTargetLabel } from "@seam/protocol";
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
@@ -70,6 +70,29 @@ export function CollaborationDetail({ data }: { data: CollaborationData }) {
             onClick={() => void run(`/api/collaborations/${id}/dispatch`, { action: "retry-thread", jobId: wait.jobId, attempts: wait.attempts }).catch(() => undefined)}>
             确认已释放并重派原任务
           </button>}
+        </div>;
+      })}
+    </section>}
+    {data.canAdminister && data.legacyThreadRetries.length > 0 && <section className="card" aria-label="旧任务重试">
+      <h2>旧任务重试</h2>
+      {data.legacyThreadRetries.map((job) => {
+        const owner = data.participants.find(({ participant }) => participant.agentId === job.agentId);
+        const objection = data.lifecycle?.planObjections?.find((item) => item.id === job.objectionId);
+        return <div className="list-item" key={job.jobId}>
+          <strong>{owner?.project.name ?? "原项目"} · {objection ? objectionTargetLabel(objection.target) : "原异议"}</strong>
+          <p>原任务 <code>{job.jobId}</code> · 第 {job.attempts} 次领取在恢复会话时失败。</p>
+          {job.threadId ? <form className="stack" onSubmit={(event) => {
+            event.preventDefault();
+            const confirmedThreadReleased = new FormData(event.currentTarget).has("threadReleased");
+            void run(`/api/collaborations/${id}/dispatch`, {
+              action: "retry-failed-thread", jobId: job.jobId, attempts: job.attempts, threadId: job.threadId, confirmedThreadReleased,
+            }).catch(() => undefined);
+          }}>
+            <p>原线程 <code>{job.threadId}</code></p>
+            <ReadOnlyThread threadId={job.threadId} />
+            <label><input name="threadReleased" type="checkbox" required /> 我已确认原线程的写锁释放，且原异议仍适用。</label>
+            <button className="btn btn-secondary btn-small" disabled={busy}>重试原失败任务</button>
+          </form> : <p>缺少此前的 Codex 会话回执，当前无法确认原线程。</p>}
         </div>;
       })}
     </section>}

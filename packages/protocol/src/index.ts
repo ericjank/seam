@@ -561,6 +561,7 @@ export const connectorJobSchema = z.object({
 export type ConnectorJob = z.infer<typeof connectorJobSchema>;
 
 export const activeThreadWriterMessage = "already has an active writer";
+export const legacyThreadResumeError = "Codex App Server thread/resume 请求被拒绝（错误码 -32600）";
 export const threadBusyReceiptSchema = z.object({
   type: z.literal("thread_busy"),
   threadId: idSchema,

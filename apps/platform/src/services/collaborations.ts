@@ -1,5 +1,5 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
-import { adapterTelemetrySchema, threadBusyReceiptSchema } from "@seam/protocol";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { adapterTelemetrySchema, legacyThreadResumeError, threadBusyReceiptSchema } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
 import {
   acceptanceRuns,
@@ -28,6 +28,7 @@ import { HttpError } from "@/lib/http";
 import { getLifecycleContext } from "./lifecycle";
 import { hasLegacyDispatch, recoverDispatchNames } from "@/lib/dispatch-message";
 import { recoverySummary } from "@/lib/recovery-summary";
+import { legacyRetryScope, previousCodexThread, type ThreadRetryPayload } from "@/lib/legacy-thread-retry";
 
 export const RECENT_JOB_LIMIT = 20;
 
@@ -207,11 +208,30 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
   const capabilityRows = agentIds.length ? await db.select().from(auditEvents).where(and(
     eq(auditEvents.action, "connector.capabilities"), inArray(auditEvents.actorId, agentIds),
   )).orderBy(desc(auditEvents.sequence)) : [];
+  const lifecycle = await getLifecycleContext(collaborationId);
+  const legacyFailures = role === "owner" && lifecycle?.phase === "plan_synthesis" && !lifecycle.paused &&
+    lifecycle.planObjections?.some((row) => row.state !== "addressed") ? await db.select({
+      jobId: connectorJobs.id, agentId: connectorJobs.agentId, attempts: connectorJobs.attempts,
+      sequence: connectorJobs.sequence, payload: connectorJobs.payload,
+    }).from(connectorJobs).where(and(
+      eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"),
+      eq(connectorJobs.status, "failed"), eq(connectorJobs.error, legacyThreadResumeError),
+      isNotNull(connectorJobs.receiptHash), isNull(connectorJobs.result),
+      sql`CAST(JSON_EXTRACT(${connectorJobs.payload}, '$.lifecycleSnapshot.revision') AS UNSIGNED) = ${lifecycle.revision}`,
+    )) : [];
+  const legacyThreadRetries = await Promise.all(legacyFailures.sort((a, b) => a.sequence - b.sequence).flatMap((job) => {
+    const owner = participantRows.find((row) => row.participant.agentId === job.agentId && row.participant.status === "active");
+    const scope = owner && legacyRetryScope(lifecycle, job.payload as ThreadRetryPayload, owner.participant.id);
+    if (!scope) return [];
+    return [previousCodexThread(collaborationId, job.agentId, job.sequence).then((threadId) => ({
+      jobId: job.jobId, agentId: job.agentId, attempts: job.attempts, objectionId: scope.objectionId, threadId,
+    }))];
+  }));
 
   return {
     collaboration,
     canAdminister: role === "owner",
-    lifecycle: await getLifecycleContext(collaborationId),
+    lifecycle,
     lifecycleEvents:(await db.select().from(auditEvents).where(and(eq(auditEvents.collaborationId,collaborationId),eq(auditEvents.action,"lifecycle.transition"))).orderBy(desc(auditEvents.sequence)).limit(100)).reverse().flatMap(event=>{const state=(event.metadata as {current?:{revision:number;phase:string;paused:boolean;documentHash:string|null}}).current;return state?[{sequence:event.sequence,at:event.createdAt.toISOString(),...state}]:[];}),
     lifecycleHistory: await db.select({ revision: lifecycleRevisions.revision, requirements: lifecycleRevisions.requirements, document: lifecycleRevisions.document, documentHash: lifecycleRevisions.documentHash, report: lifecycleRevisions.report }).from(lifecycleRevisions).where(eq(lifecycleRevisions.collaborationId, collaborationId)).orderBy(desc(lifecycleRevisions.revision)),
     participants: participantRows,
@@ -232,6 +252,7 @@ export async function getCollaborationDetail(userId: string, collaborationId: st
     acceptanceRuns: acceptanceRows,
     auditEvents: auditRows,
     availableProjects,
+    legacyThreadRetries,
     threadWaits: waitingRows.flatMap(({ result, ...job }) => {
       const blocker = threadBusyReceiptSchema.safeParse((result as { threadBusy?: unknown } | null)?.threadBusy);
       return blocker.success ? [{ ...job, ...blocker.data }] : [];

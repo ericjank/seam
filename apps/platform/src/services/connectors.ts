@@ -1,16 +1,17 @@
 import { createHash } from "node:crypto";
-import { gt, and, asc, desc, eq, lte, isNull, sql } from "drizzle-orm";
-import { threadBusyReceiptSchema, type ConnectorResult } from "@seam/protocol";
+import { gt, and, asc, desc, eq, inArray, lte, isNull, sql } from "drizzle-orm";
+import { adapterTelemetrySchema, legacyThreadResumeError, threadBusyReceiptSchema, type ConnectorResult } from "@seam/protocol";
 import { db, withTransaction } from "@/db";
-import { agents, collaborations, connectorJobs, connectorJobsClaimIndex, auditEvents } from "@/db/schema";
+import { agents, collaborations, connectorJobs, connectorJobsClaimIndex, auditEvents, outstandingConnectorJobStatuses } from "@/db/schema";
 import { hashToken, newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
 import { requireCollaborationAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
+import { legacyRetryScope, previousCodexThread, type ThreadRetryPayload } from "@/lib/legacy-thread-retry";
 import { completeAgentTurn, refreshAgentJobContext } from "./agent-engine";
 import { submitAcceptance } from "./acceptance";
 import { drainWorkflowWakeups, queueWorkflowWakeup } from "./workflow-outbox";
-import { assertLifecycleJobCurrent, type LifecycleSnapshot } from "./lifecycle";
+import { assertLifecycleJobCurrent } from "./lifecycle";
 import { z, ZodError } from "zod";
 
 const localTestResultSchema = z.object({
@@ -86,7 +87,7 @@ export async function recoverConnectorJob(agentId:string, jobId:string, attempts
   });
 }
 
-export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false, protocolVersion = 1, supportsThreadBusy = false) {
+export async function pollConnectorJob(agentId: string, waitMs: number, signal?: AbortSignal, supportsInformationLookup = false, protocolVersion = 1, supportsThreadBusy = false, supportsLegacyThreadRetry = false) {
   const informationOnly = (payload: unknown) => Boolean((payload as { context?: { informationTask?: unknown } } | null)?.context?.informationTask);
   if (signal?.aborted) return null;
   await heartbeat(agentId);
@@ -103,7 +104,8 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
       .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, sql`CURRENT_TIMESTAMP(3)`),
         sql`COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.lifecycle.protocolVersion')) AS UNSIGNED), 1) <= ${protocolVersion}`,
         supportsInformationLookup ? undefined : sql`(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask') IS NULL OR JSON_TYPE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask')) = 'NULL')`,
-        supportsThreadBusy ? undefined : sql`JSON_EXTRACT(${connectorJobs.payload}, '$.resumeThreadId') IS NULL`))
+        supportsThreadBusy ? undefined : sql`JSON_EXTRACT(${connectorJobs.payload}, '$.resumeThreadId') IS NULL`,
+        supportsLegacyThreadRetry ? undefined : sql`JSON_EXTRACT(${connectorJobs.payload}, '$.retryOfFailedAttempt') IS NULL`))
       .orderBy(asc(connectorJobs.sequence)).limit(1);
     if (candidate) {
       if (signal?.aborted) return null;
@@ -152,23 +154,70 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
   }
 }
 
-export async function retryThreadJob(userId: string, collaborationId: string, input: { jobId: string; attempts: number }) {
+async function prepareLegacyThreadRetry(collaborationId: string, job: typeof connectorJobs.$inferSelect, threadId: string) {
+  if (job.status !== "failed" || job.error !== legacyThreadResumeError || !job.receiptHash || job.result !== null) {
+    throw new HttpError(409, "此任务没有可重试的旧版会话恢复失败回执");
+  }
+  const payload = job.payload as ThreadRetryPayload;
+  const lifecycle = await assertLifecycleJobCurrent(collaborationId, payload.lifecycleSnapshot);
+  const original = payload.context;
+  const scope = original && legacyRetryScope(lifecycle, payload, original.participant.id);
+  if (!original || !scope) throw new HttpError(409, "原异议、责任方或修订已变化，请查看当前协作");
+  if (await previousCodexThread(collaborationId, job.agentId, job.sequence) !== threadId) {
+    throw new HttpError(409, "无法确认原 Codex 线程，请核对责任端的原会话");
+  }
+  const successors = await db.select({ id: connectorJobs.id, status: connectorJobs.status, payload: connectorJobs.payload, result: connectorJobs.result })
+    .from(connectorJobs).where(and(
+      eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.agentId, job.agentId),
+      eq(connectorJobs.kind, "collaboration.turn"), inArray(connectorJobs.status, outstandingConnectorJobStatuses),
+    )).for("update");
+  const replaceable = successors.every((successor) => {
+    const next = successor.payload as ThreadRetryPayload;
+    if (next.context?.planObjectionTask?.objectionId !== scope.objectionId || next.retryOfFailedAttempt) return false;
+    if (successor.status === "pending") return !next.resumeThreadId;
+    if (successor.status !== "waiting_thread") return false;
+    const blocker = threadBusyReceiptSchema.safeParse((successor.result as { threadBusy?: unknown } | null)?.threadBusy);
+    return blocker.success && blocker.data.threadId === threadId;
+  });
+  if (!replaceable) throw new HttpError(409, "责任端已有执行中或另行确认的任务，请先核对其状态");
+  if (successors.length) await db.update(connectorJobs).set({
+    status: "cancelled", error: "管理员已确认续接该异议的原任务", updatedAt: new Date(),
+  }).where(inArray(connectorJobs.id, successors.map(row => row.id)));
+  return { ...payload, context: { ...original, planObjectionTask: scope }, resumeThreadId: threadId, retryOfFailedAttempt: job.attempts };
+}
+
+export async function retryThreadJob(userId: string, collaborationId: string, input: { jobId: string; attempts: number; threadId?: string }) {
   return withTransaction(async () => {
-    const { role } = await requireCollaborationAccess(userId, collaborationId, true);
-    if (role !== "owner") throw new HttpError(403, "仅协作管理员可以重派等待会话释放的任务");
     const [collaboration] = await db.select({ id: collaborations.id }).from(collaborations).where(eq(collaborations.id, collaborationId)).limit(1).for("update");
     if (!collaboration) throw new HttpError(404, "协作不存在");
+    const { role } = await requireCollaborationAccess(userId, collaborationId, true);
+    if (role !== "owner") throw new HttpError(403, "仅协作管理员可以确认会话任务重试");
     const [job] = await db.select().from(connectorJobs).where(and(
       eq(connectorJobs.id, input.jobId), eq(connectorJobs.collaborationId, collaborationId), eq(connectorJobs.kind, "collaboration.turn"),
     )).limit(1).for("update");
-    if (job?.status !== "waiting_thread" || job.attempts !== input.attempts) throw new HttpError(409, "等待会话释放的任务已变化，请刷新协作");
-    const blocker = threadBusyReceiptSchema.parse((job.result as { threadBusy?: unknown } | null)?.threadBusy);
-    const payload = await refreshAgentJobContext(job) as Record<string, unknown>;
+    if (!job || job.attempts !== input.attempts) throw new HttpError(409, "任务领取轮次已变化，请刷新协作");
+    let threadId: string;
+    let queued = job;
+    if (input.threadId) {
+      threadId = input.threadId;
+      queued = { ...job, payload: await prepareLegacyThreadRetry(collaborationId, job, threadId) };
+    } else {
+      if (job.status !== "waiting_thread") throw new HttpError(409, "等待会话释放的任务已变化，请刷新协作");
+      const blocker = threadBusyReceiptSchema.parse((job.result as { threadBusy?: unknown } | null)?.threadBusy);
+      threadId = blocker.threadId;
+    }
+    const payload = await refreshAgentJobContext(queued) as Record<string, unknown>;
     await db.update(connectorJobs).set({
-      status: "pending", payload: { ...payload, resumeThreadId: blocker.threadId },
+      status: "pending", payload: { ...payload, resumeThreadId: threadId },
       receiptHash: null, result: null, leaseUntil: null, availableAt: sql`CURRENT_TIMESTAMP(3)`, updatedAt: new Date(),
     }).where(eq(connectorJobs.id, job.id));
-    await audit({ collaborationId, actorType: "user", actorId: userId, action: "connector.thread_retry", metadata: { jobId: job.id, attempts: job.attempts, threadId: blocker.threadId } });
+    await audit({ collaborationId, actorType: "user", actorId: userId, action: input.threadId ? "connector.legacy_thread_retry" : "connector.thread_retry",
+      metadata: {
+        jobId: job.id, attempts: job.attempts, threadId,
+        ...(input.threadId ? { failedReceipt: { status: job.status, attempts: job.attempts, error: job.error,
+          receiptHash: job.receiptHash, result: job.result, recordedAt: job.updatedAt.toISOString() } } : {}),
+      },
+    });
     return job.id;
   });
 }
@@ -203,7 +252,7 @@ export async function completeConnectorJob(agentId: string, input: ConnectorResu
     }
     if (input.status === "waiting_thread") {
       if (job.kind !== "collaboration.turn" || !job.collaborationId) throw new HttpError(422, "仅协作任务可等待会话释放");
-      const payload = job.payload as { lifecycleSnapshot?: LifecycleSnapshot; resumeThreadId?: string };
+      const payload = job.payload as ThreadRetryPayload;
       if (payload.resumeThreadId && input.threadBusy.threadId !== payload.resumeThreadId) throw new HttpError(422, "会话标识与原重派任务不符");
       await assertLifecycleJobCurrent(job.collaborationId, payload.lifecycleSnapshot);
       await db.update(connectorJobs).set({
@@ -229,7 +278,21 @@ export async function completeConnectorJob(agentId: string, input: ConnectorResu
       // the outer row lock until the durable failure receipt has been written.
       await withTransaction(async () => {
         if (job.kind === "collaboration.turn") {
+          const retry = job.payload as ThreadRetryPayload;
+          let nativeTurn: { threadId: string; turnId: string } | undefined;
+          if (retry.retryOfFailedAttempt) {
+            const telemetry = adapterTelemetrySchema.safeParse(input.result?.telemetry);
+            const conversation = input.result?.conversation as { threadId?: unknown; transport?: unknown } | undefined;
+            if (!telemetry.success || !telemetry.data.turnId || telemetry.data.jobId !== job.id ||
+              telemetry.data.revision !== retry.lifecycleSnapshot?.revision || telemetry.data.phase !== "plan_synthesis" ||
+              telemetry.data.threadId !== retry.resumeThreadId || conversation?.threadId !== retry.resumeThreadId || conversation?.transport !== "codex-app-server") {
+              throw new HttpError(422, "原任务重试需回传该任务、原线程和当前修订的新执行记录");
+            }
+            nativeTurn = { threadId: telemetry.data.threadId, turnId: telemetry.data.turnId };
+          }
           await completeAgentTurn(input.jobId, input.result);
+          if (nativeTurn) await audit({ collaborationId: job.collaborationId, actorType: "connector", actorId: agentId,
+            action: "connector.legacy_thread_retry_completed", metadata: { jobId: job.id, attempts: job.attempts, ...nativeTurn } });
         } else if (job.kind === "local.test" && job.collaborationId) {
           const payload = z.object({
             participantId: z.string().uuid(),

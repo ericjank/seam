@@ -432,10 +432,11 @@ function addressedObjection(row: StoredPlanObjection, digest: string, response: 
   return { ...row, state: "addressed", attempts: row.attempts + 1, noProgressRounds: 0, seen: [...row.seen, digest], response };
 }
 
-async function resolvePlanObjection(control: Lifecycle, revision: Revision, collaboration: typeof collaborations.$inferSelect, participantId: string, action: ObjectionAction) {
+async function resolvePlanObjection(control: Lifecycle, revision: Revision, collaboration: typeof collaborations.$inferSelect, participantId: string, action: ObjectionAction, retryPaused: boolean) {
   const row = revision.objectionState?.items.find(item => item.id === action.objectionId);
   const draft = revision.objectionState?.draft ?? revision.sharedContract;
-  if (!row || !draft || control.phase !== "plan_synthesis" || row.state !== "open" || row.attempts + 1 !== action.attempt) throw new HttpError(409, "异议任务已暂停、处理或换轮，请使用当前派发");
+  const eligible = row?.state === "open" || (row?.state === "paused" && retryPaused);
+  if (!row || !draft || control.phase !== "plan_synthesis" || !eligible || row.attempts + 1 !== action.attempt) throw new HttpError(409, "异议任务已暂停、处理或换轮，请使用当前派发");
   if (row.responsibleParticipantId !== participantId) throw new HttpError(403, "仅该异议的责任方可提交修改或证据");
   let candidate = draft;
   let next: StoredPlanObjection;
@@ -489,7 +490,7 @@ export async function resolvePausedObjection(userId: string, collaborationId: st
   });
 }
 
-export async function applyLifecycleAction(actor: Actor, collaborationId: string, rawAction: import("zod").input<typeof lifecycleAgentActionSchema>): Promise<{ changed: boolean }> {
+export async function applyLifecycleAction(actor: Actor, collaborationId: string, rawAction: import("zod").input<typeof lifecycleAgentActionSchema>, options: { retryPausedObjection?: boolean } = {}): Promise<{ changed: boolean }> {
   const inputAction = lifecycleAgentActionSchema.parse(rawAction);
   return locked(collaborationId, async (control, collaboration) => {
     let preparedAction = inputAction;
@@ -522,7 +523,7 @@ export async function applyLifecycleAction(actor: Actor, collaborationId: string
     const action = preparedAction;
     if (action.type === "plan.amend" || action.type === "plan.patch") throw new HttpError(422, "增量方案未能归一为完整契约操作");
     if (action.type === "plan.resolve") {
-      await resolvePlanObjection(control, revision, collaboration, participantId, action);
+      await resolvePlanObjection(control, revision, collaboration, participantId, action, options.retryPausedObjection === true);
       return { changed: true };
     }
     if (action.type === "information.request") {

@@ -27,6 +27,7 @@ export class PlatformClient {
     const response = await this.request("/api/connectors/poll", {
       agentId: this.config.agentId, waitMs: 0, supportsInformationLookup: true, protocolVersion: CONNECTOR_PROTOCOL_VERSION,
       supportsThreadBusy: this.config.adapter === "codex-app-server",
+      supportsLegacyThreadRetry: this.config.adapter === "codex-app-server",
     }, AbortSignal.timeout(15_000));
     const job = response.job ? connectorJobSchema.parse(response.job) : null;
     if (job) this.attempts.set(job.id, job.attempts);
