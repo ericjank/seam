@@ -83,18 +83,24 @@ beforeEach(() => {
 
 describe("Connector 结果与任务领取", () => {
   it("不支持只读信息任务的旧Connector不会领取；新Connector可领取", async () => {
-    const payload={context:{informationTask:{requestId:crypto.randomUUID(),mode:"peer"}}};
-    state.queries.push([job({status:"pending",payload})]);
-    expect(await pollConnectorJob("agent",0)).toBeNull();expect(refreshAgentJobContext).not.toHaveBeenCalled();
-    state.queries.push([job({status:"pending",payload})],[job({payload})]);
-    expect((await pollConnectorJob("agent",0,undefined,true))?.payload).toEqual(payload);
+    const payload = { context: { informationTask: { requestId: crypto.randomUUID(), mode: "peer" } } };
+    state.queries.push([]);
+    expect(await pollConnectorJob("agent", 0)).toBeNull();
+    expect(state.updates).not.toContainEqual(expect.objectContaining({ status: "running" }));
+    expect(refreshAgentJobContext).not.toHaveBeenCalled();
+    state.queries.push([{ id: "job", attempts: 0 }], [job({ payload })]);
+    expect((await pollConnectorJob("agent", 0, undefined, true))?.payload).toEqual(payload);
   });
-  it("领取刷新时变成信息任务也不能交给旧Connector；持久化新用途后释放", async () => {
-    state.queries.push([job({status:"pending"})],[job()]);
-    vi.mocked(refreshAgentJobContext).mockResolvedValueOnce({context:{informationTask:{requestId:crypto.randomUUID(),mode:"local"}}});
-    expect(await pollConnectorJob("agent",0)).toBeNull();
-    expect(state.updates.some(row=>row.payload?.context?.informationTask)).toBe(true);
-    expect(state.updates.at(-1)).toMatchObject({status:"pending",leaseUntil:null});
+  it.each([
+    { capability: "资料查找能力", context: { informationTask: { requestId: crypto.randomUUID(), mode: "local" } } },
+    { capability: "更高协议版本", context: { lifecycle: { protocolVersion: 2 } } },
+  ])("刷新后的任务要求$capability时保存新上下文并释放当前轮次", async ({ context }) => {
+    state.queries.push([{ id: "job", attempts: 0 }], [job()]);
+    const payload = { context };
+    vi.mocked(refreshAgentJobContext).mockResolvedValueOnce(payload);
+    expect(await pollConnectorJob("agent", 0)).toBeNull();
+    expect(state.updates).toContainEqual(expect.objectContaining({ payload }));
+    expect(state.updates.at(-1)).toMatchObject({ status: "pending", leaseUntil: null });
   });
   it("已断开的轮询不领取任务也不续租", async () => {
     const controller = new AbortController(); controller.abort();

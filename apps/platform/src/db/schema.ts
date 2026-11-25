@@ -195,6 +195,8 @@ export const acceptanceRuns = mysqlTable("acceptance_runs", {
   createdAt: timestamp("created_at", { fsp: 3 }).notNull().default(sql`(now(3))`),
 });
 
+export const connectorJobsClaimIndex = "connector_jobs_agent_status_sequence_idx";
+
 export const connectorJobs = mysqlTable("connector_jobs", {
   id: id().primaryKey(),
   sequence: int("sequence").autoincrement().notNull().unique(),
@@ -214,6 +216,7 @@ export const connectorJobs = mysqlTable("connector_jobs", {
   ...timestamps,
 }, (table) => [
   index("connector_jobs_agent_status_idx").on(table.agentId, table.status, table.availableAt),
+  index(connectorJobsClaimIndex).on(table.agentId, table.status, table.sequence),
   index("connector_jobs_collaboration_sequence_idx").on(table.collaborationId, table.sequence),
 ]);
 

@@ -1,0 +1,1 @@
+CREATE INDEX `connector_jobs_agent_status_sequence_idx` ON `connector_jobs` (`agent_id`,`status`,`sequence`);

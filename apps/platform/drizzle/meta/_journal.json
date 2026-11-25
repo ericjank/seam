@@ -92,6 +92,13 @@
       "when": 1795620734875,
       "tag": "0012_connector_jobs_collaboration_sequence",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "5",
+      "when": 1795621947027,
+      "tag": "0013_connector_jobs_agent_status_sequence",
+      "breakpoints": true
     }
   ]
 }

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { gt, and, asc, desc, eq, lte, isNull, sql } from "drizzle-orm";
 import { db, withTransaction } from "@/db";
-import { agents, collaborations, connectorJobs, auditEvents } from "@/db/schema";
+import { agents, collaborations, connectorJobs, connectorJobsClaimIndex, auditEvents } from "@/db/schema";
 import { hashToken, newId } from "@/lib/ids";
 import { HttpError } from "@/lib/http";
 import { completeAgentTurn, refreshAgentJobContext } from "./agent-engine";
@@ -92,23 +92,26 @@ export async function pollConnectorJob(agentId: string, waitMs: number, signal?:
   let skipped = 0;
   for (;;) {
     if (signal?.aborted) return null;
-    const [job] = await db.select().from(connectorJobs)
+    // The available_at index can cause a filesort of the payload read by the JSON predicates.
+    const [candidate] = await db.select({ id: connectorJobs.id, attempts: connectorJobs.attempts })
+      .from(connectorJobs, { forceIndex: connectorJobsClaimIndex })
       // MySQL sets available_at when the job is enqueued. Use the same clock to decide when it is due.
       .where(and(eq(connectorJobs.agentId, agentId), eq(connectorJobs.status, "pending"), lte(connectorJobs.availableAt, sql`CURRENT_TIMESTAMP(3)`),
         sql`COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.lifecycle.protocolVersion')) AS UNSIGNED), 1) <= ${protocolVersion}`,
         supportsInformationLookup ? undefined : sql`(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask') IS NULL OR JSON_TYPE(JSON_EXTRACT(${connectorJobs.payload}, '$.context.informationTask')) = 'NULL')`))
       .orderBy(asc(connectorJobs.sequence)).limit(1);
-    if (job && (supportsInformationLookup || !informationOnly(job.payload))) {
+    if (candidate) {
       if (signal?.aborted) return null;
+      const attempts = candidate.attempts + 1;
       const [claim] = await db.update(connectorJobs).set({
         // Delivery is not execution. A disconnected receiver must not hold a
         // 20-minute execution lease without acknowledging the claimed attempt.
-        status: "running", recoveryKeyHash:null, attempts: job.attempts + 1, leaseUntil: new Date(Date.now() + 60_000), updatedAt: new Date(),
-      }).where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "pending"), eq(connectorJobs.attempts, job.attempts)));
+        status: "running", recoveryKeyHash: null, attempts, leaseUntil: new Date(Date.now() + 60_000), updatedAt: new Date(),
+      }).where(and(eq(connectorJobs.id, candidate.id), eq(connectorJobs.status, "pending"), eq(connectorJobs.attempts, candidate.attempts)));
       // Only the worker whose compare-and-set won may execute the task.
       if (claim.affectedRows === 1) {
         const [claimed] = await db.select().from(connectorJobs)
-          .where(and(eq(connectorJobs.id, job.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, job.attempts + 1))).limit(1);
+          .where(and(eq(connectorJobs.id, candidate.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, attempts))).limit(1);
         if (claimed) {
           const release = () => db.update(connectorJobs).set({ status: "pending", leaseUntil: null, updatedAt: new Date() }).where(and(eq(connectorJobs.id, claimed.id), eq(connectorJobs.status, "running"), eq(connectorJobs.attempts, claimed.attempts)));
           try {

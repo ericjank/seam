@@ -5,7 +5,7 @@ import * as schema from "../src/db/schema";
 const state = vi.hoisted(() => ({
   rows: {} as Record<string, any[]>,
   orders: [] as { table: string; sql: string }[],
-  jobReads: [] as { fields?: string[]; where: string; params: unknown[]; order: string; limit?: number }[],
+  jobReads: [] as { fields?: string[]; where: string; params: unknown[]; order: string; limit?: number; forceIndex?: string }[],
   updates: [] as { table: string; values: any }[],
 }));
 
@@ -30,8 +30,13 @@ vi.mock("@/db", async () => {
         let condition: any;
         let max: number | undefined;
         let order = "";
+        let forceIndex: string | undefined;
         const query: Record<string, any> = {};
-        query.from = (value: any) => { table = nameOf(value); return query; };
+        query.from = (value: any, hint?: { forceIndex?: string }) => {
+          table = nameOf(value);
+          forceIndex = hint?.forceIndex;
+          return query;
+        };
         query.where = (value: any) => { condition = value; return query; };
         query.limit = (value: number) => { max = value; return query; };
         query.orderBy = (value: any) => {
@@ -43,7 +48,7 @@ vi.mock("@/db", async () => {
         query.then = (resolve: (rows: any[]) => unknown, reject: (reason: unknown) => unknown) => {
           if (table === "connector_jobs") {
             const { sql: where, params } = condition ? dialect.sqlToQuery(condition) : { sql: "", params: [] };
-            state.jobReads.push({ fields: fields && Object.keys(fields), where, params, order, limit: max });
+            state.jobReads.push({ fields: fields && Object.keys(fields), where, params, order, limit: max, forceIndex });
           }
           let rows = [...filter(table, state.rows[table] ?? [], condition)];
           const column = order.match(/`[^`]+`\.`([^`]+)` (asc|desc)/);
@@ -160,8 +165,18 @@ describe("同毫秒事件按数据库序列排序", () => {
 
   it("Connector在同毫秒多任务中按先插入先领取", async () => {
     const claimed = await pollConnectorJob("agent", 0);
+
     expect(claimed?.id).toBe("z-old-job");
-    expect(state.orders.find((order) => order.table === "connector_jobs")?.sql).toContain("`connector_jobs`.`sequence` asc");
+    const [candidate, claimedRow] = state.jobReads;
+    expect(candidate).toMatchObject({
+      fields: ["id", "attempts"], forceIndex: schema.connectorJobsClaimIndex,
+      order: "`connector_jobs`.`sequence` asc", limit: 1,
+    });
+    expect(candidate?.where).toContain("`connector_jobs`.`available_at` <= CURRENT_TIMESTAMP(3)");
+    expect(candidate?.where).toContain("$.context.lifecycle.protocolVersion");
+    expect(candidate?.where).toContain("$.context.informationTask");
+    expect(claimedRow?.where).toContain("`connector_jobs`.`id` = ?");
+    expect(claimedRow?.forceIndex).toBeUndefined();
   });
 
   it("验收列表将同毫秒较新的失败放在旧通过之前", async () => {
