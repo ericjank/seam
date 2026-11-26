@@ -19,8 +19,9 @@ button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 .shell { min-height: 100vh; }
 .topbar { height: 66px; background: #101a30; color: #fff; display: flex; align-items: center; padding: 0 30px; gap: 30px; position: sticky; top: 0; z-index: 20; }
-.logo { font-size: 22px; font-weight: 800; letter-spacing: -0.5px; }
-.logo span { color: #92a8ff; }
+.logo { display: inline-flex; align-items: baseline; gap: 8px; flex-shrink: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.5px; }
+.logo-dot { color: #92a8ff; }
+.logo-version { color: #bdc7dc; font-size: 12px; font-weight: 600; letter-spacing: 0; white-space: nowrap; }
 .nav { display: flex; gap: 8px; }
 .nav a { color: #bdc7dc; padding: 9px 13px; border-radius: 8px; font-size: 14px; }
 .nav a:hover { background: #1e2c49; color: #fff; }
@@ -129,4 +130,9 @@ summary { cursor: pointer; font-weight: 650; }
   .project-row-actions { justify-content: flex-end; }
   .project-row-actions > button { min-height: 40px; }
   .project-details, .project-dialog { padding: 16px; }
+}
+@media (max-width: 480px) {
+  .topbar { padding-inline: 10px; gap: 8px; }
+  .nav { gap: 2px; }
+  .nav a { padding-inline: 6px; }
 }

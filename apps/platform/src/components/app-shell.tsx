@@ -3,17 +3,21 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
-export function AppShell({ children, userName, organizationName }: {
+export function AppShell({ children, userName, organizationName, version }: {
   children: React.ReactNode;
   userName?: string;
   organizationName?: string;
+  version?: string;
 }) {
   const pathname = usePathname();
   const router = useRouter();
   if (pathname === "/login" || pathname === "/setup") return children;
   return <div className="shell">
     <header className="topbar">
-      <Link href="/" className="logo">Seam<span>·</span></Link>
+      <Link href="/" className="logo">
+        <span>Seam<span className="logo-dot">·</span></span>
+        {version && <span className="logo-version">{version}</span>}
+      </Link>
       <nav className="nav">
         <Link href="/collaborations">协作</Link>
         <Link href="/projects">项目与 Agent</Link>

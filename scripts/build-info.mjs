@@ -7,7 +7,14 @@ const kind=process.argv[2];if(!['connector','platform'].includes(kind))throw Err
 const roots=kind==='connector'?['apps/connector/src','packages/agent-adapters/src','packages/protocol/src']:['apps/platform/src','apps/platform/drizzle','packages/protocol/src'];
 const files=[];async function walk(path){for(const entry of(await readdir(resolve(root,path),{withFileTypes:true})).sort((a,b)=>a.name.localeCompare(b.name))){const next=join(path,entry.name);if(entry.isDirectory())await walk(next);else if(entry.isFile())files.push(next);}}
 for(const path of roots)await walk(path);files.push('scripts/build-info.mjs','package.json','pnpm-lock.yaml','tsconfig.base.json',`apps/${kind}/package.json`,'packages/protocol/package.json');if(kind==='connector')files.push('packages/agent-adapters/package.json');
-const entries=[];for(const file of files.sort())entries.push([file.replaceAll('\\','/'),createHash('sha256').update(await readFile(resolve(root,file))).digest('hex')]);
+if (kind === 'platform') files.push('VERSION');
+const entries = [];
+let version;
+for (const file of files.sort()) {
+  const contents = await readFile(resolve(root, file));
+  if (file === 'VERSION') version = contents.toString('utf8').trim();
+  entries.push([file.replaceAll('\\','/'), createHash('sha256').update(contents).digest('hex')]);
+}
 const sourceId=createHash('sha256').update(JSON.stringify(entries)).digest('hex');
 const destination=resolve(root,kind==='connector'?'apps/connector/dist/build-info.json':'apps/platform/build-info.json');await mkdir(dirname(destination),{recursive:true});
-await writeFile(destination,JSON.stringify({kind,sourceId,files:entries.length},null,2));console.log(`${kind} sourceId=${sourceId}`);
+await writeFile(destination,JSON.stringify({kind,sourceId,files:entries.length,version},null,2));console.log(`${kind} sourceId=${sourceId}`);

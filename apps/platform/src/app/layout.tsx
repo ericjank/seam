@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { AppShell } from "@/components/app-shell";
 import { getCurrentUser } from "@/lib/auth";
+import { platformBuildInfo } from "@/lib/build-info";
 
 export const metadata: Metadata = {
   title: "Seam · 项目 Agent 协作平台",
@@ -11,6 +12,10 @@ export const metadata: Metadata = {
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const current = await getCurrentUser();
   return <html lang="zh-CN"><body>
-    <AppShell userName={current?.user.name} organizationName={current?.organization.name}>{children}</AppShell>
+    <AppShell
+      userName={current?.user.name}
+      organizationName={current?.organization.name}
+      version={platformBuildInfo().version}
+    >{children}</AppShell>
   </body></html>;
 }

@@ -92,6 +92,8 @@ docker compose up -d --build
 docker compose ps
 ```
 
+The top bar displays the value of `VERSION` at build time. Before each release, update and commit the root `VERSION` file, then create the matching Git tag on that commit.
+
 4. Check the application logs to confirm that migrations and startup succeeded:
 
 ```bash

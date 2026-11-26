@@ -91,6 +91,8 @@ docker compose up -d --build
 docker compose ps
 ```
 
+中心顶栏显示构建时的 `VERSION`。每次发版前，先把仓库根目录的 `VERSION` 更新为目标版本并提交，再给该提交打同名 Git 标签。
+
 4. 查看应用日志，确认迁移和启动成功：
 
 ```bash
